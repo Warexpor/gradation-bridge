@@ -1,7 +1,8 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import { ensureDirs, saveConfig } from "../src/config/load.js";
@@ -293,4 +294,62 @@ describe("bridge e2e with fake ACP agent", () => {
     await client.call("bridge/closeSession", { sessionId: created.sessionId });
     await client.close();
   }, 60_000);
+
+  it("bridge/gitStatus and bridge/diff reflect workspace git state", async () => {
+    execFileSync("git", ["init"], { cwd: workspace, stdio: "ignore" });
+    execFileSync("git", ["config", "user.email", "test@example.com"], {
+      cwd: workspace,
+      stdio: "ignore",
+    });
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: workspace, stdio: "ignore" });
+    writeFileSync(join(workspace, "tracked.txt"), "v1\n");
+    execFileSync("git", ["add", "tracked.txt"], { cwd: workspace, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "init"], { cwd: workspace, stdio: "ignore" });
+    writeFileSync(join(workspace, "tracked.txt"), "v2\n");
+    writeFileSync(join(workspace, "extra.txt"), "new\n");
+
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", { protocolVersion: 1 });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "auto-edit" },
+    })) as { sessionId: string };
+
+    const status = (await client.call("bridge/gitStatus", {
+      sessionId: created.sessionId,
+    })) as {
+      branch: string;
+      ahead: number;
+      behind: number;
+      files: Array<{ path: string; status: string }>;
+    };
+    expect(status.branch).toMatch(/^(master|main)$/);
+    expect(status.files.some((f) => f.path === "tracked.txt")).toBe(true);
+    expect(status.files.some((f) => f.path === "extra.txt")).toBe(true);
+
+    const diff = (await client.call("bridge/diff", {
+      sessionId: created.sessionId,
+      path: "tracked.txt",
+    })) as { unified: string };
+    expect(diff.unified).toContain("-v1");
+    expect(diff.unified).toContain("+v2");
+
+    await client.call("bridge/closeSession", { sessionId: created.sessionId });
+    await client.close();
+  }, 60_000);
+
+  it("bridge/browse denies symlink escape outside allowedRoots", async () => {
+    const outside = join(dirname(workspace), "outside-secret");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "secret.txt"), "leak\n");
+    symlinkSync(outside, join(workspace, "escape-link"));
+
+    const client = await openClient(server!.url, token);
+    await expect(client.call("bridge/browse", { path: join(workspace, "escape-link") })).rejects.toThrow(
+      /outside allowed workspace roots/,
+    );
+    await client.close();
+  });
+
 });

@@ -1,9 +1,9 @@
-import { resolve, normalize, sep, isAbsolute } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { resolve, normalize, sep, isAbsolute, dirname, basename, join } from "node:path";
 
 /**
  * Workspace sandboxing: refuse paths outside allowed roots.
- * Resolves symlinks are NOT followed here (MVP); callers that touch the
- * filesystem should re-check after realpath.
+ * Use {@link assertAllowedRealPath} for browse/fs ops so symlink escapes are denied.
  */
 
 export class SandboxError extends Error {
@@ -43,7 +43,32 @@ export function isPathAllowed(path: string, allowedRoots: string[], cwd?: string
 }
 
 /**
- * Resolve `path` against `cwd` and assert it lies inside `allowedRoots`.
+ * Resolve symlinks for an absolute path. If the path does not exist,
+ * realpath the nearest existing ancestor and rejoin the remaining segments.
+ */
+export function resolveRealPath(path: string, cwd = process.cwd()): string {
+  const abs = normalizePath(path, cwd);
+  if (existsSync(abs)) {
+    return realpathSync(abs);
+  }
+  const missing: string[] = [];
+  let cur = abs;
+  while (true) {
+    missing.unshift(basename(cur));
+    const parent = dirname(cur);
+    if (parent === cur) {
+      // Hit filesystem root without finding an existing ancestor.
+      return abs;
+    }
+    if (existsSync(parent)) {
+      return join(realpathSync(parent), ...missing);
+    }
+    cur = parent;
+  }
+}
+
+/**
+ * Resolve `path` against `cwd` and assert it lies inside `allowedRoots` (lexical).
  * Throws SandboxError otherwise.
  */
 export function assertAllowedPath(path: string, allowedRoots: string[], cwd?: string): string {
@@ -55,8 +80,39 @@ export function assertAllowedPath(path: string, allowedRoots: string[], cwd?: st
 }
 
 /**
+ * Like {@link assertAllowedPath}, but resolves symlinks via realpath so a link
+ * inside an allowed root cannot escape to a target outside.
+ * Returns the real (symlink-resolved) absolute path.
+ */
+export function assertAllowedRealPath(
+  path: string,
+  allowedRoots: string[],
+  cwd?: string,
+): string {
+  if (!allowedRoots || allowedRoots.length === 0) {
+    const target = resolveRealPath(path, cwd);
+    throw new SandboxError(`path outside allowed workspace roots: ${target}`);
+  }
+  const target = resolveRealPath(path, cwd);
+  const ok = allowedRoots.some((root) => {
+    let realRoot: string;
+    try {
+      realRoot = resolveRealPath(root, cwd);
+    } catch {
+      realRoot = normalizePath(root, cwd);
+    }
+    return isInsideRoot(target, realRoot);
+  });
+  if (!ok) {
+    throw new SandboxError(`path outside allowed workspace roots: ${target}`);
+  }
+  return target;
+}
+
+/**
  * Assert a session cwd is itself an allowed root (or inside one).
+ * Uses realpath so a workspace symlink cannot escape allowedRoots.
  */
 export function assertAllowedWorkspace(cwd: string, allowedRoots: string[]): string {
-  return assertAllowedPath(cwd, allowedRoots);
+  return assertAllowedRealPath(cwd, allowedRoots);
 }

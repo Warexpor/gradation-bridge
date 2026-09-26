@@ -1,9 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   assertAllowedPath,
+  assertAllowedRealPath,
+  assertAllowedWorkspace,
   isInsideRoot,
   isPathAllowed,
   normalizePath,
+  resolveRealPath,
   SandboxError,
 } from "../src/approval/sandbox.js";
 
@@ -45,5 +51,80 @@ describe("sandbox", () => {
   it("blocks .. traversal out of the root", () => {
     expect(isPathAllowed("../secrets", [root], root)).toBe(false);
     expect(isPathAllowed("src/../../other/x", [root], root)).toBe(false);
+  });
+});
+
+describe("sandbox realpath / symlink hardening", () => {
+  let tmp: string | undefined;
+
+  afterEach(() => {
+    if (tmp) {
+      rmSync(tmp, { recursive: true, force: true });
+      tmp = undefined;
+    }
+  });
+
+  it("resolveRealPath follows symlinks for existing paths", () => {
+    tmp = mkdtempSync(join(tmpdir(), "gb-sb-"));
+    const allowed = join(tmp, "allowed");
+    const outside = join(tmp, "outside");
+    mkdirSync(allowed);
+    mkdirSync(outside);
+    writeFileSync(join(outside, "secret.txt"), "nope\n");
+    symlinkSync(outside, join(allowed, "escape"));
+
+    const real = resolveRealPath(join(allowed, "escape", "secret.txt"));
+    expect(real).toBe(join(outside, "secret.txt"));
+  });
+
+  it("assertAllowedRealPath denies symlink escape from allowed root", () => {
+    tmp = mkdtempSync(join(tmpdir(), "gb-sb-"));
+    const allowed = join(tmp, "allowed");
+    const outside = join(tmp, "outside");
+    mkdirSync(allowed);
+    mkdirSync(outside);
+    writeFileSync(join(outside, "secret.txt"), "nope\n");
+    symlinkSync(outside, join(allowed, "escape"));
+
+    // Lexical check would allow the path under allowed/...
+    expect(assertAllowedPath(join(allowed, "escape", "secret.txt"), [allowed])).toContain(
+      "escape",
+    );
+
+    expect(() =>
+      assertAllowedRealPath(join(allowed, "escape", "secret.txt"), [allowed]),
+    ).toThrow(SandboxError);
+
+    expect(() => assertAllowedRealPath(join(allowed, "escape"), [allowed])).toThrow(
+      SandboxError,
+    );
+  });
+
+  it("assertAllowedRealPath allows real paths inside the root", () => {
+    tmp = mkdtempSync(join(tmpdir(), "gb-sb-"));
+    const allowed = join(tmp, "allowed");
+    mkdirSync(join(allowed, "src"), { recursive: true });
+    writeFileSync(join(allowed, "src", "a.ts"), "x\n");
+    const real = assertAllowedRealPath(join(allowed, "src", "a.ts"), [allowed]);
+    expect(real).toBe(join(allowed, "src", "a.ts"));
+  });
+
+  it("assertAllowedWorkspace denies cwd that is a symlink outside", () => {
+    tmp = mkdtempSync(join(tmpdir(), "gb-sb-"));
+    const allowed = join(tmp, "allowed");
+    const outside = join(tmp, "outside");
+    mkdirSync(allowed);
+    mkdirSync(outside);
+    const linkCwd = join(allowed, "ws-link");
+    symlinkSync(outside, linkCwd);
+    expect(() => assertAllowedWorkspace(linkCwd, [allowed])).toThrow(SandboxError);
+  });
+
+  it("assertAllowedRealPath resolves non-existent child under real parent", () => {
+    tmp = mkdtempSync(join(tmpdir(), "gb-sb-"));
+    const allowed = join(tmp, "allowed");
+    mkdirSync(allowed);
+    const target = assertAllowedRealPath(join(allowed, "new-file.txt"), [allowed]);
+    expect(target).toBe(join(allowed, "new-file.txt"));
   });
 });

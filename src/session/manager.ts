@@ -14,7 +14,7 @@ import {
   type RequestPermissionParams,
 } from "../acp/permissions.js";
 import { decidePermission, requiresMachineWarning } from "../approval/policy.js";
-import { assertAllowedPath, assertAllowedWorkspace, SandboxError } from "../approval/sandbox.js";
+import { assertAllowedRealPath, assertAllowedWorkspace, SandboxError } from "../approval/sandbox.js";
 import { SessionLog } from "./log.js";
 
 export type SessionStatus = "idle" | "running" | "needs_approval" | "error" | "closed";
@@ -464,7 +464,7 @@ export class SessionManager {
   private handleReadTextFile(rec: SessionRecord, params: unknown): { content: string } {
     const p = (params ?? {}) as { path?: string; line?: number; limit?: number };
     if (!p.path) throw Object.assign(new Error("path required"), { code: -32602 });
-    const path = assertAllowedPath(p.path, this.opts.config.allowedRoots, rec.cwd);
+    const path = assertAllowedRealPath(p.path, this.opts.config.allowedRoots, rec.cwd);
     let content = readFileSync(path, "utf8");
     if (p.line != null || p.limit != null) {
       const lines = content.split("\n");
@@ -478,7 +478,7 @@ export class SessionManager {
   private handleWriteTextFile(rec: SessionRecord, params: unknown): Record<string, never> {
     const p = (params ?? {}) as { path?: string; content?: string };
     if (!p.path) throw Object.assign(new Error("path required"), { code: -32602 });
-    const path = assertAllowedPath(p.path, this.opts.config.allowedRoots, rec.cwd);
+    const path = assertAllowedRealPath(p.path, this.opts.config.allowedRoots, rec.cwd);
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, p.content ?? "", "utf8");
     return {};
@@ -496,7 +496,7 @@ export class SessionManager {
     };
     if (!p.command) throw Object.assign(new Error("command required"), { code: -32602 });
     const cwd = p.cwd
-      ? assertAllowedPath(p.cwd, this.opts.config.allowedRoots, rec.cwd)
+      ? assertAllowedRealPath(p.cwd, this.opts.config.allowedRoots, rec.cwd)
       : rec.cwd;
     const env: NodeJS.ProcessEnv = { ...process.env };
     for (const e of p.env ?? []) env[e.name] = e.value;

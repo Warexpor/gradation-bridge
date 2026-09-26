@@ -13,7 +13,8 @@ import { parseAuthorizationHeader, verifyBearerToken } from "../auth/token.js";
 import type { BridgeConfig, PermissionMode } from "../config/types.js";
 import { listHarnesses } from "../harness/registry.js";
 import { SessionManager, SandboxError } from "../session/manager.js";
-import { assertAllowedPath } from "../approval/sandbox.js";
+import { assertAllowedRealPath } from "../approval/sandbox.js";
+import { getGitDiff, getGitStatus } from "../git/status.js";
 
 export interface WsServerOptions {
   host: string;
@@ -290,7 +291,7 @@ async function dispatch(
     }
     case "bridge/browse": {
       const path = String(p.path ?? "");
-      const allowed = assertAllowedPath(path, opts.config.allowedRoots);
+      const allowed = assertAllowedRealPath(path, opts.config.allowedRoots);
       const entries = readdirSync(allowed).map((name) => {
         let dir = false;
         try {
@@ -314,10 +315,40 @@ async function dispatch(
       opts.sessions.close(sessionId);
       return {};
     }
-    case "bridge/diff":
-      return { unified: "" };
-    case "bridge/gitStatus":
-      return { branch: "", ahead: 0, behind: 0, files: [] };
+    case "bridge/diff": {
+      const sessionId = String(p.sessionId ?? "");
+      const filePath = String(p.path ?? "");
+      const rec = opts.sessions.get(sessionId);
+      if (!rec) {
+        const err = new Error(`unknown session: ${sessionId}`) as Error & { code?: number };
+        err.code = -32002;
+        throw err;
+      }
+      // Ensure workspace still under allowed roots; resolve file via realpath.
+      assertAllowedRealPath(rec.cwd, opts.config.allowedRoots);
+      if (!filePath) {
+        const err = new Error("path required") as Error & { code?: number };
+        err.code = -32602;
+        throw err;
+      }
+      const allowedFile = assertAllowedRealPath(filePath, opts.config.allowedRoots, rec.cwd);
+      return getGitDiff(rec.cwd, allowedFile);
+    }
+    case "bridge/gitStatus": {
+      const sessionId = String(p.sessionId ?? "");
+      const rec = opts.sessions.get(sessionId);
+      if (!rec) {
+        const err = new Error(`unknown session: ${sessionId}`) as Error & { code?: number };
+        err.code = -32002;
+        throw err;
+      }
+      const cwd = assertAllowedRealPath(rec.cwd, opts.config.allowedRoots);
+      const status = await getGitStatus(cwd);
+      if (status.branch) {
+        rec.branch = status.branch;
+      }
+      return status;
+    }
 
     case "session/new": {
       const meta = (p._meta ?? {}) as Record<string, unknown>;

@@ -4,7 +4,7 @@ ACP bridge daemon for [GradatiON](https://github.com/Warexpor/GradatiON) Code mo
 
 The phone never runs an agent. This small Node 20+ daemon on your machine launches coding agents (Claude Code, Codex, OpenCode, Grok Build, Cursor CLI, Pi, …) over stdio via the [Agent Client Protocol](https://agentclientprotocol.com/), and relays sessions to GradatiON over one authenticated WebSocket.
 
-> **Status:** Working MVP. End-to-end ACP sessions (initialize / new / prompt / cancel / load), approval policy, JSONL resume, and bridge extensions are implemented. Tested with a fake ACP agent; point config at OpenCode (`opencode acp`), Claude (`npx @zed-industries/claude-code-acp`), or any other harness on PATH.
+> **Status:** Working MVP. End-to-end ACP sessions (initialize / new / prompt / cancel / load), approval policy, JSONL resume, sandboxed git status/diff, realpath sandbox, and bridge extensions are implemented. Tested with a fake ACP agent; point config at OpenCode (`opencode acp`), Claude (`npx @zed-industries/claude-code-acp`), or any other harness on PATH.
 
 ## Quick start (against GradatiON)
 
@@ -124,7 +124,7 @@ Bridge extensions (see GradatiON `docs/code-mode-plan.md` §3.2):
 - `bridge/listHarnesses`, `bridge/listWorkspaces`, `bridge/browse`
 - `bridge/listSessions`, `bridge/closeSession`
 - `bridge/permissionResolved`, `bridge/sessionStatus` (notifications)
-- `bridge/diff`, `bridge/gitStatus` (stubs — empty for now)
+- `bridge/diff`, `bridge/gitStatus` (sandboxed `git diff` / `git status --porcelain` under allowedRoots)
 
 Every notification carries `_meta.seq` from an append-only JSONL log so a reconnecting phone can resume via `session/load` + `_meta.afterSeq`.
 
@@ -155,9 +155,8 @@ Requires Node 20+. Depends on [`@agentclientprotocol/sdk`](https://www.npmjs.com
 
 ## Remaining stubs / next
 
-- `bridge/diff` and `bridge/gitStatus` return empty placeholders.
-- Push notifications when no phone is attached (§3.1.7 of the plan).
-- Richer terminal UX and symlink-aware sandbox (`realpath`).
+- Push notifications when no phone is attached (§3.1.7 of the plan) — not implemented.
+- Richer terminal UX (PTY / streaming); FS browse/read/write already realpath-sandbox.
 - Multi-session sharing one long-lived agent process (today: one process per session).
 
 ## License
