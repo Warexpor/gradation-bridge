@@ -6,7 +6,7 @@
 export type PermissionMode = "ask" | "auto-edit" | "plan" | "full-auto";
 
 export interface HarnessConfig {
-  /** Stable id, e.g. "claude", "codex", "opencode", "gemini", or custom. */
+  /** Stable id, e.g. "claude", "codex", "opencode", "grok-build", "cursor-cli", "pi", or custom. */
   id: string;
   name: string;
   /** argv[0]; looked up on PATH unless absolute. */
@@ -51,10 +51,22 @@ export const DEFAULT_HARNESSES: HarnessConfig[] = [
     args: ["acp"],
   },
   {
-    id: "gemini",
-    name: "Gemini CLI",
-    command: "gemini",
-    args: ["--experimental-acp"],
+    id: "grok-build",
+    name: "Grok Build",
+    command: "npx",
+    args: ["-y", "@xai-official/grok", "agent", "stdio"],
+  },
+  {
+    id: "cursor-cli",
+    name: "Cursor CLI",
+    command: "agent",
+    args: ["acp"],
+  },
+  {
+    id: "pi",
+    name: "Pi",
+    command: "npx",
+    args: ["-y", "pi-acp"],
   },
 ];
 

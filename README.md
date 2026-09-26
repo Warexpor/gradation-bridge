@@ -2,7 +2,7 @@
 
 ACP bridge daemon for [GradatiON](https://github.com/Warexpor/GradatiON) Code mode.
 
-The phone never runs an agent. This small Node 20+ daemon on your machine launches coding agents (Claude Code, Codex, OpenCode, Gemini CLI, …) over stdio via the [Agent Client Protocol](https://agentclientprotocol.com/), and relays sessions to GradatiON over one authenticated WebSocket.
+The phone never runs an agent. This small Node 20+ daemon on your machine launches coding agents (Claude Code, Codex, OpenCode, Grok Build, Cursor CLI, Pi, …) over stdio via the [Agent Client Protocol](https://agentclientprotocol.com/), and relays sessions to GradatiON over one authenticated WebSocket.
 
 > **Status:** MVP scaffold. Pairing/auth, config, approval policy, session log, harness registry, and WS stubs are in place. Full ACP session relay is next.
 
