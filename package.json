@@ -1,7 +1,7 @@
 {
   "name": "gradation-bridge",
   "version": "0.1.0",
-  "description": "ACP bridge daemon for GradatiON Code mode — launches local coding agents and relays sessions to the phone over authenticated WebSocket.",
+  "description": "ACP bridge daemon for GradatiON Code mode \u2014 launches local coding agents and relays sessions to the phone over authenticated WebSocket.",
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -23,7 +23,9 @@
     "dev": "tsx watch src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "fake-agent": "tsx src/harness/fake-agent.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "keywords": [
     "acp",

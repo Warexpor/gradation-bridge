@@ -1,0 +1,39 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { SessionLog } from "../src/session/log.js";
+
+const dirs: string[] = [];
+
+afterEach(() => {
+  for (const d of dirs.splice(0)) {
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+
+describe("SessionLog", () => {
+  it("assigns monotonic seq and injects _meta.seq", () => {
+    const base = mkdtempSync(join(tmpdir(), "gb-log-"));
+    dirs.push(base);
+    const log = new SessionLog("s1", base);
+    const a = log.append({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: { sessionId: "s1", update: { sessionUpdate: "agent_message_chunk" } },
+    });
+    const b = log.append({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: { sessionId: "s1", update: { sessionUpdate: "agent_message_chunk" } },
+    });
+    expect(a.seq).toBe(1);
+    expect(b.seq).toBe(2);
+    expect((a.event as { params: { _meta: { seq: number } } }).params._meta.seq).toBe(1);
+    expect((b.event as { params: { _meta: { seq: number } } }).params._meta.seq).toBe(2);
+
+    const replayed = [...log.replay(1)];
+    expect(replayed).toHaveLength(1);
+    expect(replayed[0].seq).toBe(2);
+  });
+});
