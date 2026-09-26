@@ -3,10 +3,12 @@
  * See GradatiON docs/code-mode-plan.md §3.1
  */
 
+import { homedir } from "node:os";
+
 export type PermissionMode = "ask" | "auto-edit" | "plan" | "full-auto";
 
 export interface HarnessConfig {
-  /** Stable id, e.g. "claude", "codex", "opencode", "grok-build", "cursor-cli", "pi", or custom. */
+  /** Stable id, e.g. "claude-code", "codex", "opencode", "grok-build", "cursor-cli", "pi", or custom. */
   id: string;
   name: string;
   /** argv[0]; looked up on PATH unless absolute. */
@@ -33,7 +35,7 @@ export interface BridgeConfig {
 
 export const DEFAULT_HARNESSES: HarnessConfig[] = [
   {
-    id: "claude",
+    id: "claude-code",
     name: "Claude Code",
     command: "npx",
     args: ["-y", "@zed-industries/claude-code-acp"],
@@ -71,8 +73,9 @@ export const DEFAULT_HARNESSES: HarnessConfig[] = [
 ];
 
 export function defaultConfig(): BridgeConfig {
+  const home = homedir();
   return {
-    allowedRoots: [],
+    allowedRoots: [home],
     workspaces: [],
     defaultPermissionMode: "ask",
     harnesses: DEFAULT_HARNESSES.map((h) => ({ ...h })),

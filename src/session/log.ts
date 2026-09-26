@@ -1,4 +1,4 @@
-import { createWriteStream, existsSync, mkdirSync, readFileSync, type WriteStream } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { dataDir, ensureDirs } from "../config/load.js";
 
@@ -12,12 +12,14 @@ export interface LoggedEvent {
 /**
  * Append-only JSONL event log with a monotonically increasing `seq` per session.
  * A reconnecting phone can replay from its last seen seq.
+ *
+ * When `event` looks like a JSON-RPC notification/request with `params`,
+ * `_meta.seq` is injected before the line is written so replay matches live frames.
  */
 export class SessionLog {
   readonly sessionId: string;
   readonly path: string;
   private seq = 0;
-  private stream: WriteStream | null = null;
 
   constructor(sessionId: string, baseDir?: string) {
     this.sessionId = sessionId;
@@ -36,23 +38,19 @@ export class SessionLog {
 
   append(event: unknown): LoggedEvent {
     this.seq += 1;
+    const stamped = injectSeq(event, this.seq);
     const entry: LoggedEvent = {
       seq: this.seq,
       ts: new Date().toISOString(),
-      event,
+      event: stamped,
     };
-    if (!this.stream) {
-      this.stream = createWriteStream(this.path, { flags: "a", mode: 0o600 });
-    }
-    this.stream.write(JSON.stringify(entry) + "\n");
+    appendFileSync(this.path, JSON.stringify(entry) + "\n", { mode: 0o600 });
     return entry;
   }
 
-  /** Yield events with seq > afterSeq (inclusive bound exclusive start). */
+  /** Yield events with seq > afterSeq. */
   *replay(afterSeq = 0): Generator<LoggedEvent> {
     if (!existsSync(this.path)) return;
-    // Flush pending writes before reading.
-    // For MVP we read the whole file; fine for scaffold size.
     const text = readFileSync(this.path, "utf8");
     for (const line of text.split("\n")) {
       if (!line.trim()) continue;
@@ -62,9 +60,27 @@ export class SessionLog {
   }
 
   close(): void {
-    this.stream?.end();
-    this.stream = null;
+    // sync writer — nothing to flush
   }
+}
+
+function injectSeq(event: unknown, seq: number): unknown {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return event;
+  const obj = event as Record<string, unknown>;
+  if (!("params" in obj)) return event;
+  const params = obj.params;
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    return {
+      ...obj,
+      params: { value: params, _meta: { seq } },
+    };
+  }
+  const p = params as Record<string, unknown>;
+  const meta =
+    p._meta && typeof p._meta === "object" && !Array.isArray(p._meta)
+      ? { ...(p._meta as Record<string, unknown>), seq }
+      : { seq };
+  return { ...obj, params: { ...p, _meta: meta } };
 }
 
 function recoverLastSeq(path: string): number {

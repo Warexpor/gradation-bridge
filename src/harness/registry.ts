@@ -1,4 +1,5 @@
 import { accessSync, constants } from "node:fs";
+import { createRequire } from "node:module";
 import { delimiter, join } from "node:path";
 import type { BridgeConfig, HarnessConfig } from "../config/types.js";
 
@@ -10,6 +11,13 @@ export interface HarnessInfo {
   args: string[];
   models?: string[];
 }
+
+const ALIASES: Record<string, string> = {
+  claude: "claude-code",
+  "claude-code": "claude-code",
+};
+
+const require = createRequire(import.meta.url);
 
 function commandExists(command: string): boolean {
   if (command.includes("/") || command.includes("\\")) {
@@ -31,7 +39,7 @@ function commandExists(command: string): boolean {
     }
   }
   // npx ships with npm; available whenever we can run under node.
-  if (command === "npx") return true;
+  if (command === "npx" || command === "node") return true;
   return false;
 }
 
@@ -40,9 +48,7 @@ function commandExists(command: string): boolean {
  * does not probe whether the ACP subcommand actually works.
  */
 export function listHarnesses(config: BridgeConfig): HarnessInfo[] {
-  return config.harnesses
-    .filter((h) => h.enabled !== false)
-    .map((h) => describeHarness(h));
+  return config.harnesses.filter((h) => h.enabled !== false).map((h) => describeHarness(h));
 }
 
 export function describeHarness(h: HarnessConfig): HarnessInfo {
@@ -58,7 +64,10 @@ export function describeHarness(h: HarnessConfig): HarnessInfo {
 }
 
 export function findHarness(config: BridgeConfig, id: string): HarnessConfig | undefined {
-  return config.harnesses.find((h) => h.id === id && h.enabled !== false);
+  const normalized = ALIASES[id] ?? id;
+  return config.harnesses.find(
+    (h) => h.enabled !== false && (h.id === id || h.id === normalized || ALIASES[h.id] === normalized),
+  );
 }
 
 export function which(command: string): string | undefined {
@@ -76,4 +85,25 @@ export function which(command: string): string | undefined {
     }
   }
   return undefined;
+}
+
+/** Build a HarnessConfig that launches the in-repo fake ACP agent via tsx. */
+export function fakeHarnessConfig(agentScriptPath: string): HarnessConfig {
+  // Absolute tsx loader so the child can run with any session cwd.
+  let tsxLoader = "tsx";
+  try {
+    tsxLoader = require.resolve("tsx/esm");
+  } catch {
+    try {
+      tsxLoader = require.resolve("tsx");
+    } catch {
+      /* bare specifier fallback */
+    }
+  }
+  return {
+    id: "fake",
+    name: "Fake ACP Agent",
+    command: process.execPath,
+    args: ["--import", tsxLoader, agentScriptPath],
+  };
 }

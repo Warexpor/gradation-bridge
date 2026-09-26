@@ -148,10 +148,10 @@ async function main(): Promise<void> {
   const tls = ensureTlsMaterial();
   const host = pickBindHost(flags);
   const port = flags.port ?? config.port ?? 8787;
-  const sessions = new SessionManager();
+  const sessions = new SessionManager({ config, version: VERSION });
 
   const hasRealCert = tls.certPem.includes("BEGIN CERTIFICATE");
-  const server = startBridgeServer({
+  const server = await startBridgeServer({
     host,
     port,
     config,
