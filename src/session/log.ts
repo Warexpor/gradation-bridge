@@ -48,13 +48,19 @@ export class SessionLog {
     return entry;
   }
 
-  /** Yield events with seq > afterSeq. */
+  /** Yield events with seq > afterSeq. Corrupt lines are skipped. */
   *replay(afterSeq = 0): Generator<LoggedEvent> {
     if (!existsSync(this.path)) return;
     const text = readFileSync(this.path, "utf8");
     for (const line of text.split("\n")) {
       if (!line.trim()) continue;
-      const entry = JSON.parse(line) as LoggedEvent;
+      let entry: LoggedEvent;
+      try {
+        entry = JSON.parse(line) as LoggedEvent;
+      } catch {
+        continue;
+      }
+      if (!entry || typeof entry.seq !== "number" || entry.event == null) continue;
       if (entry.seq > afterSeq) yield entry;
     }
   }

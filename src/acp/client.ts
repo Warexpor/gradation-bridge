@@ -8,6 +8,7 @@ import { createInterface } from "node:readline";
 import type { HarnessConfig } from "../config/types.js";
 import { log } from "../log/diagnostics.js";
 import { redactSecrets } from "../log/redact.js";
+import { killProcessTree } from "../proc/tree.js";
 
 export interface AcpJsonRpcRequest {
   jsonrpc?: string;
@@ -38,6 +39,8 @@ export interface AcpClientOptions {
   onStderr?: (line: string) => void;
 }
 
+const STDIN_BACKLOG_LIMIT = 1024;
+
 export class AcpStdioClient {
   readonly harness: HarnessConfig;
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -50,6 +53,9 @@ export class AcpStdioClient {
   private stderrBuf = "";
   private readonly stderrLines: string[] = [];
   private lastLaunchError: Error | null = null;
+  private readonly outbound: string[] = [];
+  private stdinPaused = false;
+  private settled = false;
 
   constructor(opts: AcpClientOptions) {
     this.opts = opts;
@@ -71,6 +77,7 @@ export class AcpStdioClient {
 
   start(): void {
     if (this.child) throw new Error("ACP client already started");
+    if (this.settled) throw new Error("ACP client already exited");
     const env = {
       ...process.env,
       ...this.opts.env,
@@ -80,6 +87,8 @@ export class AcpStdioClient {
       cwd: this.opts.cwd,
       env,
       stdio: ["pipe", "pipe", "pipe"],
+      // Own process group so kill() reaps npx/node grandchildren.
+      detached: process.platform !== "win32",
     });
 
     const rl = createInterface({ input: this.child.stdout });
@@ -95,18 +104,15 @@ export class AcpStdioClient {
       }
     });
 
+    this.child.stdin.on("error", (err) => {
+      this.settle(null, null, err instanceof Error ? err : new Error(String(err)));
+    });
+
     this.child.on("exit", (code, signal) => {
-      this.flushStderr();
-      this.child = null;
-      const err = new Error(
-        `ACP process exited (code=${code}, signal=${signal})${this.stderrSuffix()}`,
-      );
-      this.failPending(err);
-      this.opts.onExit?.(code, signal);
+      this.settle(code, signal);
     });
 
     this.child.on("error", (err) => {
-      this.flushStderr();
       const nodeErr = err as NodeJS.ErrnoException;
       const message =
         nodeErr.code === "ENOENT"
@@ -114,8 +120,31 @@ export class AcpStdioClient {
           : err instanceof Error
             ? err.message
             : String(err);
-      this.failPending(new Error(`ACP process error: ${message}${this.stderrSuffix()}`));
+      this.settle(null, null, new Error(`ACP process error: ${message}`));
     });
+
+    this.flushStdin();
+  }
+
+  private settle(
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    err?: Error,
+  ): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.flushStderr();
+    this.child = null;
+    this.outbound.length = 0;
+    const base = err ?? new Error(`ACP process exited (code=${code}, signal=${signal})`);
+    this.failPending(this.withStderr(base));
+    this.opts.onExit?.(code, signal);
+  }
+
+  private withStderr(err: Error): Error {
+    const suffix = this.stderrSuffix();
+    if (!suffix || err.message.includes("\nstderr:")) return err;
+    return new Error(`${err.message}${suffix}`);
   }
 
   private pushStderr(line: string): void {
@@ -144,6 +173,7 @@ export class AcpStdioClient {
   }
 
   private onLine(line: string): void {
+    if (line.length > 8 * 1024 * 1024) return;
     let msg: unknown;
     try {
       msg = JSON.parse(line);
@@ -153,7 +183,7 @@ export class AcpStdioClient {
       }
       return;
     }
-    if (!msg || typeof msg !== "object") return;
+    if (!msg || typeof msg !== "object" || Array.isArray(msg)) return;
     const obj = msg as {
       id?: number | string | null;
       method?: string;
@@ -231,19 +261,49 @@ export class AcpStdioClient {
   }
 
   private write(obj: unknown): void {
-    if (!this.child?.stdin.writable) return;
-    this.child.stdin.write(JSON.stringify(obj) + "\n");
+    if (this.settled) return;
+    if (this.outbound.length >= STDIN_BACKLOG_LIMIT) {
+      const err = new Error("ACP stdin backlog exceeded");
+      this.kill();
+      this.settle(null, null, err);
+      return;
+    }
+    this.outbound.push(JSON.stringify(obj) + "\n");
+    this.flushStdin();
+  }
+
+  private flushStdin(): void {
+    if (this.stdinPaused) return;
+    const stdin = this.child?.stdin;
+    if (!stdin || !stdin.writable) return;
+    while (this.outbound.length > 0) {
+      const line = this.outbound[0]!;
+      let ok = true;
+      try {
+        ok = stdin.write(line);
+      } catch {
+        return;
+      }
+      this.outbound.shift();
+      if (!ok) {
+        this.stdinPaused = true;
+        stdin.once("drain", () => {
+          this.stdinPaused = false;
+          this.flushStdin();
+        });
+        return;
+      }
+    }
   }
 
   /** Send a JSON-RPC request; returns a promise for the result. */
   request(method: string, params?: unknown, timeoutMs = 600_000): Promise<unknown> {
-    if (!this.child?.stdin) {
+    if (!this.child?.stdin || this.settled) {
       return Promise.reject(
         this.lastLaunchError ?? new Error(`ACP client not running${this.stderrSuffix()}`),
       );
     }
     const id = this.nextId++;
-    const payload = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
     return new Promise((resolve, reject) => {
       const timer =
         timeoutMs > 0
@@ -262,13 +322,7 @@ export class AcpStdioClient {
           reject(e);
         },
       });
-      this.child!.stdin.write(payload, (err) => {
-        if (err) {
-          if (timer) clearTimeout(timer);
-          this.pending.delete(id);
-          reject(err);
-        }
-      });
+      this.write({ jsonrpc: "2.0", id, method, params });
     });
   }
 
@@ -334,22 +388,18 @@ export class AcpStdioClient {
   }
 
   kill(signal: NodeJS.Signals = "SIGTERM"): void {
-    if (!this.child) return;
-    try {
-      this.child.kill(signal);
-    } catch {
-      // ignore
-    }
-    // Force-kill after grace period
     const child = this.child;
-    setTimeout(() => {
+    if (!child) return;
+    this.child = null;
+    killProcessTree(child, signal);
+    const timer = setTimeout(() => {
       try {
-        if (child.exitCode === null) child.kill("SIGKILL");
+        if (child.exitCode === null) killProcessTree(child, "SIGKILL");
       } catch {
         // ignore
       }
-    }, 2000).unref?.();
-    this.child = null;
+    }, 2000);
+    timer.unref?.();
   }
 }
 

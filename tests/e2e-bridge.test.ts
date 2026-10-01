@@ -44,10 +44,6 @@ async function openClient(url: string, token: string): Promise<{
   close: () => Promise<void>;
 }> {
   const ws = new WebSocket(url, { headers: { Authorization: `Bearer ${token}` } });
-  await new Promise<void>((resolve, reject) => {
-    ws.once("open", () => resolve());
-    ws.once("error", reject);
-  });
   let nextId = 1;
   const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   const updates: unknown[] = [];
@@ -68,6 +64,10 @@ async function openClient(url: string, token: string): Promise<{
       return;
     }
     if (msg.method) updates.push(msg);
+  });
+  await new Promise<void>((resolve, reject) => {
+    ws.once("open", () => resolve());
+    ws.once("error", reject);
   });
   return {
     ws,
@@ -97,8 +97,13 @@ async function openClient(url: string, token: string): Promise<{
     },
     close: () =>
       new Promise((resolve) => {
+        for (const [id, p] of pending) {
+          pending.delete(id);
+          p.reject(new Error("socket closed"));
+        }
         ws.once("close", () => resolve());
-        ws.close();
+        if (ws.readyState === ws.CLOSED) resolve();
+        else ws.close();
       }),
   };
 }
@@ -355,5 +360,252 @@ describe("bridge e2e with fake ACP agent", () => {
     );
     await client.close();
   });
+
+  async function boot(config: BridgeConfig): Promise<void> {
+    await server?.close();
+    saveConfig(config);
+    const sessions = new SessionManager({ config, version: "0.1.0-test" });
+    server = await startBridgeServer({
+      host: "127.0.0.1",
+      port: 0,
+      config,
+      sessions,
+      version: "0.1.0-test",
+    });
+  }
+
+  async function waitFor(pred: () => boolean, label: string, timeoutMs = 8_000): Promise<void> {
+    const start = Date.now();
+    while (!pred()) {
+      if (Date.now() - start > timeoutMs) throw new Error(`timeout: ${label}`);
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+
+  it("rejects malformed frames and still serves the next request", async () => {
+    const client = await openClient(server!.url, token);
+    const errors: Array<{ code?: number; message?: string }> = [];
+    client.ws.on("message", (raw) => {
+      const msg = JSON.parse(raw.toString()) as { error?: { code?: number; message?: string } };
+      if (msg.error) errors.push(msg.error);
+    });
+    client.ws.send("not json");
+    client.ws.send("null");
+    client.ws.send("[]");
+    client.ws.send(JSON.stringify({ jsonrpc: "1.0", id: 99, method: "initialize" }));
+    await waitFor(() => errors.length >= 4, "malformed frame errors");
+    expect(errors.map((e) => e.code)).toEqual([-32700, -32600, -32600, -32600]);
+
+    const init = (await client.call("initialize", { protocolVersion: 1 })) as { protocolVersion: number };
+    expect(init.protocolVersion).toBe(1);
+    await client.close();
+  });
+
+  it("cancels an in-flight prompt and rejects a second concurrent prompt", async () => {
+    await boot({
+      allowedRoots: [workspace],
+      workspaces: [workspace],
+      defaultPermissionMode: "auto-edit",
+      port: 0,
+      harnesses: [{ ...fakeHarnessConfig(fakeAgent), env: { FAKE_ACP_SLOW_MS: "400" } }],
+    });
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", { protocolVersion: 1 });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "auto-edit" },
+    })) as { sessionId: string };
+
+    const first = client.call("session/prompt", {
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "slow" }],
+    }) as Promise<{ stopReason: string }>;
+    await waitFor(
+      () => client.updates.some((u) => (u as { method?: string }).method === "session/update"),
+      "first update",
+    );
+    await expect(
+      client.call("session/prompt", {
+        sessionId: created.sessionId,
+        prompt: [{ type: "text", text: "overlap" }],
+      }),
+    ).rejects.toThrow(/already in progress/);
+
+    client.notify("session/cancel", { sessionId: created.sessionId });
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    const second = client.call("session/prompt", {
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "again" }],
+    }) as Promise<{ stopReason: string }>;
+    await waitFor(
+      () =>
+        client.updates.filter((u) => (u as { method?: string }).method === "session/update").length > 1,
+      "second prompt update",
+    );
+    await expect(
+      client.call("session/cancel", { sessionId: created.sessionId }),
+    ).resolves.toEqual({});
+    await expect(second).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    await client.call("bridge/closeSession", { sessionId: created.sessionId });
+    await client.close();
+  }, 20_000);
+
+  it("cancel during a permission prompt unblocks the agent", async () => {
+    await boot({
+      allowedRoots: [workspace],
+      workspaces: [workspace],
+      defaultPermissionMode: "ask",
+      port: 0,
+      harnesses: [{ ...fakeHarnessConfig(fakeAgent), env: { FAKE_ACP_PERMISSION: "1" } }],
+    });
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", { protocolVersion: 1 });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "ask" },
+    })) as { sessionId: string };
+
+    const promptP = client.call("session/prompt", {
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "need a decision" }],
+    }) as Promise<{ stopReason: string }>;
+    await waitFor(
+      () =>
+        client.updates.some((u) => (u as { method?: string }).method === "session/request_permission"),
+      "permission request",
+    );
+    client.notify("session/cancel", { sessionId: created.sessionId });
+    await expect(promptP).resolves.toMatchObject({ stopReason: "cancelled" });
+    await client.close();
+  }, 20_000);
+
+  it("redelivers an unanswered permission after the phone reconnects", async () => {
+    await boot({
+      allowedRoots: [workspace],
+      workspaces: [workspace],
+      defaultPermissionMode: "ask",
+      port: 0,
+      harnesses: [{ ...fakeHarnessConfig(fakeAgent), env: { FAKE_ACP_PERMISSION: "1" } }],
+    });
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", { protocolVersion: 1 });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "ask" },
+    })) as { sessionId: string };
+
+    const orphan = client
+      .call("session/prompt", {
+        sessionId: created.sessionId,
+        prompt: [{ type: "text", text: "hold for reconnect" }],
+      })
+      .catch(() => undefined);
+    await waitFor(
+      () =>
+        client.updates.some((u) => (u as { method?: string }).method === "session/request_permission"),
+      "permission before disconnect",
+    );
+    await client.close();
+
+    const client2 = await openClient(server!.url, token);
+    const answer = (msg: unknown): void => {
+      const m = msg as {
+        id?: number;
+        method?: string;
+        params?: { options?: Array<{ optionId: string; kind: string }> };
+      };
+      if (m.method !== "session/request_permission" || m.id == null) return;
+      const allow = m.params?.options?.find((o) => o.kind === "allow_once");
+      client2.ws.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: m.id,
+          result: {
+            outcome: { outcome: "selected", optionId: allow?.optionId ?? "allow-once" },
+          },
+        }),
+      );
+    };
+    client2.ws.on("message", (raw) => {
+      try {
+        answer(JSON.parse(raw.toString()));
+      } catch {
+        // ignore
+      }
+    });
+    for (const update of client2.updates) answer(update);
+
+    await waitFor(
+      () =>
+        client2.updates.some((u) => (u as { method?: string }).method === "session/request_permission"),
+      "permission redelivered",
+    );
+    await waitFor(
+      () => client2.updates.some((u) => (u as { method?: string }).method === "bridge/promptResult"),
+      "prompt result after reconnect",
+    );
+    const result = client2.updates.find(
+      (u) => (u as { method?: string }).method === "bridge/promptResult",
+    ) as { params?: { result?: { stopReason?: string } } };
+    expect(result.params?.result?.stopReason).toBe("end_turn");
+    await orphan;
+    await client2.close();
+  }, 20_000);
+
+  it("session/load respawns an agent that exited", async () => {
+    await boot({
+      allowedRoots: [workspace],
+      workspaces: [workspace],
+      defaultPermissionMode: "auto-edit",
+      port: 0,
+      harnesses: [{ ...fakeHarnessConfig(fakeAgent), env: { FAKE_ACP_EXIT_AFTER_PROMPT: "1" } }],
+    });
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", { protocolVersion: 1 });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "auto-edit" },
+    })) as { sessionId: string };
+
+    const first = (await client.call("session/prompt", {
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "die after this" }],
+    })) as { stopReason: string };
+    expect(first.stopReason).toBe("end_turn");
+
+    const deadline = Date.now() + 5_000;
+    let status = "";
+    while (Date.now() < deadline) {
+      const listed = (await client.call("bridge/listSessions")) as {
+        sessions: Array<{ status: string }>;
+      };
+      status = listed.sessions[0]?.status ?? "";
+      if (status === "error") break;
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    expect(status).toBe("error");
+
+    const loaded = (await client.call("session/load", {
+      sessionId: created.sessionId,
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { afterSeq: 0 },
+    })) as { agentAlive: boolean; replayed: number; status: string };
+    expect(loaded.replayed).toBeGreaterThan(0);
+    expect(loaded.agentAlive).toBe(true);
+
+    const second = (await client.call("session/prompt", {
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "still here" }],
+    })) as { stopReason: string };
+    expect(second.stopReason).toBe("end_turn");
+    await client.close();
+  }, 20_000);
 
 });

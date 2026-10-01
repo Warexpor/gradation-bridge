@@ -1,4 +1,4 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { configDir, ensureDirs } from "../config/load.js";
@@ -20,11 +20,28 @@ function devicesPath(): string {
   return join(configDir(), "devices.json");
 }
 
-function loadDevices(): DevicesFile {
+type DevicesRead =
+  | { ok: true; file: DevicesFile }
+  | { ok: false; path: string };
+
+function readDevices(): DevicesRead {
   ensureDirs();
   const path = devicesPath();
-  if (!existsSync(path)) return { devices: [] };
-  return JSON.parse(readFileSync(path, "utf8")) as DevicesFile;
+  if (!existsSync(path)) return { ok: true, file: { devices: [] } };
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as DevicesFile;
+    if (!parsed || !Array.isArray(parsed.devices)) return { ok: false, path };
+    return { ok: true, file: parsed };
+  } catch {
+    return { ok: false, path };
+  }
+}
+
+/** SHA-256 then constant-time compare so token length is not a timing oracle. */
+function tokenMatches(presented: string, expected: string): boolean {
+  const a = createHash("sha256").update(presented, "utf8").digest();
+  const b = createHash("sha256").update(expected, "utf8").digest();
+  return timingSafeEqual(a, b);
 }
 
 function saveDevices(file: DevicesFile): void {
@@ -43,7 +60,13 @@ export function generateToken(): string {
  * and returns `{ token, created: true }`.
  */
 export function ensurePrimaryToken(): { token: string; deviceId: string; created: boolean } {
-  const file = loadDevices();
+  const read = readDevices();
+  if (!read.ok) {
+    throw new Error(
+      `devices.json is corrupt (${read.path}); refusing to mint a replacement token`,
+    );
+  }
+  const file = read.file;
   const active = file.devices.find((d) => !d.revokedAt);
   if (active) {
     return { token: active.token, deviceId: active.id, created: false };
@@ -61,11 +84,19 @@ export function ensurePrimaryToken(): { token: string; deviceId: string; created
 }
 
 export function listDevices(): DeviceRecord[] {
-  return loadDevices().devices;
+  const read = readDevices();
+  if (!read.ok) {
+    throw new Error(`devices.json is corrupt (${read.path}); refusing to continue`);
+  }
+  return read.file.devices;
 }
 
 export function revokeDevice(id: string): boolean {
-  const file = loadDevices();
+  const read = readDevices();
+  if (!read.ok) {
+    throw new Error(`devices.json is corrupt (${read.path}); refusing to continue`);
+  }
+  const file = read.file;
   const d = file.devices.find((x) => x.id === id);
   if (!d || d.revokedAt) return false;
   d.revokedAt = new Date().toISOString();
@@ -76,13 +107,13 @@ export function revokeDevice(id: string): boolean {
 /** Constant-time check against any non-revoked device token. */
 export function verifyBearerToken(presented: string | undefined): boolean {
   if (!presented || presented.length === 0) return false;
-  const file = loadDevices();
-  const active = file.devices.filter((d) => !d.revokedAt);
-  const presentedBuf = Buffer.from(presented, "utf8");
+  const read = readDevices();
+  // Fail closed. Never throw on the upgrade path — a bad devices file must
+  // not take down the listener, and must not be overwritten with a new token.
+  if (!read.ok) return false;
+  const active = read.file.devices.filter((d) => !d.revokedAt);
   for (const d of active) {
-    const expected = Buffer.from(d.token, "utf8");
-    if (expected.length !== presentedBuf.length) continue;
-    if (timingSafeEqual(expected, presentedBuf)) return true;
+    if (tokenMatches(presented, d.token)) return true;
   }
   return false;
 }

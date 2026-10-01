@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { dataDir, ensureDirs } from "../config/load.js";
 
@@ -31,31 +31,65 @@ export function fingerprintOfPem(certPem: string): string {
   return createHash("sha256").update(der).digest("hex");
 }
 
-function tryOpensslSelfSigned(keyPath: string, certPath: string): boolean {
-  try {
-    execFileSync(
-      "openssl",
-      [
-        "req",
-        "-x509",
-        "-newkey",
-        "rsa:2048",
-        "-keyout",
-        keyPath,
-        "-out",
-        certPath,
-        "-days",
-        "3650",
-        "-nodes",
-        "-subj",
-        "/CN=gradation-bridge",
-      ],
-      { stdio: "pipe" },
-    );
-    return true;
-  } catch {
-    return false;
+/**
+ * SANs for a newly minted self-signed cert. Existing certs are left alone so
+ * a paired phone's pinned fingerprint does not change.
+ */
+export function tlsSubjectAltNames(bindHost?: string): string[] {
+  const sans = ["DNS:localhost", "DNS:gradation-bridge", "IP:127.0.0.1", "IP:::1"];
+  if (!bindHost || bindHost === "127.0.0.1" || bindHost === "localhost" || bindHost === "::1") {
+    return sans;
   }
+  if (bindHost.includes(":")) {
+    const bare = bindHost.replace(/^\[|\]$/g, "");
+    sans.push(`IP:${bare}`);
+  } else if (/^\d{1,3}(\.\d{1,3}){3}$/.test(bindHost)) {
+    sans.push(`IP:${bindHost}`);
+  } else {
+    sans.push(`DNS:${bindHost}`);
+  }
+  return sans;
+}
+
+function opensslArgs(keyPath: string, certPath: string, sans?: string[]): string[] {
+  const args = [
+    "req",
+    "-x509",
+    "-newkey",
+    "rsa:2048",
+    "-keyout",
+    keyPath,
+    "-out",
+    certPath,
+    "-days",
+    "3650",
+    "-nodes",
+    "-subj",
+    "/CN=gradation-bridge",
+  ];
+  if (sans && sans.length > 0) {
+    args.push("-addext", `subjectAltName=${sans.join(",")}`);
+  }
+  return args;
+}
+
+function tryOpensslSelfSigned(keyPath: string, certPath: string, sans: string[]): boolean {
+  const attempts = [opensslArgs(keyPath, certPath, sans), opensslArgs(keyPath, certPath)];
+  for (const args of attempts) {
+    try {
+      execFileSync("openssl", args, { stdio: "pipe" });
+      try {
+        chmodSync(keyPath, 0o600);
+        chmodSync(certPath, 0o600);
+      } catch {
+        // best effort
+      }
+      return true;
+    } catch {
+      // retry without SAN; some openssl builds reject -addext
+    }
+  }
+  return false;
 }
 
 /**
@@ -63,9 +97,10 @@ function tryOpensslSelfSigned(keyPath: string, certPath: string): boolean {
  * self-signed cert (no extra npm deps). Falls back to writing an RSA key and
  * leaving a stub cert marker if openssl is missing.
  */
-export function ensureTlsMaterial(): TlsMaterial {
+export function ensureTlsMaterial(opts?: { bindHost?: string }): TlsMaterial {
   ensureDirs();
   const { keyPath, certPath } = certPaths();
+  const sans = tlsSubjectAltNames(opts?.bindHost);
 
   if (existsSync(keyPath) && existsSync(certPath)) {
     const keyPem = readFileSync(keyPath, "utf8");
@@ -82,7 +117,7 @@ export function ensureTlsMaterial(): TlsMaterial {
     }
   }
 
-  if (tryOpensslSelfSigned(keyPath, certPath)) {
+  if (tryOpensslSelfSigned(keyPath, certPath, sans)) {
     const keyPem = readFileSync(keyPath, "utf8");
     const certPem = readFileSync(certPath, "utf8");
     return {

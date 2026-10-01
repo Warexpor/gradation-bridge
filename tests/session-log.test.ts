@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -35,5 +35,17 @@ describe("SessionLog", () => {
     const replayed = [...log.replay(1)];
     expect(replayed).toHaveLength(1);
     expect(replayed[0].seq).toBe(2);
+  });
+
+  it("skips corrupt lines while replaying", () => {
+    const base = mkdtempSync(join(tmpdir(), "gb-log-"));
+    dirs.push(base);
+    const log = new SessionLog("s2", base);
+    log.append({ jsonrpc: "2.0", method: "session/update", params: { n: 1 } });
+    appendFileSync(log.path, "{this is not json\n");
+    appendFileSync(log.path, "\n");
+    log.append({ jsonrpc: "2.0", method: "session/update", params: { n: 2 } });
+    const replayed = [...log.replay(0)];
+    expect(replayed.map((e) => e.seq)).toEqual([1, 2]);
   });
 });

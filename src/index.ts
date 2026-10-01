@@ -170,9 +170,9 @@ async function main(): Promise<void> {
   const config = loadConfig();
   applyLogLevel(config.logLevel);
   const { token, created: tokenCreated } = ensurePrimaryToken();
-  const tls = ensureTlsMaterial();
   const host = pickBindHost(flags);
   const port = flags.port ?? config.port ?? 8787;
+  const tls = ensureTlsMaterial({ bindHost: host });
   const sessions = new SessionManager({ config, version: VERSION });
 
   const hasRealCert = tls.certPem.includes("BEGIN CERTIFICATE");
@@ -206,9 +206,18 @@ async function main(): Promise<void> {
     );
   }
 
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     process.stdout.write("\nshutting down…\n");
-    await server.close();
+    try {
+      await server.close();
+    } catch (err) {
+      process.stderr.write(
+        `shutdown error: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
     process.exit(0);
   };
   process.on("SIGINT", () => void shutdown());

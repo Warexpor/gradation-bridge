@@ -14,6 +14,7 @@
  *   FAKE_ACP_AUTH=1             — advertise an auth method from initialize
  *   FAKE_ACP_DUMP=<file>        — write the initialize params JSON to a file
  *   FAKE_ACP_SLOW_MS=N          — delay between update chunks
+ *   FAKE_ACP_EXIT_AFTER_PROMPT=1 — exit shortly after the prompt result is flushed
  */
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -35,6 +36,7 @@ const wantTerminal = process.env.FAKE_ACP_TERMINAL === "1";
 const wantAuth = process.env.FAKE_ACP_AUTH === "1";
 const dumpPath = process.env.FAKE_ACP_DUMP;
 const slowMs = Number(process.env.FAKE_ACP_SLOW_MS ?? "0") || 0;
+const exitAfterPrompt = process.env.FAKE_ACP_EXIT_AFTER_PROMPT === "1";
 
 function write(obj: unknown): void {
   process.stdout.write(JSON.stringify(obj) + "\n");
@@ -126,7 +128,12 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     },
   });
 
-  if (wantPermission && !session.cancelled) {
+  if (session.cancelled) {
+    respond(id, { stopReason: "cancelled" });
+    return;
+  }
+
+  if (wantPermission) {
     try {
       const permResult = (await requestClient("session/request_permission", {
         sessionId,
@@ -145,7 +152,11 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
 
       const outcome = permResult?.outcome?.outcome;
       const optionId = permResult?.outcome?.optionId;
-      if (outcome === "cancelled" || (optionId && optionId.startsWith("reject"))) {
+      if (session.cancelled || outcome === "cancelled") {
+        respond(id, { stopReason: "cancelled" });
+        return;
+      }
+      if (optionId && optionId.startsWith("reject")) {
         notify("session/update", {
           sessionId,
           update: {
@@ -241,7 +252,10 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
       },
     },
   });
-  respond(id, { stopReason: "end_turn" });
+  const done = { jsonrpc: "2.0", id, result: { stopReason: "end_turn" } };
+  process.stdout.write(JSON.stringify(done) + "\n", () => {
+    if (exitAfterPrompt) setTimeout(() => process.exit(0), 50);
+  });
 }
 
 async function dispatch(msg: JsonRpcRequest): Promise<void> {

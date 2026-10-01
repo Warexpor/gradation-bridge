@@ -19,6 +19,8 @@ import { log, recentLogs } from "../log/diagnostics.js";
 import { SessionManager, SandboxError } from "../session/manager.js";
 import { assertAllowedRealPath } from "../approval/sandbox.js";
 import { getGitDiff, getGitStatus } from "../git/status.js";
+import { parseRpcFrame, type JsonRpcMessage } from "./frames.js";
+import { SocketOutbox } from "./outbox.js";
 
 export interface WsServerOptions {
   host: string;
@@ -29,13 +31,37 @@ export interface WsServerOptions {
   version: string;
 }
 
-interface JsonRpcMessage {
-  jsonrpc?: string;
-  id?: number | string | null;
-  method?: string;
-  params?: unknown;
-  result?: unknown;
-  error?: unknown;
+interface BridgeSocket extends WebSocket {
+  isAlive?: boolean;
+  bridgeToken?: string;
+}
+
+interface PendingPhone {
+  resolve: (v: { result?: unknown; error?: unknown; requestId: string | number }) => void;
+  reject: (e: Error) => void;
+  timer: NodeJS.Timeout;
+  frame: unknown;
+  params: unknown;
+}
+
+const outboxes = new WeakMap<WebSocket, SocketOutbox>();
+
+function send(ws: WebSocket, obj: unknown, droppable = false): boolean {
+  const box = outboxes.get(ws);
+  if (box) return box.trySend(obj, droppable);
+  if (ws.readyState !== ws.OPEN) return false;
+  try {
+    ws.send(JSON.stringify(obj));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sendImportant(ws: WebSocket, obj: unknown): Promise<boolean> {
+  const box = outboxes.get(ws);
+  if (!box) return Promise.resolve(send(ws, obj, false));
+  return box.send(obj);
 }
 
 export interface BridgeServer {
@@ -58,10 +84,6 @@ function extractToken(req: IncomingMessage): string | undefined {
   }
 }
 
-function send(ws: WebSocket, obj: unknown): void {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
-}
-
 export async function startBridgeServer(opts: WsServerOptions): Promise<BridgeServer> {
   const useTls = Boolean(opts.tls?.certPem.includes("BEGIN CERTIFICATE"));
   let httpServer: HttpServer | HttpsServer;
@@ -72,22 +94,35 @@ export async function startBridgeServer(opts: WsServerOptions): Promise<BridgeSe
     httpServer = createHttpServer();
   }
 
-  const wss = new WebSocketServer({ noServer: true });
-  const clients = new Set<WebSocket>();
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
+  const clients = new Set<BridgeSocket>();
   let phoneReqId = 1;
-  const pendingPhone = new Map<
-    string | number,
-    {
-      resolve: (v: { result?: unknown; error?: unknown; requestId: string | number }) => void;
-      reject: (e: Error) => void;
-      timer: NodeJS.Timeout;
-    }
-  >();
+  const pendingPhone = new Map<string | number, PendingPhone>();
 
-  const broadcast = (msg: unknown): void => {
-    const raw = JSON.stringify(msg);
-    for (const ws of clients) {
-      if (ws.readyState === ws.OPEN) ws.send(raw);
+  const fanout = (msg: unknown, droppable = false): void => {
+    for (const ws of clients) send(ws, msg, droppable);
+  };
+
+  const broadcast = (msg: unknown, broadcastOpts?: { droppable?: boolean }): void => {
+    fanout(msg, broadcastOpts?.droppable === true);
+  };
+
+  const resendPending = (ws: WebSocket): void => {
+    for (const pending of pendingPhone.values()) {
+      send(ws, pending.frame, false);
+    }
+  };
+
+  const cancelPhoneRequests = (sessionId: string): void => {
+    for (const [id, pending] of pendingPhone) {
+      const params = pending.params as { sessionId?: string } | null;
+      if (!params || typeof params !== "object" || params.sessionId !== sessionId) continue;
+      clearTimeout(pending.timer);
+      pendingPhone.delete(id);
+      pending.resolve({
+        result: { outcome: { outcome: "cancelled" } },
+        requestId: id,
+      });
     }
   };
 
@@ -95,9 +130,6 @@ export async function startBridgeServer(opts: WsServerOptions): Promise<BridgeSe
     method: string,
     params: unknown,
   ): Promise<{ result?: unknown; error?: unknown; requestId: string | number }> => {
-    if (clients.size === 0) {
-      return Promise.reject(new Error("no phone connected"));
-    }
     const requestId = phoneReqId++;
     const frame = { jsonrpc: "2.0", id: requestId, method, params };
     return new Promise((resolve, reject) => {
@@ -105,48 +137,113 @@ export async function startBridgeServer(opts: WsServerOptions): Promise<BridgeSe
         pendingPhone.delete(requestId);
         reject(new Error(`phone did not answer ${method}`));
       }, 300_000);
-      pendingPhone.set(requestId, { resolve, reject, timer });
-      const raw = JSON.stringify(frame);
-      for (const ws of clients) {
-        if (ws.readyState === ws.OPEN) ws.send(raw);
-      }
+      pendingPhone.set(requestId, { resolve, reject, timer, frame, params });
+      // Keep the request if every phone is briefly gone so a reconnect can answer.
+      if (clients.size > 0) fanout(frame, false);
     });
   };
 
-  opts.sessions.setHooks({ broadcast, requestPhone });
+  opts.sessions.setHooks({ broadcast, requestPhone, cancelPhoneRequests });
 
   httpServer.on("upgrade", (req, socket, head) => {
-    const url = new URL(req.url ?? "/", "http://localhost");
-    if (url.pathname !== "/v1") {
-      socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+    try {
+      const url = new URL(req.url ?? "/", "http://localhost");
+      if (url.pathname !== "/v1") {
+        socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+      const token = extractToken(req);
+      if (!verifyBearerToken(token)) {
+        log("warn", "rejected websocket upgrade: missing or invalid credentials");
+        socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        (ws as BridgeSocket).bridgeToken = token;
+        wss.emit("connection", ws, req);
+      });
+    } catch {
       socket.destroy();
-      return;
     }
-    const token = extractToken(req);
-    if (!verifyBearerToken(token)) {
-      log("warn", "rejected websocket upgrade: missing or invalid credentials");
-      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
-      socket.destroy();
-      return;
-    }
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
-    });
   });
 
   wss.on("connection", (ws) => {
-    clients.add(ws);
-    ws.on("message", (raw) => {
-      void handleMessage(ws, raw.toString(), opts, pendingPhone);
+    const sock = ws as BridgeSocket;
+    sock.isAlive = true;
+    clients.add(sock);
+    outboxes.set(
+      sock,
+      new SocketOutbox(sock, {
+        onDrop: (n) => {
+          if (n === 1 || n % 100 === 0) {
+            process.stderr.write(
+              `warning: dropped ${n} outbound frame(s) due to backpressure\n`,
+            );
+          }
+        },
+      }),
+    );
+    resendPending(sock);
+    sock.on("pong", () => {
+      sock.isAlive = true;
     });
-    ws.on("close", () => {
-      clients.delete(ws);
+    sock.on("message", (raw, isBinary) => {
+      if (isBinary) {
+        send(sock, {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32600, message: "Invalid Request" },
+        });
+        return;
+      }
+      void handleMessage(sock, raw.toString(), opts, pendingPhone);
+    });
+    sock.on("error", () => {
+      clients.delete(sock);
+    });
+    sock.on("close", () => {
+      clients.delete(sock);
+      outboxes.get(sock)?.dispose();
+      outboxes.delete(sock);
     });
   });
 
+  wss.on("error", (err) => {
+    process.stderr.write(`websocket server error: ${err.message}\n`);
+  });
+
+  const ping = setInterval(() => {
+    for (const sock of clients) {
+      if (sock.isAlive === false) {
+        sock.terminate();
+        continue;
+      }
+      if (sock.bridgeToken && !verifyBearerToken(sock.bridgeToken)) {
+        sock.close(1008, "unauthorized");
+        continue;
+      }
+      sock.isAlive = false;
+      try {
+        sock.ping();
+      } catch {
+        sock.terminate();
+      }
+    }
+  }, 20_000);
+  ping.unref?.();
+
   await new Promise<void>((resolve, reject) => {
-    httpServer.once("error", reject);
-    httpServer.listen(opts.port, opts.host, () => resolve());
+    const onError = (err: Error): void => reject(err);
+    httpServer.once("error", onError);
+    httpServer.listen(opts.port, opts.host, () => {
+      httpServer.off("error", onError);
+      resolve();
+    });
+  });
+  httpServer.on("error", (err) => {
+    process.stderr.write(`http server error: ${err.message}\n`);
   });
 
   const scheme = useTls ? "wss" : "ws";
@@ -159,16 +256,27 @@ export async function startBridgeServer(opts: WsServerOptions): Promise<BridgeSe
     url,
     port: boundPort,
     close: async () => {
+      clearInterval(ping);
       for (const [, p] of pendingPhone) {
         clearTimeout(p.timer);
         p.reject(new Error("server closing"));
       }
       pendingPhone.clear();
+      for (const sock of clients) {
+        outboxes.get(sock)?.dispose();
+        outboxes.delete(sock);
+        try {
+          sock.terminate();
+        } catch {
+          // ignore
+        }
+      }
+      clients.clear();
       await opts.sessions.closeAll();
       await new Promise<void>((resolve, reject) => {
         wss.close((err) => {
           if (err) reject(err);
-          httpServer.close((e) => (e ? reject(e) : resolve()));
+          else httpServer.close((e) => (e ? reject(e) : resolve()));
         });
       });
     },
@@ -179,22 +287,35 @@ async function handleMessage(
   ws: WebSocket,
   text: string,
   opts: WsServerOptions,
-  pendingPhone: Map<
-    string | number,
-    {
-      resolve: (v: { result?: unknown; error?: unknown; requestId: string | number }) => void;
-      reject: (e: Error) => void;
-      timer: NodeJS.Timeout;
-    }
-  >,
+  pendingPhone: Map<string | number, PendingPhone>,
 ): Promise<void> {
-  let msg: JsonRpcMessage;
-  try {
-    msg = JSON.parse(text) as JsonRpcMessage;
-  } catch {
-    send(ws, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
+  const parsed = parseRpcFrame(text);
+  if (!parsed.ok) {
+    send(ws, {
+      jsonrpc: "2.0",
+      id: parsed.id,
+      error: { code: parsed.code, message: parsed.message },
+    });
     return;
   }
+  const msg: JsonRpcMessage = parsed.msg;
+  try {
+    await routeMessage(ws, msg, opts, pendingPhone);
+  } catch {
+    send(ws, {
+      jsonrpc: "2.0",
+      id: msg.id ?? null,
+      error: { code: -32603, message: "Internal error" },
+    });
+  }
+}
+
+async function routeMessage(
+  ws: WebSocket,
+  msg: JsonRpcMessage,
+  opts: WsServerOptions,
+  pendingPhone: Map<string | number, PendingPhone>,
+): Promise<void> {
 
   // Phone answering a bridge→phone request (permission)
   if (
@@ -436,8 +557,13 @@ async function dispatch(
         cwd: typeof p.cwd === "string" ? p.cwd : undefined,
         afterSeq: Number.isFinite(afterSeq) ? afterSeq : 0,
         mcpServers: Array.isArray(p.mcpServers) ? p.mcpServers : [],
-        send: (frame) => send(ws, frame),
+        send: (frame) => sendImportant(ws, frame),
       });
+    }
+
+    case "session/cancel": {
+      opts.sessions.cancel(String(p.sessionId ?? ""));
+      return {};
     }
 
     case "session/set_mode": {
