@@ -31,6 +31,12 @@ describe("terminal output limit", () => {
 
   it("rejects loader and git-config env names", () => {
     expect(blockedTerminalEnvName("LD_PRELOAD")).toBe(true);
+    expect(blockedTerminalEnvName("GIT_DIR")).toBe(true);
+    expect(blockedTerminalEnvName("GIT_WORK_TREE")).toBe(true);
+    expect(blockedTerminalEnvName("GIT_EDITOR")).toBe(true);
+    expect(blockedTerminalEnvName("GIT_PAGER")).toBe(true);
+    expect(blockedTerminalEnvName("EDITOR")).toBe(true);
+    expect(blockedTerminalEnvName("PAGER")).toBe(true);
     expect(blockedTerminalEnvName("GIT_CONFIG_KEY_0")).toBe(true);
     expect(blockedTerminalEnvName("GIT_CONFIG_VALUE_1")).toBe(true);
     expect(blockedTerminalEnvName("NODE_OPTIONS")).toBe(true);

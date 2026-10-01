@@ -325,6 +325,8 @@ function isBlockedV6(host: string): boolean {
     const v4 = h.slice("::ffff:".length);
     return isIP(v4) !== 4 || isBlockedV4(v4);
   }
+  const expanded = expandIpv6(h);
+  if (expanded && embeddedPrivateV4(expanded)) return true;
   const head = h.split(":")[0] ?? "";
   if (!head) return false;
   const prefix = Number.parseInt(head, 16);
@@ -332,6 +334,65 @@ function isBlockedV6(host: string): boolean {
   if (prefix >= 0xfe80 && prefix <= 0xfebf) return true;
   if (prefix >= 0xfc00 && prefix <= 0xfdff) return true;
   if (prefix >= 0xff00) return true;
+  return false;
+}
+
+/** Eight hextets, or undefined when `host` is not a compressed IPv6 literal. */
+function expandIpv6(host: string): number[] | undefined {
+  if (host.includes(".")) return undefined;
+  const halves = host.split("::");
+  if (halves.length > 2) return undefined;
+  const parseSide = (side: string): number[] | undefined => {
+    if (!side) return [];
+    const out: number[] = [];
+    for (const part of side.split(":")) {
+      if (!/^[0-9a-f]{1,4}$/.test(part)) return undefined;
+      out.push(Number.parseInt(part, 16));
+    }
+    return out;
+  };
+  const left = parseSide(halves[0] ?? "");
+  if (!left) return undefined;
+  if (halves.length === 1) return left.length === 8 ? left : undefined;
+  const right = parseSide(halves[1] ?? "");
+  if (!right) return undefined;
+  const missing = 8 - left.length - right.length;
+  if (missing < 1) return undefined;
+  return [...left, ...new Array<number>(missing).fill(0), ...right];
+}
+
+function v4FromHextets(hi: number, lo: number): string {
+  return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+}
+
+/**
+ * NAT64, 6to4, and IPv4-compatible forms hide a private IPv4 address inside
+ * a public-looking IPv6 literal. The phone would still open that IPv4.
+ * A public embedded address (8.8.8.8) stays allowed.
+ */
+function embeddedPrivateV4(parts: number[]): boolean {
+  const hi = parts[6] ?? 0;
+  const lo = parts[7] ?? 0;
+  const v4 = (): boolean => isBlockedV4(v4FromHextets(hi, lo));
+  // IPv4-compatible ::a.b.c.d and :: (already covered) — last 32 bits are IPv4.
+  if (parts.slice(0, 6).every((n) => n === 0)) return v4();
+  // NAT64 well-known prefix 64:ff9b::/96.
+  if (
+    parts[0] === 0x64 &&
+    parts[1] === 0xff9b &&
+    parts[2] === 0 &&
+    parts[3] === 0 &&
+    parts[4] === 0 &&
+    parts[5] === 0
+  ) {
+    return v4();
+  }
+  // NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215). Subnet id is hextet 3.
+  if (parts[0] === 0x64 && parts[1] === 0xff9b && parts[2] === 1 && parts[4] === 0 && parts[5] === 0) {
+    return v4();
+  }
+  // 6to4 2002::/16 embeds IPv4 in the next 32 bits.
+  if (parts[0] === 0x2002) return isBlockedV4(v4FromHextets(parts[1] ?? 0, parts[2] ?? 0));
   return false;
 }
 

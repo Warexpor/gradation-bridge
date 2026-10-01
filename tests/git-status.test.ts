@@ -158,9 +158,17 @@ describe("getGitStatus / getGitDiff", () => {
       GIT_CONFIG_KEY_0: "filter.evil.clean",
       GIT_CONFIG_VALUE_0: "/tmp/evil",
       GIT_PAGER: "less",
+      GIT_DIR: "/tmp/other-repo",
+      GIT_WORK_TREE: "/tmp/other-work",
+      GIT_EDITOR: "/tmp/editor",
+      EDITOR: "/tmp/editor",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.GIT_EXTERNAL_DIFF).toBeUndefined();
+    expect(env.GIT_DIR).toBeUndefined();
+    expect(env.GIT_WORK_TREE).toBeUndefined();
+    expect(env.GIT_EDITOR).toBeUndefined();
+    expect(env.EDITOR).toBeUndefined();
     expect(env.GIT_CONFIG_COUNT).toBeUndefined();
     expect(env.GIT_CONFIG_KEY_0).toBeUndefined();
     expect(env.GIT_CONFIG_VALUE_0).toBeUndefined();
@@ -325,6 +333,64 @@ describe("getGitStatus / getGitDiff", () => {
     } finally {
       if (prev === undefined) delete process.env.PATH;
       else process.env.PATH = prev;
+    }
+  });
+
+  it("does not run a clean filter pulled in by include.path", async () => {
+    tmp = mkdtempSync(join(tmpdir(), "gb-git-include-"));
+    const repo = join(tmp, "repo");
+    mkdirSync(repo);
+    const marker = join(tmp, "marker");
+    const script = join(tmp, "helper.sh");
+    const inc = join(tmp, "inc.cfg");
+    writeFileSync(script, `#!/bin/sh\necho ran >> ${JSON.stringify(marker)}\ncat "$1" 2>/dev/null || cat\n`);
+    chmodSync(script, 0o755);
+    writeFileSync(inc, `[filter "evil"]\n\tclean = ${script}\n`);
+    git(repo, ["init"]);
+    git(repo, ["config", "user.email", "test@example.com"]);
+    git(repo, ["config", "user.name", "Test"]);
+    writeFileSync(join(repo, "a.txt"), "one\n");
+    git(repo, ["add", "a.txt"]);
+    git(repo, ["commit", "-m", "init"]);
+    writeFileSync(join(repo, "a.txt"), "two\n");
+    git(repo, ["config", "include.path", inc]);
+    writeFileSync(join(repo, ".gitattributes"), "* filter=evil\n");
+
+    rmSync(marker, { force: true });
+    const diff = await getGitDiff(repo, "a.txt");
+    expect(diff.unified).toContain("+two");
+    expect(existsSync(marker)).toBe(false);
+    const st = await getGitStatus(repo);
+    expect(st.files.some((f) => f.path === "a.txt")).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("ignores GIT_DIR and reports the workspace repo", async () => {
+    tmp = mkdtempSync(join(tmpdir(), "gb-git-dir-"));
+    const workspace = join(tmp, "workspace");
+    const other = join(tmp, "other");
+    mkdirSync(workspace);
+    mkdirSync(other);
+    for (const dir of [workspace, other]) {
+      git(dir, ["init"]);
+      git(dir, ["config", "user.email", "test@example.com"]);
+      git(dir, ["config", "user.name", "Test"]);
+    }
+    writeFileSync(join(workspace, "tracked.txt"), "one\n");
+    git(workspace, ["add", "tracked.txt"]);
+    git(workspace, ["commit", "-m", "init"]);
+    writeFileSync(join(workspace, "tracked.txt"), "two\n");
+    writeFileSync(join(other, "secret.txt"), "nope\n");
+    git(other, ["add", "secret.txt"]);
+    git(other, ["commit", "-m", "init"]);
+    const prev = process.env.GIT_DIR;
+    process.env.GIT_DIR = join(other, ".git");
+    try {
+      const st = await getGitStatus(workspace);
+      expect(st.files.some((f) => f.path === "tracked.txt")).toBe(true);
+      expect(st.files.some((f) => f.path === "secret.txt")).toBe(false);
+    } finally {
+      restoreEnv("GIT_DIR", prev);
     }
   });
 
