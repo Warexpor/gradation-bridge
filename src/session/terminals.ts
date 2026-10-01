@@ -89,9 +89,10 @@ export function isEnvName(name: string): boolean {
 /**
  * Names an agent must not set on terminal/create. The phone approves argv.
  * These variables change which code that binary runs (loader, git config,
- * git directory, editor, pager, interpreter startup) without appearing in
- * the command. The process environment is still inherited; only the agent's
- * overlay is refused.
+ * git directory, editor, pager, askpass, proxy, interpreter startup) without
+ * appearing in the command. `GIT_ALLOW_PROTOCOL` turns on helpers such as
+ * `ext::` that git leaves off. The process environment is still inherited;
+ * only the agent's overlay is refused.
  */
 const BLOCKED_TERMINAL_ENV = new Set([
   "LD_PRELOAD",
@@ -119,6 +120,12 @@ const BLOCKED_TERMINAL_ENV = new Set([
   "PAGER",
   "GIT_SSH",
   "GIT_SSH_COMMAND",
+  "GIT_ASKPASS",
+  "SSH_ASKPASS",
+  "SSH_ASKPASS_REQUIRE",
+  "GIT_PROXY_COMMAND",
+  "GIT_ALLOW_PROTOCOL",
+  "GIT_CONFIG",
   "GIT_CONFIG_PARAMETERS",
   "GIT_CONFIG_COUNT",
   "GIT_CONFIG_GLOBAL",
