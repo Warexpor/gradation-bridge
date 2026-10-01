@@ -86,6 +86,56 @@ export function isEnvName(name: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
 }
 
+/**
+ * Names an agent must not set on terminal/create. The phone approves argv.
+ * These variables change which code that binary runs (loader, git config,
+ * interpreter startup) without appearing in the command.
+ */
+const BLOCKED_TERMINAL_ENV = new Set([
+  "LD_PRELOAD",
+  "LD_AUDIT",
+  "LD_PROFILE",
+  "LD_LIBRARY_PATH",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_LIBRARY_PATH",
+  "DYLD_FRAMEWORK_PATH",
+  "DYLD_FALLBACK_LIBRARY_PATH",
+  "DYLD_FALLBACK_FRAMEWORK_PATH",
+  "GIT_EXTERNAL_DIFF",
+  "GIT_EXEC_PATH",
+  "GIT_SSH",
+  "GIT_SSH_COMMAND",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM",
+  "GIT_CONFIG_NOSYSTEM",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "BASH_ENV",
+  "ENV",
+  "SHELLOPTS",
+  "BASHOPTS",
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "NODE_REPL_EXTERNAL_MODULE",
+  "PYTHONSTARTUP",
+  "PYTHONINSPECT",
+  "PYTHONPATH",
+  "PYTHONHOME",
+  "PERL5OPT",
+  "PERL5LIB",
+  "RUBYOPT",
+  "RUBYLIB",
+  "GCONV_PATH",
+]);
+
+export function blockedTerminalEnvName(name: string): boolean {
+  if (BLOCKED_TERMINAL_ENV.has(name)) return true;
+  if (name.startsWith("GIT_CONFIG_KEY_") || name.startsWith("GIT_CONFIG_VALUE_")) return true;
+  if (name.startsWith("BASH_FUNC_")) return true;
+  return false;
+}
+
 /** Reject a terminal/create the bridge cannot start. Does not spawn anything. */
 export function assertTerminalCreateParams(opts: {
   command: unknown;

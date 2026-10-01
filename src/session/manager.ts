@@ -51,12 +51,21 @@ import { SessionLog, type LoggedEvent } from "./log.js";
 import {
   deletePersistedSession,
   loadPersistedMetas,
+  pruneSessionCatalog,
   removeSessionStorage,
   sealPersistedClosed,
   writeSessionMeta,
   type SessionMeta,
 } from "./persist.js";
-import { assertTerminalCreateParams, isEnvName, TerminalTable } from "./terminals.js";
+import { assertTerminalCreateParams, blockedTerminalEnvName, isEnvName, TerminalTable } from "./terminals.js";
+import {
+  MAX_CATALOG_BYTES,
+  MAX_CLOSED_SESSIONS,
+  MAX_LIVE_AGENTS,
+  MAX_OPEN_SESSIONS,
+  resolveLimit,
+  type SessionLimits,
+} from "./limits.js";
 
 export type SessionStatus = "idle" | "running" | "needs_approval" | "error" | "closed";
 
@@ -150,6 +159,8 @@ export interface SessionManagerOptions {
   /** Abort in-flight phone requests (session cancel, or one warm login). */
   cancelPhoneRequests?: (filter: PhoneCancelFilter) => void;
   version?: string;
+  /** Test overrides. Production uses the defaults in session/limits.ts. */
+  limits?: SessionLimits;
 }
 
 /**
@@ -181,11 +192,22 @@ export class SessionManager {
   private promptGates = new Map<string, Promise<void>>();
   /** One respawn per session so two phones cannot start two harnesses. */
   private respawnInflight = new Map<string, Promise<unknown>>();
+  private readonly maxOpenSessions: number;
+  private readonly maxLiveAgents: number;
+  private readonly maxClosedSessions: number;
+  private readonly maxCatalogBytes: number;
+  /** Sync reservation so two session/new calls cannot both pass the agent cap. */
+  private agentReserved = 0;
 
   constructor(opts?: SessionManagerOptions) {
     this.opts = opts ?? {
       config: { allowedRoots: [], defaultPermissionMode: "ask", harnesses: [] },
     };
+    const limits = opts?.limits;
+    this.maxOpenSessions = resolveLimit(limits?.maxOpenSessions, MAX_OPEN_SESSIONS, 1);
+    this.maxLiveAgents = resolveLimit(limits?.maxLiveAgents, MAX_LIVE_AGENTS, 1);
+    this.maxClosedSessions = resolveLimit(limits?.maxClosedSessions, MAX_CLOSED_SESSIONS, 0);
+    this.maxCatalogBytes = resolveLimit(limits?.maxCatalogBytes, MAX_CATALOG_BYTES, 1);
     this.restorePersisted();
   }
 
@@ -340,6 +362,7 @@ export class SessionManager {
     this.terminals.closeSession(sessionId);
     rec.log.close();
     this.emitSessionStatus(rec);
+    this.pruneCatalog();
     return true;
   }
 
@@ -497,6 +520,14 @@ export class SessionManager {
       );
     }
     const permissionMode = params.permissionMode ?? config.defaultPermissionMode ?? "ask";
+    this.pruneCatalog();
+    if (this.openSessionCount() >= this.maxOpenSessions) {
+      throw new BridgeError(
+        -32012,
+        `too many open sessions (limit ${this.maxOpenSessions})`,
+        { reason: "sessions", limit: this.maxOpenSessions },
+      );
+    }
     this.warnFullAuto(permissionMode);
     log(
       "info",
@@ -542,7 +573,7 @@ export class SessionManager {
         // A failed or cancelled login does not block a fresh session process.
       }
     }
-    const warm = this.takeMatchingWarm(harness.id, cwd, launch, overlayEnv(config.env, harness.env));
+      const warm = this.takeMatchingWarm(harness.id, cwd, launch, overlayEnv(config.env, harness.env));
       if (warm) {
         client = warm.client;
         this.wireClient(rec, client, harness.id);
@@ -550,8 +581,13 @@ export class SessionManager {
         rec.authMethods = warm.authMethods;
         rec.logoutSupported = warm.logoutSupported;
       } else {
-        client = this.openClient(rec, launch);
-        client.start();
+        this.holdAgentSlot();
+        try {
+          client = this.openClient(rec, launch);
+          client.start();
+        } finally {
+          this.releaseAgentSlot();
+        }
         const initialized = await client.initialize(this.agentClientInfo());
         this.applyInit(rec, readAgentInitialize(initialized));
       }
@@ -983,9 +1019,14 @@ export class SessionManager {
         }
       },
     });
-    client.start();
-    this.warmLive.set(key, client);
     try {
+      this.holdAgentSlot();
+      try {
+        client.start();
+      } finally {
+        this.releaseAgentSlot();
+      }
+      this.warmLive.set(key, client);
       const initialized = await client.initialize(this.agentClientInfo());
       const info = readAgentInitialize(initialized);
       assertAgentAuthMethod(info.authMethods, methodId);
@@ -1203,10 +1244,21 @@ export class SessionManager {
       throw new BridgeError(-32002, `unknown session: ${rec.sessionId}`, { sessionId: rec.sessionId });
     }
     const previous = rec.client;
-    const client = this.openClient(rec);
-    previous?.kill();
+    this.holdAgentSlot();
+    let client: AcpStdioClient | undefined;
     try {
+      previous?.kill();
+      client = this.openClient(rec);
       client.start();
+    } catch (e) {
+      client?.kill();
+      if (client && rec.client === client) rec.client = null;
+      throw e;
+    } finally {
+      this.releaseAgentSlot();
+    }
+    if (!client) throw new BridgeError(-32004, "session agent not running", { sessionId: rec.sessionId });
+    try {
       if (this.sessionGone(rec)) {
         this.dropRespawn(rec, client);
         throw new BridgeError(-32002, `unknown session: ${rec.sessionId}`, { sessionId: rec.sessionId });
@@ -1228,8 +1280,8 @@ export class SessionManager {
       return result;
     } catch (e) {
       rec.clientGeneration += 1;
-      client.kill();
-      if (rec.client === client) rec.client = null;
+      client?.kill();
+      if (client && rec.client === client) rec.client = null;
       throw e;
     }
   }
@@ -1487,6 +1539,9 @@ export class SessionManager {
       if (!isEnvName(row.name) || row.value.includes("\0")) {
         throw Object.assign(new Error(`invalid env var: ${row.name}`), { code: -32602 });
       }
+      if (blockedTerminalEnvName(row.name)) {
+        throw Object.assign(new Error(`terminal env cannot set ${row.name}`), { code: -32003 });
+      }
       env[row.name] = row.value;
     }
     // Resolve before the grant is spent. Bridge PATH wins so an agent PATH
@@ -1684,6 +1739,74 @@ export class SessionManager {
       };
       this.sessions.set(rec.sessionId, rec);
       if (!workspaceOk || stale || authDirty) this.persist(rec);
+    }
+    this.pruneCatalog();
+  }
+
+  private openSessionCount(): number {
+    let n = 0;
+    for (const rec of this.sessions.values()) {
+      if (rec.status !== "closed" && !rec.closing) n += 1;
+    }
+    return n;
+  }
+
+  private liveAgentCount(): number {
+    const seen = new Set<AcpStdioClient>();
+    let n = 0;
+    const add = (client: AcpStdioClient | null | undefined): void => {
+      if (!client || !client.running || seen.has(client)) return;
+      seen.add(client);
+      n += 1;
+    };
+    for (const warm of this.warm.values()) add(warm.client);
+    for (const client of this.warmLive.values()) add(client);
+    for (const rec of this.sessions.values()) add(rec.client);
+    return n;
+  }
+
+  /** Reserve one agent process. Released as soon as `start()` returns and the process is counted. */
+  private holdAgentSlot(): void {
+    if (this.liveAgentCount() + this.agentReserved >= this.maxLiveAgents) {
+      throw new BridgeError(
+        -32012,
+        `too many running agents (limit ${this.maxLiveAgents})`,
+        { reason: "agents", limit: this.maxLiveAgents },
+      );
+    }
+    this.agentReserved += 1;
+  }
+
+  private releaseAgentSlot(): void {
+    this.agentReserved = Math.max(0, this.agentReserved - 1);
+  }
+
+  /** Drop closed transcripts that are past the count or byte cap. Open sessions stay. */
+  private pruneCatalog(): void {
+    const protect = new Set<string>();
+    for (const rec of this.sessions.values()) {
+      if (rec.status !== "closed") protect.add(rec.sessionId);
+    }
+    let removed: string[] = [];
+    try {
+      removed = pruneSessionCatalog({
+        protectIds: protect,
+        maxClosed: this.maxClosedSessions,
+        maxBytes: this.maxCatalogBytes,
+      });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      log("warn", `could not prune session catalog: ${message}`);
+      return;
+    }
+    for (const id of removed) {
+      const rec = this.sessions.get(id);
+      if (!rec || rec.status !== "closed") continue;
+      this.sessions.delete(id);
+      this.permissionEpoch.delete(id);
+      this.promptGates.delete(id);
+      this.respawnInflight.delete(id);
+      this.sessionAuthEpoch.delete(id);
     }
   }
 

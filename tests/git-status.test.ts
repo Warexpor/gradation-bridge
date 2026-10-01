@@ -267,6 +267,67 @@ describe("getGitStatus / getGitDiff", () => {
     expect(existsSync(marker)).toBe(false);
   });
 
+  it("does not run a submodule diff.external helper", async () => {
+    tmp = mkdtempSync(join(tmpdir(), "gb-git-sub-"));
+    const remote = join(tmp, "remote");
+    const parent = join(tmp, "parent");
+    mkdirSync(remote);
+    mkdirSync(parent);
+    const marker = join(tmp, "marker");
+    const script = join(tmp, "hook.sh");
+    writeFileSync(script, `#!/bin/sh\necho ran >> ${JSON.stringify(marker)}\nexit 0\n`);
+    chmodSync(script, 0o755);
+    git(remote, ["init"]);
+    git(remote, ["config", "user.email", "test@example.com"]);
+    git(remote, ["config", "user.name", "Test"]);
+    writeFileSync(join(remote, "file.txt"), "sub\n");
+    git(remote, ["add", "file.txt"]);
+    git(remote, ["commit", "-m", "init"]);
+    git(parent, ["init"]);
+    git(parent, ["config", "user.email", "test@example.com"]);
+    git(parent, ["config", "user.name", "Test"]);
+    git(parent, ["-c", "protocol.file.allow=always", "submodule", "add", remote, "child"]);
+    git(parent, ["commit", "-m", "add"]);
+    git(parent, ["config", "diff.submodule", "diff"]);
+    git(join(parent, "child"), ["config", "diff.external", script]);
+    writeFileSync(join(parent, "top.txt"), "one\n");
+    git(parent, ["add", "top.txt"]);
+    git(parent, ["commit", "-m", "top"]);
+    writeFileSync(join(parent, "top.txt"), "two\n");
+    writeFileSync(join(parent, "child", "file.txt"), "changed\n");
+    rmSync(marker, { force: true });
+
+    const diff = await getGitDiff(parent, "top.txt");
+    expect(diff.unified).toContain("+two");
+    expect(existsSync(marker)).toBe(false);
+    const st = await getGitStatus(parent);
+    expect(st.files.some((f) => f.path === "top.txt")).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+  }, 20_000);
+
+  it("kills a git helper that ignores the deadline", async () => {
+    tmp = mkdtempSync(join(tmpdir(), "gb-git-hang-"));
+    const bin = join(tmp, "bin");
+    mkdirSync(bin);
+    const fake = join(bin, "git");
+    writeFileSync(
+      fake,
+      "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = config ]; then exit 0; fi\n  if [ \"$a\" = status ] || [ \"$a\" = diff ]; then /bin/sleep 30; fi\ndone\nexit 0\n",
+    );
+    chmodSync(fake, 0o755);
+    const prev = process.env.PATH;
+    process.env.PATH = bin;
+    try {
+      await expect(getGitStatus(tmp, { timeoutMs: 400 })).rejects.toMatchObject({
+        code: -32012,
+        message: "git timed out",
+      });
+    } finally {
+      if (prev === undefined) delete process.env.PATH;
+      else process.env.PATH = prev;
+    }
+  });
+
   it("returns empty status outside a git repo", async () => {
     tmp = mkdtempSync(join(tmpdir(), "gb-nogit-"));
     mkdirSync(join(tmp, "sub"));
