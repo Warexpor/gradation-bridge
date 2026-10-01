@@ -140,4 +140,81 @@ describe("ACP stdio client errors", () => {
     }
     throw new Error(`grandchild ${grandPid} still alive after harness exit`);
   });
+
+  it("cancels a timed-out request and ignores the late result", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gb-acp-timeout-"));
+    dirs.push(dir);
+    const log = join(dir, "log.ndjson");
+    const script = join(dir, "agent.mjs");
+    writeFileSync(
+      script,
+      [
+        "import { createInterface } from 'node:readline';",
+        "import { appendFileSync } from 'node:fs';",
+        "const rl = createInterface({ input: process.stdin });",
+        "rl.on('line', (line) => {",
+        "  let msg;",
+        "  try { msg = JSON.parse(line); } catch { return; }",
+        "  appendFileSync(process.env.LOG, JSON.stringify(msg) + '\\n');",
+        "  if (msg.method === '$/cancel_request') {",
+        "    const id = msg.params && msg.params.requestId;",
+        "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result: { stopReason: 'late' } }) + '\\n');",
+        "    return;",
+        "  }",
+        "  if (msg.method === 'ping') {",
+        "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { ok: true } }) + '\\n');",
+        "  }",
+        "});",
+        "",
+      ].join("\n"),
+    );
+    const client = new AcpStdioClient({
+      harness: { id: "slow", name: "slow", command: process.execPath, args: [script] },
+      cwd: dir,
+      env: { LOG: log },
+    });
+    client.start();
+    try {
+      await expect(client.request("initialize", {}, 200)).rejects.toThrow(
+        "ACP request timeout: initialize",
+      );
+      const afterInit = await readHarnessLog(log, 2);
+      expect(afterInit.map((msg) => msg.method)).toContain("$/cancel_request");
+      expect(afterInit.map((msg) => msg.method)).not.toContain("session/cancel");
+
+      await expect(
+        client.request("session/prompt", { sessionId: "sess-1" }, 200),
+      ).rejects.toThrow("ACP request timeout: session/prompt");
+      const afterPrompt = await readHarnessLog(log, 5);
+      const methods = afterPrompt.map((msg) => msg.method);
+      expect(methods.filter((method) => method === "$/cancel_request")).toHaveLength(2);
+      const turnCancel = afterPrompt.find((msg) => msg.method === "session/cancel");
+      expect(turnCancel?.params).toEqual({ sessionId: "sess-1" });
+
+      await expect(client.request("ping", {}, 2_000)).resolves.toEqual({ ok: true });
+    } finally {
+      client.kill();
+    }
+  });
 });
+
+async function readHarnessLog(
+  path: string,
+  minLines: number,
+): Promise<Array<{ method?: string; params?: { sessionId?: string; requestId?: number } }>> {
+  const start = Date.now();
+  while (Date.now() - start < 3_000) {
+    try {
+      const lines = readFileSync(path, "utf8").split("\n").filter((line) => line.trim());
+      if (lines.length >= minLines) {
+        return lines.map(
+          (line) => JSON.parse(line) as { method?: string; params?: { sessionId?: string } },
+        );
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  throw new Error(`harness log did not reach ${minLines} lines`);
+}
