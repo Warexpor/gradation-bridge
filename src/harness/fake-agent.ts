@@ -21,6 +21,9 @@
  *   FAKE_ACP_ELICIT_URL=<url>   — url elicitation during the prompt
  *   FAKE_ACP_ELICIT_FOREIGN=1   — elicitation claims sessionId "victim-session"
  *   FAKE_ACP_ELICIT_DUMP=<file> — write the elicitation result JSON
+ *   FAKE_ACP_CANCEL_ELICIT=1    — `$/cancel_request` the elicitation as soon as it is sent
+ *   FAKE_ACP_ELICIT_IGNORE_CANCEL=1 — still elicit after session/cancel
+ *   FAKE_ACP_WRITE_ON_TERM=1    — emit a session update from the SIGTERM handler
  *   FAKE_ACP_AUTH_HOLD_MS=N     — delay authenticate before it succeeds
  *   FAKE_ACP_TRACE=<file>       — append init/auth/new lines with this process id
  *   FAKE_ACP_DUMP=<file>        — write the initialize params JSON to a file
@@ -58,6 +61,10 @@ const elicitSecret = process.env.FAKE_ACP_ELICIT_SECRET === "1";
 const elicitUrl = process.env.FAKE_ACP_ELICIT_URL;
 const elicitForeign = process.env.FAKE_ACP_ELICIT_FOREIGN === "1";
 const elicitDump = process.env.FAKE_ACP_ELICIT_DUMP;
+const cancelElicit = process.env.FAKE_ACP_CANCEL_ELICIT === "1";
+const elicitIgnoreCancel = process.env.FAKE_ACP_ELICIT_IGNORE_CANCEL === "1";
+const writeOnTerm = process.env.FAKE_ACP_WRITE_ON_TERM === "1";
+let lastSessionId = "";
 const authHoldMs = Number(process.env.FAKE_ACP_AUTH_HOLD_MS ?? "0") || 0;
 let authenticated = !authRequired;
 const dumpPath = process.env.FAKE_ACP_DUMP;
@@ -106,7 +113,39 @@ function requestClient(method: string, params: unknown): Promise<unknown> {
   const id = `agent-${inboundId++}`;
   return new Promise((resolve, reject) => {
     pendingInbound.set(id, { resolve, reject });
-    write({ jsonrpc: "2.0", id, method, params });
+    const requestLine = JSON.stringify({ jsonrpc: "2.0", id, method, params });
+    if (cancelElicit && method === "elicitation/create") {
+      const cancelLine = JSON.stringify({
+        jsonrpc: "2.0",
+        method: "$/cancel_request",
+        params: { requestId: id },
+      });
+      process.stdout.write(`${requestLine}\n${cancelLine}\n`);
+      return;
+    }
+    process.stdout.write(`${requestLine}\n`);
+  });
+}
+
+if (writeOnTerm) {
+  let termHandled = false;
+  process.on("SIGTERM", () => {
+    if (termHandled) return;
+    termHandled = true;
+    if (lastSessionId) {
+      write({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: lastSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "stale-after-kill" },
+          },
+        },
+      });
+    }
+    setTimeout(() => process.exit(0), 80);
   });
 }
 
@@ -137,7 +176,7 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     },
   });
   if (slowMs) await sleep(slowMs);
-  if (session.cancelled) {
+  if (session.cancelled && !elicitIgnoreCancel) {
     respond(id, { stopReason: "cancelled" });
     return;
   }
@@ -164,7 +203,7 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     },
   });
 
-  if (session.cancelled) {
+  if (session.cancelled && !elicitIgnoreCancel) {
     respond(id, { stopReason: "cancelled" });
     return;
   }
@@ -217,7 +256,7 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     }
   }
 
-  if (session.cancelled) {
+  if (session.cancelled && !elicitIgnoreCancel) {
     respond(id, { stopReason: "cancelled" });
     return;
   }
@@ -471,6 +510,7 @@ async function dispatch(msg: JsonRpcRequest): Promise<void> {
       }
       trace("new");
       const sessionId = forcedSessionId || `fake-${nextSession++}`;
+      lastSessionId = sessionId;
       sessions.set(sessionId, { cwd: String(params.cwd ?? process.cwd()), cancelled: false });
       respond(id, {
         sessionId,
@@ -523,6 +563,7 @@ async function dispatch(msg: JsonRpcRequest): Promise<void> {
       return;
     }
     case "session/prompt":
+      lastSessionId = String(params.sessionId ?? lastSessionId);
       await handlePrompt(id as number | string, params);
       return;
     case "session/cancel": {

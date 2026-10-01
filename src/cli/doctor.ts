@@ -3,8 +3,8 @@
  * pairing safety. Never prints device tokens.
  */
 
-import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { inspectTlsFiles } from "../auth/cert.js";
 import { listDevices } from "../auth/token.js";
 import { configPath, dataDir } from "../config/load.js";
 import type { BridgeConfig } from "../config/types.js";
@@ -15,14 +15,27 @@ export function formatDoctorReport(config: BridgeConfig): string {
   const devices = listDevices();
   const active = devices.filter((d) => !d.revokedAt).length;
   const revoked = devices.length - active;
-  const certPath = join(dataDir(), "certs", "server.crt");
+  const tls = inspectTlsFiles();
+  const tlsDetail =
+    tls.state === "ready"
+      ? `ready (${tls.certPath})`
+      : tls.state === "stub"
+        ? `stub (${tls.certPath}) — not a certificate; install openssl and delete this file`
+        : `missing (${tls.certPath}) — created on first start when openssl is on PATH`;
   const lines: string[] = [
     "gradation-bridge doctor",
     `config:  ${configPath()}`,
     `data:    ${dataDir()}`,
     `sessions: ${join(dataDir(), "sessions")} (restored on startup; session/delete removes one)`,
+    `port:    ${config.port ?? 8787}`,
     `openssl: ${which("openssl") ? "on PATH" : "missing — needed to mint the self-signed cert"}`,
-    `tls:     ${existsSync(certPath) ? certPath : "not created yet (created on first start)"}`,
+    `tls:     ${tlsDetail}`,
+  ];
+  if (tls.fingerprintSha256) {
+    lines.push(`cert fp: ${tls.fingerprintSha256}`);
+    lines.push("         Compare this with GradatiON before trusting the machine. The pairing token is not printed.");
+  }
+  lines.push(
     `devices: ${active} active, ${revoked} revoked (tokens are not printed)`,
     "",
     "Safety:",
@@ -35,7 +48,7 @@ export function formatDoctorReport(config: BridgeConfig): string {
     `allowed roots: ${config.allowedRoots.length ? config.allowedRoots.join(", ") : "(none — every path is refused)"}`,
     "",
     "Harnesses:",
-  ];
+  );
 
   const harnesses = listHarnesses(config);
   if (harnesses.length === 0) {
