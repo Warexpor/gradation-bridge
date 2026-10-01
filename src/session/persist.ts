@@ -46,6 +46,8 @@ const MetaSchema = z.object({
       }),
     )
     .optional(),
+  /** Agent advertised `agentCapabilities.auth.logout` when this meta was written. */
+  logoutSupported: z.boolean().optional(),
   grants: z
     .array(
       z.object({
@@ -68,7 +70,15 @@ export function writeSessionMeta(dir: string, meta: SessionMeta): void {
   if (!isSafeSessionId(meta.sessionId)) {
     throw new Error("refusing to persist an unsafe session id");
   }
+  const expected = join(sessionsRoot(), meta.sessionId);
+  if (dir !== expected) {
+    throw new Error("refusing to persist a session outside the catalog");
+  }
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const dirInfo = lstatSync(dir);
+  if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory()) {
+    throw new Error("refusing to persist a session through a symlink");
+  }
   const dest = join(dir, "meta.json");
   const tmp = join(dir, `.meta.${process.pid}.tmp`);
   writeFileSync(tmp, JSON.stringify(meta) + "\n", { mode: 0o600 });
@@ -92,7 +102,18 @@ export function loadPersistedMetas(): SessionMeta[] {
     // Skip symlinks so a catalog entry cannot point outside this directory.
     if (!info.isDirectory()) continue;
     const metaPath = join(root, name, "meta.json");
-    if (!existsSync(metaPath)) continue;
+    let metaInfo: ReturnType<typeof lstatSync>;
+    try {
+      metaInfo = lstatSync(metaPath);
+    } catch {
+      continue;
+    }
+    // A symlinked meta.json can point at a file outside this directory.
+    if (!metaInfo.isFile()) {
+      skipped++;
+      log("warn", `skipping session ${name}: meta.json is not a regular file`);
+      continue;
+    }
     let parsed: z.SafeParseReturnType<unknown, z.infer<typeof MetaSchema>>;
     try {
       parsed = MetaSchema.safeParse(JSON.parse(readFileSync(metaPath, "utf8")));

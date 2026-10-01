@@ -5,6 +5,7 @@
  */
 
 import { BridgeError } from "../errors.js";
+import { redactArgs } from "../log/redact.js";
 
 export interface PublicAuthMethod {
   id: string;
@@ -31,7 +32,7 @@ export function readAgentInitialize(result: unknown): AgentInitInfo {
   const obj = result as Record<string, unknown>;
   return {
     agentInfo: readAgentInfo(obj.agentInfo),
-    authMethods: readAuthMethods(obj.authMethods),
+    authMethods: publicAuthMethods(obj.authMethods),
     logoutSupported: readLogout(obj.agentCapabilities),
   };
 }
@@ -68,13 +69,17 @@ function readLogout(caps: unknown): boolean {
   return logout != null && typeof logout === "object" && !Array.isArray(logout);
 }
 
-function readAuthMethods(raw: unknown): PublicAuthMethod[] {
+/** Phone-safe auth methods. Drops env, redacts secret args, and keeps the first id. */
+export function publicAuthMethods(raw: unknown): PublicAuthMethod[] {
   if (!Array.isArray(raw)) return [];
   const out: PublicAuthMethod[] = [];
+  const seen = new Set<string>();
   for (const entry of raw) {
     if (out.length >= MAX_METHODS) break;
     const method = readOneMethod(entry);
-    if (method) out.push(method);
+    if (!method || seen.has(method.id)) continue;
+    seen.add(method.id);
+    out.push(method);
   }
   return out;
 }
@@ -83,6 +88,7 @@ function readOneMethod(entry: unknown): PublicAuthMethod | undefined {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
   const rec = entry as Record<string, unknown>;
   if (typeof rec.id !== "string" || !rec.id || rec.id.length > 120) return undefined;
+  if (/[\u0000-\u001f]/.test(rec.id)) return undefined;
   const name = typeof rec.name === "string" && rec.name ? rec.name.slice(0, 120) : rec.id;
   const description =
     typeof rec.description === "string" ? rec.description.slice(0, 240) : undefined;
@@ -92,12 +98,12 @@ function readOneMethod(entry: unknown): PublicAuthMethod | undefined {
     ...(description ? { description } : {}),
   };
   if (rec.type === "terminal") {
-    const args = Array.isArray(rec.args)
-      ? rec.args
-          .filter((arg): arg is string => typeof arg === "string")
-          .slice(0, MAX_ARGS)
-          .map((arg) => arg.slice(0, 200))
-      : [];
+    const args = redactArgs(
+      (Array.isArray(rec.args) ? rec.args : [])
+        .filter((arg): arg is string => typeof arg === "string")
+        .slice(0, MAX_ARGS)
+        .map((arg) => arg.slice(0, 200)),
+    );
     return { ...base, type: "terminal", ...(args.length ? { args } : {}) };
   }
   if (rec.type != null && rec.type !== "agent") return undefined;

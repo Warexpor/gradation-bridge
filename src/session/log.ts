@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { dataDir, ensureDirs } from "../config/load.js";
 import { isSafeSessionId } from "./ids.js";
@@ -28,6 +28,7 @@ export class SessionLog {
     const dir = baseDir ?? join(dataDir(), "sessions", sessionId);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     this.path = join(dir, "events.jsonl");
+    assertNotSymlink(this.path);
     if (existsSync(this.path)) {
       this.seq = recoverLastSeq(this.path);
     }
@@ -39,6 +40,7 @@ export class SessionLog {
 
   append(event: unknown): LoggedEvent {
     this.seq += 1;
+    assertNotSymlink(this.path);
     const stamped = injectSeq(event, this.seq);
     const entry: LoggedEvent = {
       seq: this.seq,
@@ -91,6 +93,19 @@ export class SessionLog {
 
   close(): void {
     // sync writer — nothing to flush
+  }
+}
+
+function assertNotSymlink(path: string): void {
+  let info: ReturnType<typeof lstatSync>;
+  try {
+    info = lstatSync(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw e;
+  }
+  if (info.isSymbolicLink()) {
+    throw new Error("refusing to follow a symlinked session log");
   }
 }
 

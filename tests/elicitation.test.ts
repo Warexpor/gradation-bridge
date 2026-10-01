@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  bindElicitationSession,
   elicitationSupportFromInitialize,
   ElicitationRejected,
+  mergeInitializeElicitation,
   relayElicitationParams,
   sanitizeElicitationResponse,
 } from "../src/acp/elicitation.js";
@@ -108,5 +110,102 @@ describe("elicitation relay checks", () => {
       }),
     ).toEqual({ action: "accept", content: { name: "Ada" } });
     expect(sanitizeElicitationResponse({ action: "nope" })).toEqual({ action: "cancel" });
+  });
+
+  it("rejects disguised modes, password formats, and non-public urls", () => {
+    expect(() =>
+      relayElicitationParams(
+        {
+          sessionId: "s",
+          mode: "Form",
+          requestedSchema: { type: "object", properties: { password: { type: "string" } } },
+        },
+        both,
+      ),
+    ).toThrow(/not supported/);
+
+    expect(() =>
+      relayElicitationParams(
+        {
+          sessionId: "s",
+          mode: "form",
+          requestedSchema: {
+            type: "object",
+            properties: { note: { type: "string", format: "password" } },
+          },
+        },
+        both,
+      ),
+    ).toThrow(/credentials/);
+
+    expect(() =>
+      relayElicitationParams(
+        {
+          sessionId: "s",
+          mode: "form",
+          requestedSchema: {
+            type: "object",
+            properties: { note: { type: "string", writeOnly: true } },
+          },
+        },
+        both,
+      ),
+    ).toThrow(/credentials/);
+
+    for (const url of [
+      "http://127.0.0.1/login",
+      "http://2130706433/login",
+      "http://[::1]/login",
+      "https://169.254.169.254/latest",
+      "https://metadata.google.internal/computeMetadata/v1/",
+      "http://10.1.2.3/hook",
+    ]) {
+      expect(() =>
+        relayElicitationParams(
+          { sessionId: "s", mode: "url", elicitationId: "e1", url },
+          both,
+        ),
+      ).toThrow(/public/);
+    }
+
+    const forwarded = relayElicitationParams(
+      {
+        sessionId: "s",
+        mode: "url",
+        elicitationId: "e1",
+        url: "https://example.com/connect",
+        env: { TOKEN: "nope" },
+      },
+      both,
+    );
+    expect(forwarded).toEqual({
+      mode: "url",
+      sessionId: "s",
+      elicitationId: "e1",
+      url: "https://example.com/connect",
+    });
+    expect(
+      relayElicitationParams(
+        { sessionId: "s", mode: "_vendor", message: "extension" },
+        both,
+      ).mode,
+    ).toBe("_vendor");
+  });
+
+  it("binds the prompt to the calling session and keeps earlier elicitation modes", () => {
+    expect(bindElicitationSession({ sessionId: "victim", requestId: 4, mode: "form" }, "real")).toMatchObject({
+      sessionId: "real",
+      requestId: 4,
+    });
+    const warm = bindElicitationSession({ sessionId: "victim", requestId: 4, mode: "form" }) as {
+      sessionId?: string;
+    };
+    expect(warm.sessionId).toBeUndefined();
+
+    const merged = mergeInitializeElicitation(
+      { clientCapabilities: { elicitation: { form: {} } } },
+      { clientCapabilities: { fs: { readTextFile: true } } },
+    );
+    expect(elicitationSupportFromInitialize(merged)).toEqual({ form: true, url: false });
   });
 });

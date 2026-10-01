@@ -1,8 +1,11 @@
 /**
  * Relay checks for ACP elicitation/create.
- * Form mode must not carry credential fields. URL mode must be an http(s) URL
- * with no userinfo. The bridge does not open the URL.
+ * Form mode must not carry credential fields. URL mode must be a public http(s)
+ * URL with no userinfo. The bridge does not open the URL. The phone does, so a
+ * loopback or private host would be the phone's network, not this machine.
  */
+
+import { isIP } from "node:net";
 
 export interface ElicitationSupport {
   form: boolean;
@@ -20,8 +23,10 @@ export class ElicitationRejected extends Error {
 
 const MAX_BYTES = 256 * 1024;
 const MAX_PROPERTIES = 40;
+const MAX_MESSAGE = 8000;
+const MAX_MODE = 64;
 const SECRET_KEY =
-  /(password|passwd|secret|api[-_]?key|access[-_]?token|refresh[-_]?token|private[-_]?key|credential|otp|(^|[-_])pin($|[-_]))/i;
+  /(password|passwd|passphrase|passcode|(^|[-_])pwd($|[-_])|secret|api[-_]?key|access[-_]?token|refresh[-_]?token|auth[-_]?token|session[-_]?token|id[-_]?token|private[-_]?key|credential|client[-_]?secret|(^|[-_])otp($|[-_])|(^|[-_])pin($|[-_])|(^|[-_])cvv($|[-_])|(^|[-_])ssn($|[-_]))/i;
 
 const PROPERTY_TYPES = new Set(["string", "number", "integer", "boolean", "array"]);
 
@@ -33,6 +38,44 @@ export function elicitationSupportFromInitialize(params: unknown): ElicitationSu
     form: isCapability(rec.form),
     url: isCapability(rec.url),
   };
+}
+
+/**
+ * A later `initialize` must not drop elicitation modes an earlier phone already
+ * advertised. Other capabilities stay as the latest params sent them.
+ */
+export function mergeInitializeElicitation(previous: unknown, next: unknown): Record<string, unknown> {
+  if (!next || typeof next !== "object" || Array.isArray(next)) return {};
+  const nextObj = { ...(next as Record<string, unknown>) };
+  const prevSupport = elicitationSupportFromInitialize(previous);
+  const nextSupport = elicitationSupportFromInitialize(nextObj);
+  if (!prevSupport.form && !prevSupport.url) return nextObj;
+  if (prevSupport.form === nextSupport.form && prevSupport.url === nextSupport.url) return nextObj;
+  const caps = { ...(clientCaps(nextObj) ?? {}) };
+  const elicitation: Record<string, unknown> = {};
+  const raw = caps.elicitation;
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    Object.assign(elicitation, raw);
+  }
+  if ((prevSupport.form || nextSupport.form) && !isCapability(elicitation.form)) elicitation.form = {};
+  if ((prevSupport.url || nextSupport.url) && !isCapability(elicitation.url)) elicitation.url = {};
+  caps.elicitation = elicitation;
+  return { ...nextObj, clientCapabilities: caps };
+}
+
+/**
+ * In a session, the phone always sees that session id. Before a session exists,
+ * drop any sessionId so a warm login cannot point the prompt at another session.
+ */
+export function bindElicitationSession(params: unknown, sessionId?: string): unknown {
+  if (!params || typeof params !== "object" || Array.isArray(params)) return params;
+  const raw = { ...(params as Record<string, unknown>) };
+  if (sessionId) {
+    raw.sessionId = sessionId;
+    return raw;
+  }
+  delete raw.sessionId;
+  return raw;
 }
 
 /** Return the params to forward, or throw ElicitationRejected. */
@@ -56,17 +99,24 @@ export function relayElicitationParams(
   }
   const mode = raw.mode;
   if (typeof mode !== "string" || !mode) throw new ElicitationRejected("elicitation mode required");
+  assertMessage(raw);
   assertScope(raw);
   if (mode === "form") {
     if (!support.form) throw new ElicitationRejected("client does not advertise form elicitation");
     assertForm(raw);
-  } else if (mode === "url") {
+    return pickKnown(raw, ["sessionId", "requestId", "message", "requestedSchema"]);
+  }
+  if (mode === "url") {
     if (!support.url) throw new ElicitationRejected("client does not advertise url elicitation");
     assertUrl(raw);
-  } else if (!mode.startsWith("_") && mode.length > 64) {
+    return pickKnown(raw, ["sessionId", "requestId", "message", "elicitationId", "url"]);
+  }
+  if (!isExtensionMode(mode)) {
     throw new ElicitationRejected("elicitation mode is not supported");
   }
-  return raw;
+  const copy = { ...raw };
+  delete copy.env;
+  return copy;
 }
 
 export function elicitationLogLabel(params: Record<string, unknown>): string {
@@ -101,7 +151,7 @@ export function sanitizeElicitationResponse(result: unknown): {
   if (!isPlain(content)) return { action: "cancel" };
   const clean: Record<string, ElicitValue> = {};
   for (const [key, value] of Object.entries(content)) {
-    if (!key || key.length > 80 || SECRET_KEY.test(key)) continue;
+    if (!key || key.length > 80 || SECRET_KEY.test(canonicalKey(key))) continue;
     const kept = sanitizeValue(value);
     if (kept !== undefined) clean[key] = kept;
   }
@@ -127,6 +177,16 @@ function assertScope(raw: Record<string, unknown>): void {
   }
 }
 
+function assertMessage(raw: Record<string, unknown>): void {
+  if (raw.message == null) return;
+  if (typeof raw.message !== "string") throw new ElicitationRejected("elicitation message is invalid");
+  if (raw.message.length > MAX_MESSAGE) throw new ElicitationRejected("elicitation message is too large");
+}
+
+function canonicalKey(key: string): string {
+  return key.normalize("NFKC").replace(/[\u200b-\u200d\ufeff]/g, "");
+}
+
 function assertForm(raw: Record<string, unknown>): void {
   const schema = raw.requestedSchema;
   if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
@@ -140,16 +200,50 @@ function assertForm(raw: Record<string, unknown>): void {
   if (!isPlain(properties)) throw new ElicitationRejected("form properties must be an object");
   const entries = Object.entries(properties);
   if (entries.length > MAX_PROPERTIES) throw new ElicitationRejected("form schema has too many fields");
-  for (const [key, value] of entries) {
-    if (SECRET_KEY.test(key)) {
+  const required = rec.required;
+  if (required != null) {
+    if (!Array.isArray(required) || required.some((item) => typeof item !== "string")) {
+      throw new ElicitationRejected("form schema is invalid");
+    }
+    if (required.some((item) => SECRET_KEY.test(canonicalKey(item)))) {
       throw new ElicitationRejected("form elicitation cannot request credentials");
     }
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
+  }
+  for (const [key, value] of entries) {
+    if (SECRET_KEY.test(canonicalKey(key))) {
+      throw new ElicitationRejected("form elicitation cannot request credentials");
+    }
+    assertFieldSchema(value);
+  }
+}
+
+function assertFieldSchema(value: unknown): void {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ElicitationRejected("form field schema is invalid");
+  }
+  const field = value as Record<string, unknown>;
+  if (field.writeOnly === true || (typeof field.format === "string" && field.format.toLowerCase() === "password")) {
+    throw new ElicitationRejected("form elicitation cannot request credentials");
+  }
+  const type = field.type;
+  if (typeof type !== "string" || !PROPERTY_TYPES.has(type)) {
+    throw new ElicitationRejected("form field type is not supported");
+  }
+  if (type === "array" && field.items != null) {
+    const items = field.items;
+    if (!items || typeof items !== "object" || Array.isArray(items)) {
       throw new ElicitationRejected("form field schema is invalid");
     }
-    const type = (value as { type?: unknown }).type;
-    if (typeof type !== "string" || !PROPERTY_TYPES.has(type)) {
+    const itemType = (items as { type?: unknown }).type;
+    if (itemType != null && (typeof itemType !== "string" || !PROPERTY_TYPES.has(itemType) || itemType === "array")) {
       throw new ElicitationRejected("form field type is not supported");
+    }
+    const itemFormat = (items as { format?: unknown }).format;
+    if (
+      (items as { writeOnly?: unknown }).writeOnly === true ||
+      (typeof itemFormat === "string" && itemFormat.toLowerCase() === "password")
+    ) {
+      throw new ElicitationRejected("form elicitation cannot request credentials");
     }
   }
 }
@@ -176,6 +270,81 @@ function assertUrl(raw: Record<string, unknown>): void {
     throw new ElicitationRejected("elicitation url must not include credentials");
   }
   if (!url.hostname) throw new ElicitationRejected("elicitation url is invalid");
+  assertPublicHost(url.hostname);
+}
+
+const BLOCKED_HOSTS = new Set([
+  "localhost",
+  "localhost.localdomain",
+  "metadata.google.internal",
+  "metadata.internal",
+]);
+
+/** The phone opens this URL. Loopback would be the phone, not this machine. */
+function assertPublicHost(hostname: string): void {
+  let host = hostname.toLowerCase();
+  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
+  host = host.replace(/\.$/, "");
+  if (!host || BLOCKED_HOSTS.has(host) || host.endsWith(".localhost")) {
+    throw new ElicitationRejected("elicitation url must be a public http(s) address");
+  }
+  const kind = isIP(host);
+  if (kind === 4 && isBlockedV4(host)) {
+    throw new ElicitationRejected("elicitation url must be a public http(s) address");
+  }
+  if (kind === 6 && isBlockedV6(host)) {
+    throw new ElicitationRejected("elicitation url must be a public http(s) address");
+  }
+}
+
+function isBlockedV4(host: string): boolean {
+  const parts = host.split(".").map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+  const a = parts[0] ?? 0;
+  const b = parts[1] ?? 0;
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a >= 224) return true;
+  return false;
+}
+
+function isBlockedV6(host: string): boolean {
+  const h = host.toLowerCase();
+  if (h === "::" || h === "::1") return true;
+  const mapped = h.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (mapped) {
+    const hi = Number.parseInt(mapped[1] ?? "", 16);
+    const lo = Number.parseInt(mapped[2] ?? "", 16);
+    if (!Number.isFinite(hi) || !Number.isFinite(lo)) return true;
+    return isBlockedV4(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+  }
+  if (h.startsWith("::ffff:")) {
+    const v4 = h.slice("::ffff:".length);
+    return isIP(v4) !== 4 || isBlockedV4(v4);
+  }
+  const head = h.split(":")[0] ?? "";
+  if (!head) return false;
+  const prefix = Number.parseInt(head, 16);
+  if (!Number.isFinite(prefix)) return false;
+  if (prefix >= 0xfe80 && prefix <= 0xfebf) return true;
+  if (prefix >= 0xfc00 && prefix <= 0xfdff) return true;
+  if (prefix >= 0xff00) return true;
+  return false;
+}
+
+function isExtensionMode(mode: string): boolean {
+  return mode.startsWith("_") && mode.length <= MAX_MODE && !/[\s\u0000-\u001f]/.test(mode);
+}
+
+function pickKnown(raw: Record<string, unknown>, keys: string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = { mode: raw.mode };
+  for (const key of keys) {
+    if (raw[key] !== undefined) out[key] = raw[key];
+  }
+  return out;
 }
 
 function sanitizeValue(value: unknown): ElicitValue | undefined {
