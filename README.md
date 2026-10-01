@@ -4,7 +4,7 @@ ACP bridge daemon for [GradatiON](https://github.com/Warexpor/GradatiON) Code mo
 
 The phone never runs an agent. This small Node 20+ daemon on your machine launches coding agents (Claude Code, Codex, OpenCode, Grok Build, Cursor CLI, Pi, …) over stdio via the [Agent Client Protocol](https://agentclientprotocol.com/), and relays sessions to GradatiON over one authenticated WebSocket.
 
-> **Status:** Working MVP. End-to-end ACP sessions (initialize / new / prompt / cancel / load / set_mode), approval policy enforced on real file writes and terminal calls, JSONL resume, sandboxed git status/diff, harness readiness diagnostics, and bridge extensions are implemented. Tested with a fake ACP agent. Point config at a harness below, or run `gradation-bridge doctor` to see what is actually installed.
+> **Status:** Working MVP. End-to-end ACP sessions (initialize / new / prompt / cancel / load / resume / set_mode / set_config_option / list / close / delete), approval policy enforced on real file writes and terminal calls, JSONL resume that survives a bridge restart, sandboxed git status/diff, harness readiness diagnostics, and bridge extensions are implemented. Tested with a fake ACP agent. Point config at a harness below, or run `gradation-bridge doctor` to see what is actually installed.
 
 ## Quick start (against GradatiON)
 
@@ -129,9 +129,11 @@ Changing mode clears outstanding grants. Phone-selected outcomes are applied bac
 
 WebSocket, text frames, JSON-RPC 2.0, path `/v1`, `Authorization: Bearer <token>`.
 
-ACP methods relayed: `initialize`, `session/new`, `session/prompt`, `session/cancel`, `session/load` (with `_meta.afterSeq` replay), `session/set_mode`, `session/update`, `session/request_permission`. The bridge implements `fs/read_text_file`, `fs/write_text_file`, and `terminal/*` for the agent. Phone `clientCapabilities` are forwarded, with filesystem and terminal forced on because the bridge is the one performing them.
+ACP methods relayed: `initialize`, `session/new`, `session/prompt`, `session/cancel`, `session/load` (with `_meta.afterSeq` replay), `session/resume` (no transcript replay), `session/set_mode`, `session/set_config_option`, `session/list`, `session/close`, `session/delete`, `session/update`, `session/request_permission`. The bridge implements `fs/read_text_file`, `fs/write_text_file`, and `terminal/*` for the agent. Phone `clientCapabilities` are forwarded, with filesystem and terminal forced on because the bridge is the one performing them.
 
-`session/new` returns the agent's payload (including `modes` when the harness sends them) plus `_meta.permissionMode`, `_meta.harness`, `_meta.agentInfo`, and `_meta.authMethods` when the agent advertised login methods. `initialize` advertises `authMethods: []` because the WebSocket bearer already authenticated the phone. Harness login stays on the machine.
+`initialize` advertises `sessionCapabilities` for list, close, resume, and delete, and `loadSession: true`. Prompt image and audio stay off; a prompt that includes those blocks is rejected with `-32602`. `session/new` returns the agent's payload (including `modes` and `configOptions` when the harness sends them) plus `_meta.permissionMode`, `_meta.harness`, `_meta.agentInfo`, and `_meta.authMethods` when the agent advertised login methods. `initialize` advertises `authMethods: []` because the WebSocket bearer already authenticated the phone. Harness login stays on the machine.
+
+`session/list` is the ACP list (`cwd` filter, `cursor` / `nextCursor`). `bridge/listSessions` is the same catalog with bridge fields. `session/close` matches `bridge/closeSession` and also asks the harness to close before the process is killed. `session/delete` removes the session and its on-disk log. `session/set_config_option` is forwarded when the harness process is running (`-32004` if it has exited; load or resume first). Extra workspace roots on `session/new` (`additionalDirectories`) are realpath-checked against `allowedRoots` and forwarded. A harness session id that is not a safe directory name is rejected.
 
 Bridge extensions (see GradatiON `docs/code-mode-plan.md` §3.2):
 
@@ -147,6 +149,8 @@ Harness launch failures use JSON-RPC code `-32010` and a `data` object (`readine
 
 Every notification carries `_meta.seq` from an append-only JSONL log so a reconnecting phone can resume via `session/load` + `_meta.afterSeq`. `session/load` replays `seq > afterSeq` (skipping corrupt log lines), respawns the harness if the agent process has died, and returns `{ replayed, agentAlive, lastSeq, status }` merged with whatever the agent's `session/load` returned. A prompt that finishes while the phone is gone is also logged as `bridge/promptResult` so the next load can see `stopReason`.
 
+`session/resume` respawns a dead harness without replaying that log. If the harness has no `session/resume`, the bridge falls back to `session/load` on the agent and still does not replay frames to the phone. The first prompt's text becomes the session title until the agent sends `session_info_update`.
+
 `session/cancel` is accepted as a notification or a request. It is forwarded to the agent and aborts an in-flight `session/request_permission` so cancel is not stuck behind the approval dialog.
 
 `session/new` params include `_meta:{ harness, permissionMode, model? }` (GradatiON sends these).
@@ -157,7 +161,8 @@ Every notification carries `_meta.seq` from an append-only JSONL log so a reconn
 - **Backpressure.** Each socket has an outbound queue. Past a 1MB kernel buffer, frames wait in user space. `session/update` chunks are the first frames dropped when a phone stops reading; responses, status, permissions, and replay are kept. `session/load` paces replay instead of bursting the socket.
 - **Malformed frames.** Non-JSON, `null`, arrays, and non-2.0 envelopes return a JSON-RPC error and leave the socket up. Payload cap is 8MB.
 - **Auth / TLS.** Token checks hash then compare in constant time. A corrupt `devices.json` fails closed and is not overwritten with a new token. New self-signed certs include `subjectAltName` for localhost, loopback, and the bind address (an existing cert is left in place so the pinned fingerprint does not change).
-- **Process lifecycle.** Each harness is its own process group, so shutting a session down also kills `npx` grandchildren. Terminals for that session are killed with it, and their captured output is capped at 1MB.
+- **Process lifecycle.** Each harness is its own process group, so shutting a session down also kills `npx` grandchildren. Terminals for that session are killed with it. `terminal/create` honors `outputByteLimit` (capped at 1MB) by keeping the newest bytes, on a UTF-8 boundary. `terminal/kill` leaves the id readable; `terminal/release` frees it. `fs/read_text_file` and `fs/write_text_file` refuse payloads over 8MB.
+- **Restart.** Open sessions are written to `~/.local/share/gradation-bridge/sessions/<id>/` (`meta.json` + `events.jsonl`). A bridge restart lists them again. The harness process is gone until `session/load` or `session/resume`. `session/close` keeps the log but does not restore that session. `session/delete` removes the directory. Shutting the bridge down does not mark sessions closed.
 
 ## Safety
 
@@ -196,9 +201,9 @@ Requires Node 20+. Depends on [`@agentclientprotocol/sdk`](https://www.npmjs.com
 ## Remaining stubs / next
 
 - Push notifications when no phone is attached (§3.1.7 of the plan) — not implemented. A permission request is held for a reconnecting phone and cancelled if nobody answers.
-- Richer terminal UX (PTY / streaming). Output is buffered until `terminal/output`, capped at 1MB. FS browse/read/write already realpath-sandbox.
-- Multi-session sharing one long-lived agent process (today: one process per session). `session/load` respawns a dead per-session process; it does not restore sessions after the bridge itself restarts.
-- ACP `authenticate` is not relayed. Harness login stays on the machine; `session/new` surfaces `authMethods` so the phone can say why a start failed.
+- Richer terminal UX (PTY / streaming). Output is buffered until `terminal/output`. FS browse/read/write already realpath-sandbox.
+- Multi-session sharing one long-lived agent process (today: one process per session). `session/load` and `session/resume` respawn a dead per-session process. The catalog survives a bridge restart; the harness's own memory survives only if that harness implements load or resume.
+- ACP `authenticate` / `auth/login` and `elicitation/*` are not relayed. Harness login stays on the machine; `session/new` surfaces `authMethods` so the phone can say why a start failed. `$/cancel_request` is ignored, which the protocol allows. ACP v2 (`session/load` removed, terminals agent-owned) is not negotiated; the bridge answers `protocolVersion: 1`.
 
 ## License
 

@@ -20,6 +20,7 @@ export function formatDoctorReport(config: BridgeConfig): string {
     "gradation-bridge doctor",
     `config:  ${configPath()}`,
     `data:    ${dataDir()}`,
+    `sessions: ${join(dataDir(), "sessions")} (restored on startup; session/delete removes one)`,
     `openssl: ${which("openssl") ? "on PATH" : "missing — needed to mint the self-signed cert"}`,
     `tls:     ${existsSync(certPath) ? certPath : "not created yet (created on first start)"}`,
     `devices: ${active} active, ${revoked} revoked (tokens are not printed)`,

@@ -410,6 +410,12 @@ async function dispatch(
         agentCapabilities: {
           loadSession: true,
           promptCapabilities: { image: false, audio: false, embeddedContext: true },
+          sessionCapabilities: {
+            list: {},
+            close: {},
+            resume: {},
+            delete: {},
+          },
         },
         // WebSocket bearer auth already happened. Per-harness auth is on session/new _meta.
         authMethods: [],
@@ -473,8 +479,34 @@ async function dispatch(
     }
     case "bridge/closeSession": {
       const sessionId = String(p.sessionId ?? "");
-      opts.sessions.close(sessionId);
+      await opts.sessions.closeSession(sessionId, { missing: "ignore" });
       return {};
+    }
+    case "session/list":
+      return opts.sessions.listForProtocol({
+        cwd: typeof p.cwd === "string" ? p.cwd : undefined,
+        cursor: typeof p.cursor === "string" ? p.cursor : undefined,
+      });
+    case "session/close": {
+      const sessionId = String(p.sessionId ?? "");
+      await opts.sessions.closeSession(sessionId, { missing: "error" });
+      return {};
+    }
+    case "session/delete": {
+      const sessionId = String(p.sessionId ?? "");
+      await opts.sessions.deleteSession(sessionId);
+      return {};
+    }
+    case "session/resume": {
+      const sessionId = String(p.sessionId ?? "");
+      return opts.sessions.resume(sessionId, {
+        cwd: typeof p.cwd === "string" ? p.cwd : undefined,
+        mcpServers: Array.isArray(p.mcpServers) ? p.mcpServers : [],
+      });
+    }
+    case "session/set_config_option": {
+      const sessionId = String(p.sessionId ?? "");
+      return opts.sessions.setConfigOption(sessionId, p);
     }
     case "bridge/diff": {
       const sessionId = String(p.sessionId ?? "");
@@ -505,9 +537,7 @@ async function dispatch(
       }
       const cwd = assertAllowedRealPath(rec.cwd, opts.config.allowedRoots);
       const status = await getGitStatus(cwd);
-      if (status.branch) {
-        rec.branch = status.branch;
-      }
+      if (status.branch) opts.sessions.noteBranch(sessionId, status.branch);
       return status;
     }
 
@@ -519,17 +549,22 @@ async function dispatch(
         VALID_MODES.has(modeRaw as PermissionMode) ? modeRaw : "ask"
       ) as PermissionMode;
       const cwd = String(p.cwd ?? "");
+      const additionalDirectories = Array.isArray(p.additionalDirectories)
+        ? p.additionalDirectories.filter((entry): entry is string => typeof entry === "string")
+        : undefined;
       const rec = await opts.sessions.startSession({
         harnessId,
         cwd,
         permissionMode,
         mcpServers: Array.isArray(p.mcpServers) ? p.mcpServers : [],
+        additionalDirectories,
         model: typeof meta.model === "string" ? meta.model : undefined,
       });
       rememberWorkspace(opts.config, cwd);
       return {
         sessionId: rec.sessionId,
         ...(rec.sessionModes ? { modes: rec.sessionModes } : {}),
+        ...(rec.configOptions !== undefined ? { configOptions: rec.configOptions } : {}),
         _meta: {
           permissionMode: rec.permissionMode,
           harness: rec.harness,

@@ -1,6 +1,7 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { dataDir, ensureDirs } from "../config/load.js";
+import { isSafeSessionId } from "./ids.js";
 
 export interface LoggedEvent {
   seq: number;
@@ -17,8 +18,8 @@ export interface LoggedEvent {
  * `_meta.seq` is injected before the line is written so replay matches live frames.
  */
 export class SessionLog {
-  readonly sessionId: string;
-  readonly path: string;
+  sessionId: string;
+  path: string;
   private seq = 0;
 
   constructor(sessionId: string, baseDir?: string) {
@@ -63,6 +64,29 @@ export class SessionLog {
       if (!entry || typeof entry.seq !== "number" || entry.event == null) continue;
       if (entry.seq > afterSeq) yield entry;
     }
+  }
+
+  /**
+   * Move this session's directory so the folder name matches the agent session id.
+   * `events.jsonl` and `meta.json` move together.
+   */
+  relocate(newSessionId: string): void {
+    if (!isSafeSessionId(newSessionId)) {
+      throw new Error("invalid session id");
+    }
+    if (newSessionId === this.sessionId) return;
+    const destDir = join(dirname(dirname(this.path)), newSessionId);
+    if (existsSync(destDir)) {
+      throw new Error(`session directory already exists: ${newSessionId}`);
+    }
+    renameSync(dirname(this.path), destDir);
+    this.sessionId = newSessionId;
+    this.path = join(destDir, "events.jsonl");
+  }
+
+  /** Delete the session directory after a failed start. */
+  discard(): void {
+    rmSync(dirname(this.path), { recursive: true, force: true });
   }
 
   close(): void {

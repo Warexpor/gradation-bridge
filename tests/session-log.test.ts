@@ -48,4 +48,18 @@ describe("SessionLog", () => {
     const replayed = [...log.replay(0)];
     expect(replayed.map((e) => e.seq)).toEqual([1, 2]);
   });
+
+  it("moves the directory when the agent assigns a session id", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-log-"));
+    dirs.push(root);
+    const dir = join(root, "sessions", "tempid");
+    const log = new SessionLog("tempid", dir);
+    log.append({ jsonrpc: "2.0", method: "session/update", params: { n: 1 } });
+    log.relocate("fake-1");
+    expect(log.sessionId).toBe("fake-1");
+    expect(log.path).toBe(join(root, "sessions", "fake-1", "events.jsonl"));
+    const again = new SessionLog("fake-1", join(root, "sessions", "fake-1"));
+    expect(again.lastSeq).toBe(1);
+    expect([...again.replay(0)]).toHaveLength(1);
+  });
 });

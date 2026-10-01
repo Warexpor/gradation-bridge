@@ -15,6 +15,10 @@
  *   FAKE_ACP_DUMP=<file>        — write the initialize params JSON to a file
  *   FAKE_ACP_SLOW_MS=N          — delay between update chunks
  *   FAKE_ACP_EXIT_AFTER_PROMPT=1 — exit shortly after the prompt result is flushed
+ *   FAKE_ACP_SESSION_ID=<id>     — force the id returned by session/new
+ *   FAKE_ACP_NO_RESUME=1         — session/resume returns method-not-found
+ *   FAKE_ACP_DUMP_NEW=<file>     — write session/new params JSON to a file
+ *   FAKE_ACP_TERMINAL_TAIL=1     — terminal/create with a 4-byte output limit
  */
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -37,6 +41,10 @@ const wantAuth = process.env.FAKE_ACP_AUTH === "1";
 const dumpPath = process.env.FAKE_ACP_DUMP;
 const slowMs = Number(process.env.FAKE_ACP_SLOW_MS ?? "0") || 0;
 const exitAfterPrompt = process.env.FAKE_ACP_EXIT_AFTER_PROMPT === "1";
+const forcedSessionId = process.env.FAKE_ACP_SESSION_ID;
+const noResume = process.env.FAKE_ACP_NO_RESUME === "1";
+const dumpNewPath = process.env.FAKE_ACP_DUMP_NEW;
+const terminalTail = process.env.FAKE_ACP_TERMINAL_TAIL === "1";
 
 function write(obj: unknown): void {
   process.stdout.write(JSON.stringify(obj) + "\n");
@@ -206,17 +214,27 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     }
   }
 
-  if (wantTerminal) {
+  if (wantTerminal || terminalTail) {
     try {
       const created = (await requestClient("terminal/create", {
         sessionId,
         command: process.execPath,
-        args: ["-e", "process.stdout.write('term-ok')"],
+        args: ["-e", terminalTail ? "process.stdout.write('ééXYZ')" : "process.stdout.write('term-ok')"],
         cwd: session.cwd,
+        ...(terminalTail ? { outputByteLimit: 4 } : {}),
       })) as { terminalId?: string };
       const terminalId = String(created?.terminalId ?? "");
       await requestClient("terminal/wait_for_exit", { sessionId, terminalId });
-      await requestClient("terminal/output", { sessionId, terminalId });
+      const output = await requestClient("terminal/output", { sessionId, terminalId });
+      if (terminalTail) {
+        notify("session/update", {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `tail:${JSON.stringify(output)}` },
+          },
+        });
+      }
       await requestClient("terminal/release", { sessionId, terminalId });
     } catch (e) {
       notify("session/update", {
@@ -300,7 +318,8 @@ async function dispatch(msg: JsonRpcRequest): Promise<void> {
       });
       return;
     case "session/new": {
-      const sessionId = `fake-${nextSession++}`;
+      if (dumpNewPath) writeFileSync(dumpNewPath, JSON.stringify(params));
+      const sessionId = forcedSessionId || `fake-${nextSession++}`;
       sessions.set(sessionId, { cwd: String(params.cwd ?? process.cwd()), cancelled: false });
       respond(id, {
         sessionId,
@@ -308,15 +327,48 @@ async function dispatch(msg: JsonRpcRequest): Promise<void> {
           currentModeId: "agent",
           availableModes: [{ id: "agent", name: "Agent", description: "Fake agent mode" }],
         },
+        configOptions: [
+          {
+            id: "model",
+            name: "Model",
+            type: "select",
+            currentValue: "small",
+            options: [{ value: "small", name: "Small" }],
+          },
+        ],
       });
       return;
     }
-    case "session/load": {
+    case "session/load":
+    case "session/resume": {
+      if (method === "session/resume" && noResume) {
+        respondError(id, -32601, "Method not found: session/resume");
+        return;
+      }
       const sessionId = String(params.sessionId ?? "");
       if (!sessions.has(sessionId)) {
         sessions.set(sessionId, { cwd: String(params.cwd ?? process.cwd()), cancelled: false });
       }
       respond(id, {});
+      return;
+    }
+    case "session/close": {
+      sessions.delete(String(params.sessionId ?? ""));
+      respond(id, {});
+      return;
+    }
+    case "session/set_config_option": {
+      respond(id, {
+        configOptions: [
+          {
+            id: String(params.configId ?? "model"),
+            name: "Model",
+            type: "select",
+            currentValue: String(params.value ?? ""),
+            options: [{ value: "small", name: "Small" }, { value: "large", name: "Large" }],
+          },
+        ],
+      });
       return;
     }
     case "session/prompt":

@@ -1,13 +1,13 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { spawn as spawnProc, type ChildProcess } from "node:child_process";
 import type { BridgeConfig, PermissionMode } from "../config/types.js";
 import { BridgeError } from "../errors.js";
-import { killProcessTree } from "../proc/tree.js";
 import { findHarness } from "../harness/registry.js";
 import { launchErrorData, resolveHarnessLaunch, type HarnessLaunch } from "../harness/catalog.js";
-import { AcpStdioClient, type AcpJsonRpcRequest } from "../acp/client.js";
+import { AcpStdioClient, isMethodNotFound, type AcpJsonRpcRequest } from "../acp/client.js";
+import { assertSupportedPrompt, firstPromptText } from "../acp/prompt.js";
+import { assertNotDirectory, assertWritableContent, readTextFileWindow } from "../acp/text-file.js";
 import {
   optionKindById,
   pathFromToolCall,
@@ -27,7 +27,15 @@ import {
 } from "../approval/grants.js";
 import { assertAllowedRealPath, assertAllowedWorkspace, SandboxError } from "../approval/sandbox.js";
 import { log } from "../log/diagnostics.js";
+import { isSafeSessionId } from "./ids.js";
 import { SessionLog } from "./log.js";
+import {
+  loadPersistedMetas,
+  removeSessionStorage,
+  writeSessionMeta,
+  type SessionMeta,
+} from "./persist.js";
+import { isEnvName, TerminalTable } from "./terminals.js";
 
 export type SessionStatus = "idle" | "running" | "needs_approval" | "error" | "closed";
 
@@ -53,10 +61,16 @@ export interface SessionRecord {
   agentInfo?: { name: string; version?: string };
   authMethods?: Array<{ id: string; name?: string; description?: string }>;
   mcpServers: unknown[];
+  /** Extra workspace roots, already realpath-checked against allowedRoots. */
+  additionalDirectories: string[];
+  /** ACP session/new `configOptions`, when the agent returned them. */
+  configOptions?: unknown;
   /** Bumped each time a new agent process is bound so a late exit is ignored. */
   clientGeneration: number;
   promptInFlight: boolean;
   cancelRequested: boolean;
+  /** Set while session/close is in progress so an agent exit is not stored as an error. */
+  closing: boolean;
 }
 
 export type SessionSummary = Omit<
@@ -69,9 +83,11 @@ export type SessionSummary = Omit<
   | "agentInfo"
   | "authMethods"
   | "mcpServers"
+  | "configOptions"
   | "clientGeneration"
   | "promptInFlight"
   | "cancelRequested"
+  | "closing"
 >;
 
 export type BridgeEmitter = (
@@ -101,22 +117,15 @@ export class SessionManager {
   private sessions = new Map<string, SessionRecord>();
   private opts: SessionManagerOptions;
   private fullAutoWarned = false;
+  private stopping = false;
   private phoneInitialize: Record<string, unknown> | undefined;
-  private terminals = new Map<
-    string,
-    {
-      child: ChildProcess;
-      sessionId: string;
-      chunks: Buffer[];
-      bytes: number;
-      truncated: boolean;
-    }
-  >();
+  private terminals = new TerminalTable();
 
   constructor(opts?: SessionManagerOptions) {
     this.opts = opts ?? {
       config: { allowedRoots: [], defaultPermissionMode: "ask", harnesses: [] },
     };
+    this.restorePersisted();
   }
 
   setHooks(
@@ -170,6 +179,7 @@ export class SessionManager {
       status: s.status,
       permissionMode: s.permissionMode,
       lastSeq: s.log.lastSeq,
+      additionalDirectories: s.additionalDirectories,
     };
   }
 
@@ -252,20 +262,121 @@ export class SessionManager {
   close(sessionId: string): boolean {
     const rec = this.sessions.get(sessionId);
     if (!rec || rec.status === "closed") return false;
+    rec.closing = true;
     rec.clientGeneration += 1;
     rec.status = "closed";
     rec.promptInFlight = false;
+    rec.cancelRequested = true;
+    this.opts.cancelPhoneRequests?.(sessionId);
     rec.client?.kill();
     rec.client = null;
-    this.killTerminals(sessionId);
+    this.terminals.closeSession(sessionId);
     rec.log.close();
     this.emitSessionStatus(rec);
     return true;
   }
 
+  /**
+   * Process shutdown. Kill harnesses but leave sessions resumable:
+   * meta stays `idle` (or `error`) so the next process can list and load them.
+   */
   async closeAll(): Promise<void> {
-    for (const id of [...this.sessions.keys()]) this.close(id);
-    this.killTerminals();
+    this.stopping = true;
+    for (const id of [...this.sessions.keys()]) this.detachForShutdown(id);
+    this.terminals.closeSession();
+  }
+
+  /**
+   * ACP session/close. Tells the harness when it is still up, then tears down locally.
+   * `missing: "ignore"` matches bridge/closeSession (unknown id is a no-op).
+   */
+  async closeSession(
+    sessionId: string,
+    opts?: { missing?: "error" | "ignore" },
+  ): Promise<Record<string, never>> {
+    const rec = this.sessions.get(sessionId);
+    if (!rec) {
+      if (opts?.missing === "error") {
+        throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
+      }
+      return {};
+    }
+    if (rec.status === "closed") return {};
+    rec.closing = true;
+    rec.cancelRequested = true;
+    this.opts.cancelPhoneRequests?.(sessionId);
+    if (rec.client?.running) {
+      try {
+        await rec.client.closeSession(rec.agentSessionId);
+      } catch {
+        // The process is killed below either way.
+      }
+    }
+    this.close(sessionId);
+    return {};
+  }
+
+  /** ACP session/delete. Closes the session and removes its on-disk catalog. */
+  async deleteSession(sessionId: string): Promise<Record<string, never>> {
+    const rec = this.sessions.get(sessionId);
+    if (!rec) {
+      throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
+    }
+    if (rec.status !== "closed") await this.closeSession(sessionId, { missing: "error" });
+    this.sessions.delete(sessionId);
+    try {
+      rec.log.discard();
+    } catch {
+      removeSessionStorage(sessionId);
+    }
+    return {};
+  }
+
+  /**
+   * ACP session/list. `cwd` is sandboxed. Cursor is the last sessionId of the previous page.
+   */
+  listForProtocol(opts?: { cwd?: string; cursor?: string }): {
+    sessions: Array<Record<string, unknown>>;
+    nextCursor?: string;
+  } {
+    const pageSize = 50;
+    let items = this.list();
+    if (opts?.cwd) {
+      const want = assertAllowedRealPath(opts.cwd, this.opts.config.allowedRoots);
+      items = items.filter((s) => s.cwd === want);
+    }
+    if (opts?.cursor) {
+      const idx = items.findIndex((s) => s.sessionId === opts.cursor);
+      items = idx >= 0 ? items.slice(idx + 1) : [];
+    }
+    const page = items.slice(0, pageSize);
+    const next = items.length > pageSize ? page[page.length - 1]?.sessionId : undefined;
+    return {
+      sessions: page.map((s) => ({
+        sessionId: s.sessionId,
+        cwd: s.cwd,
+        title: s.title,
+        updatedAt: s.updatedAt,
+        ...(s.additionalDirectories.length ? { additionalDirectories: s.additionalDirectories } : {}),
+        _meta: {
+          harness: s.harness,
+          permissionMode: s.permissionMode,
+          status: s.status,
+          preview: s.preview,
+          lastSeq: s.lastSeq,
+          ...(s.branch ? { branch: s.branch } : {}),
+        },
+      })),
+      ...(next ? { nextCursor: next } : {}),
+    };
+  }
+
+  noteBranch(sessionId: string, branch: string): void {
+    const rec = this.sessions.get(sessionId);
+    if (!rec || rec.branch === branch) return;
+    rec.branch = branch;
+    rec.updatedAt = new Date().toISOString();
+    this.persist(rec);
   }
 
   /**
@@ -277,11 +388,16 @@ export class SessionManager {
     cwd: string;
     permissionMode?: PermissionMode;
     mcpServers?: unknown[];
+    additionalDirectories?: string[];
     model?: string;
     title?: string;
   }): Promise<SessionRecord> {
     const config = this.opts.config;
     const cwd = assertAllowedWorkspace(params.cwd, config.allowedRoots);
+    const additionalDirectories = sandboxAdditionalDirectories(
+      params.additionalDirectories,
+      config.allowedRoots,
+    );
     const harness = findHarness(config, params.harnessId);
     if (!harness) {
       throw new BridgeError(-32602, `unknown harness: ${params.harnessId}`, {
@@ -323,15 +439,17 @@ export class SessionManager {
       agentSessionId: tempId,
       grants: [],
       mcpServers: params.mcpServers ?? [],
+      additionalDirectories,
       clientGeneration: 0,
       promptInFlight: false,
       cancelRequested: false,
+      closing: false,
     };
     this.sessions.set(tempId, rec);
 
-    const client = this.openClient(rec, launch);
-
+    let client: AcpStdioClient | undefined;
     try {
+      client = this.openClient(rec, launch);
       client.start();
       const phoneCaps = this.phoneCapabilities();
       const initialized = await client.initialize({
@@ -347,6 +465,7 @@ export class SessionManager {
       const created = await client.newSession({
         cwd,
         mcpServers: rec.mcpServers,
+        additionalDirectories,
         _meta: {
           harness: harness.id,
           permissionMode,
@@ -354,24 +473,23 @@ export class SessionManager {
         },
       });
       const agentSessionId = created.sessionId;
-      if (created.modes && typeof created.modes === "object") {
-        rec.sessionModes = created.modes;
-      }
-      if (agentSessionId !== tempId) {
-        this.sessions.delete(tempId);
-        rec.sessionId = agentSessionId;
-        rec.agentSessionId = agentSessionId;
-        this.sessions.set(agentSessionId, rec);
-      }
+      this.adoptAgentSession(rec, tempId, agentSessionId);
+      this.captureSessionPayload(rec, created);
       this.setStatus(rec.sessionId, "idle");
       return rec;
     } catch (e) {
-      const stderr = client.stderrTail().slice(-2000);
+      const stderr = client?.stderrTail().slice(-2000) ?? "";
       rec.clientGeneration += 1;
       rec.status = "closed";
-      client.kill();
+      client?.kill();
       rec.client = null;
+      this.sessions.delete(tempId);
       this.sessions.delete(rec.sessionId);
+      try {
+        rec.log.discard();
+      } catch {
+        // The directory may already be gone.
+      }
       if (e instanceof BridgeError) throw e;
       const message = e instanceof Error ? e.message : String(e);
       log("error", `harness ${harness.id} failed to start: ${message}`);
@@ -388,12 +506,15 @@ export class SessionManager {
     if (rec.promptInFlight) {
       throw new BridgeError(-32005, "prompt already in progress", { sessionId });
     }
+    assertSupportedPrompt(params);
+    this.assertSessionWorkspace(rec);
     const client = rec.client;
     if (!client?.running) {
       throw new BridgeError(-32004, `session agent not running: ${sessionId}`, { sessionId });
     }
     rec.promptInFlight = true;
     rec.cancelRequested = false;
+    this.maybeTitle(rec, params);
     this.setStatus(sessionId, "running");
     const body =
       params && typeof params === "object" && !Array.isArray(params)
@@ -408,8 +529,8 @@ export class SessionManager {
       return result;
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
-      this.emitPromptResult(rec, { error: { message } });
-      if (rec.status !== "closed") {
+      if (!this.stopping) this.emitPromptResult(rec, { error: { message } });
+      if (!this.stopping && rec.status !== "closed") {
         this.setStatus(sessionId, "error", { preview: message });
       }
       throw e;
@@ -462,8 +583,9 @@ export class SessionManager {
     let agentAlive = Boolean(rec.client?.running);
     let agentResult: unknown = {};
     if (!agentAlive && rec.status !== "closed" && !rec.promptInFlight) {
+      this.assertSessionWorkspace(rec);
       try {
-        await this.respawnAgent(rec);
+        agentResult = await this.respawnAgent(rec, "load");
         agentAlive = Boolean(rec.client?.running);
       } catch {
         agentAlive = false;
@@ -474,11 +596,13 @@ export class SessionManager {
           sessionId: rec.agentSessionId,
           cwd: opts.cwd ?? rec.cwd,
           mcpServers: rec.mcpServers,
+          additionalDirectories: rec.additionalDirectories,
         });
       } catch {
         /* replay alone is enough when the agent has no load support */
       }
     }
+    this.captureSessionPayload(rec, agentResult);
     const replayMeta = {
       sessionId: rec.sessionId,
       replayed,
@@ -490,6 +614,78 @@ export class SessionManager {
       return { ...(agentResult as Record<string, unknown>), ...replayMeta };
     }
     return replayMeta;
+  }
+
+  /**
+   * ACP session/resume. Does not replay the JSONL transcript.
+   * If the harness has no `session/resume`, fall back to `session/load` on the agent.
+   */
+  async resume(
+    sessionId: string,
+    opts?: { cwd?: string; mcpServers?: unknown[] },
+  ): Promise<Record<string, unknown>> {
+    const rec = this.sessions.get(sessionId);
+    if (!rec || rec.status === "closed") {
+      throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
+    }
+    this.assertSessionWorkspace(rec);
+    if (opts?.cwd) {
+      const cwd = assertAllowedRealPath(opts.cwd, this.opts.config.allowedRoots, rec.cwd);
+      if (cwd !== rec.cwd) {
+        throw new BridgeError(-32602, "cwd does not match the session", {
+          sessionId,
+          cwd,
+        });
+      }
+    }
+    if (opts?.mcpServers && opts.mcpServers.length > 0) rec.mcpServers = opts.mcpServers;
+    if (rec.promptInFlight) {
+      throw new BridgeError(-32005, "prompt already in progress", { sessionId });
+    }
+    let agentResult: unknown = {};
+    let warning: string | undefined;
+    try {
+      if (!rec.client?.running) {
+        agentResult = await this.respawnAgent(rec, "resume");
+      } else {
+        agentResult = await this.attachExisting(rec, "resume");
+      }
+    } catch (e) {
+      warning = e instanceof Error ? e.message : String(e);
+      log("warn", `session/resume ${sessionId}: ${warning}`);
+    }
+    this.captureSessionPayload(rec, agentResult);
+    const body: Record<string, unknown> = {
+      sessionId: rec.sessionId,
+      agentAlive: Boolean(rec.client?.running),
+      status: rec.status,
+      ...(warning ? { warning } : {}),
+    };
+    if (agentResult && typeof agentResult === "object") {
+      return { ...(agentResult as Record<string, unknown>), ...body };
+    }
+    return body;
+  }
+
+  async setConfigOption(sessionId: string, params: Record<string, unknown>): Promise<unknown> {
+    const rec = this.requireSession(sessionId);
+    this.assertSessionWorkspace(rec);
+    const client = rec.client;
+    if (!client?.running) {
+      throw new BridgeError(-32004, `session agent not running: ${sessionId}`, { sessionId });
+    }
+    const configId = params.configId;
+    if (typeof configId !== "string" || !configId) {
+      throw new BridgeError(-32602, "configId required");
+    }
+    const result = await client.setConfigOption({
+      ...params,
+      sessionId: rec.agentSessionId,
+      configId,
+    });
+    this.captureSessionPayload(rec, result);
+    this.persist(rec);
+    return result;
   }
 
   private phoneCapabilities(): Record<string, unknown> | undefined {
@@ -572,7 +768,7 @@ export class SessionManager {
       },
       onExit: (code, signal) => {
         if (rec.clientGeneration !== gen) return;
-        if (rec.status === "closed") return;
+        if (rec.status === "closed" || rec.closing) return;
         rec.status = "error";
         const tail = client.stderrTail().split("\n").filter(Boolean).slice(-1)[0];
         rec.preview = tail
@@ -590,8 +786,8 @@ export class SessionManager {
     return client;
   }
 
-  /** Start a fresh harness and ask it to resume `rec.sessionId`. */
-  private async respawnAgent(rec: SessionRecord): Promise<void> {
+  /** Start a fresh harness and ask it to load or resume `rec.sessionId`. */
+  private async respawnAgent(rec: SessionRecord, mode: "load" | "resume"): Promise<unknown> {
     const previous = rec.client;
     const client = this.openClient(rec);
     previous?.kill();
@@ -604,19 +800,35 @@ export class SessionManager {
         },
         clientCapabilities: this.phoneCapabilities(),
       });
-      await client.loadSession({
-        sessionId: rec.agentSessionId,
-        cwd: rec.cwd,
-        mcpServers: rec.mcpServers,
-      });
+      const result = await this.attachExisting(rec, mode);
       if (rec.status === "error" || rec.status === "idle") {
         this.setStatus(rec.sessionId, "idle");
       }
+      return result;
     } catch (e) {
       rec.clientGeneration += 1;
       client.kill();
       if (rec.client === client) rec.client = null;
       throw e;
+    }
+  }
+
+  private async attachExisting(rec: SessionRecord, mode: "load" | "resume"): Promise<unknown> {
+    const client = rec.client;
+    if (!client) throw new Error("session agent not running");
+    const params = {
+      sessionId: rec.agentSessionId,
+      cwd: rec.cwd,
+      mcpServers: rec.mcpServers,
+      additionalDirectories: rec.additionalDirectories,
+    };
+    if (mode === "load") return client.loadSession(params);
+    try {
+      return await client.resumeSession(params);
+    } catch (e) {
+      if (!isMethodNotFound(e)) throw e;
+      log("info", `harness ${rec.harness} has no session/resume; using session/load`);
+      return client.loadSession(params);
     }
   }
 
@@ -636,6 +848,16 @@ export class SessionManager {
         rec.preview = update.content.text.slice(0, 160);
         rec.updatedAt = new Date().toISOString();
       }
+      const info = update as { sessionUpdate?: string; title?: unknown } | undefined;
+      if (
+        (info?.sessionUpdate === "session_info_update" || info?.sessionUpdate === "session_info") &&
+        typeof info.title === "string" &&
+        info.title.trim()
+      ) {
+        rec.title = info.title.trim().slice(0, 120);
+        rec.updatedAt = new Date().toISOString();
+        this.persist(rec);
+      }
       return;
     }
     this.broadcastLogged(rec, { jsonrpc: "2.0", method, params });
@@ -652,12 +874,13 @@ export class SessionManager {
       case "terminal/create":
         return this.handleTerminalCreate(rec, req.params);
       case "terminal/output":
-        return this.handleTerminalOutput(req.params);
-      case "terminal/release":
+        return this.handleTerminalOutput(rec, req.params);
       case "terminal/kill":
-        return this.handleTerminalKill(req.params);
+        return this.handleTerminalKill(rec, req.params);
+      case "terminal/release":
+        return this.handleTerminalRelease(rec, req.params);
       case "terminal/wait_for_exit":
-        return this.handleTerminalWait(req.params);
+        return this.handleTerminalWait(rec, req.params);
       default: {
         const err = new Error(`Method not found: ${req.method}`) as Error & { code?: number };
         err.code = -32601;
@@ -735,7 +958,10 @@ export class SessionManager {
           grantFamilyForKind(kind),
           resolveGrantPath(path, rec.cwd),
         );
-        if (grant) rec.grants.push(grant);
+        if (grant) {
+          rec.grants.push(grant);
+          this.persist(rec);
+        }
       }
       const resolvedKind = rec.cancelRequested
         ? "cancelled"
@@ -755,23 +981,23 @@ export class SessionManager {
     const p = (params ?? {}) as { path?: string; line?: number; limit?: number };
     if (!p.path) throw Object.assign(new Error("path required"), { code: -32602 });
     const path = assertAllowedRealPath(p.path, this.opts.config.allowedRoots, rec.cwd);
-    let content = readFileSync(path, "utf8");
-    if (p.line != null || p.limit != null) {
-      const lines = content.split("\n");
-      const start = Math.max(0, (p.line ?? 1) - 1);
-      const end = p.limit != null ? start + p.limit : lines.length;
-      content = lines.slice(start, end).join("\n");
-    }
+    const content = readTextFileWindow(path, {
+      line: typeof p.line === "number" ? p.line : undefined,
+      limit: typeof p.limit === "number" ? p.limit : undefined,
+    });
     return { content };
   }
 
   private handleWriteTextFile(rec: SessionRecord, params: unknown): Record<string, never> {
     const p = (params ?? {}) as { path?: string; content?: string };
     if (!p.path) throw Object.assign(new Error("path required"), { code: -32602 });
+    const content = p.content ?? "";
+    assertWritableContent(content);
     const path = assertAllowedRealPath(p.path, this.opts.config.allowedRoots, rec.cwd);
     this.assertMutatingTool(rec, "write", path);
+    assertNotDirectory(path);
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, p.content ?? "", "utf8");
+    writeFileSync(path, content, "utf8");
     return {};
   }
 
@@ -784,6 +1010,7 @@ export class SessionManager {
       args?: string[];
       cwd?: string;
       env?: Array<{ name: string; value: string }>;
+      outputByteLimit?: unknown;
     };
     if (!p.command) throw Object.assign(new Error("command required"), { code: -32602 });
     const cwd = p.cwd
@@ -791,93 +1018,56 @@ export class SessionManager {
       : rec.cwd;
     this.assertMutatingTool(rec, "exec");
     const env: NodeJS.ProcessEnv = { ...process.env };
-    for (const e of p.env ?? []) env[e.name] = e.value;
-    const terminalId = randomBytes(8).toString("hex");
-    const chunks: Buffer[] = [];
-    const child = spawnProc(p.command, p.args ?? [], {
+    for (const entry of p.env ?? []) {
+      if (!entry || typeof entry.name !== "string" || typeof entry.value !== "string") {
+        throw Object.assign(new Error("terminal env entries must be strings"), { code: -32602 });
+      }
+      if (!isEnvName(entry.name) || entry.value.includes("\0")) {
+        throw Object.assign(new Error(`invalid env var: ${entry.name}`), { code: -32602 });
+      }
+      env[entry.name] = entry.value;
+    }
+    return this.terminals.create({
+      sessionId: rec.sessionId,
+      command: p.command,
+      args: p.args ?? [],
       cwd,
       env,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: process.platform !== "win32",
+      outputByteLimit: p.outputByteLimit,
     });
-    child.on("error", () => {
-      // Keep the process from crashing the bridge; output/wait report the failure.
-    });
-    const term = {
-      child,
-      sessionId: rec.sessionId,
-      chunks,
-      bytes: 0,
-      truncated: false,
-    };
-    const push = (b: Buffer): void => {
-      const cap = SessionManager.MAX_TERMINAL_BYTES;
-      if (term.bytes >= cap) {
-        term.truncated = true;
-        return;
-      }
-      if (term.bytes + b.length > cap) {
-        chunks.push(b.subarray(0, cap - term.bytes));
-        term.bytes = cap;
-        term.truncated = true;
-        return;
-      }
-      chunks.push(b);
-      term.bytes += b.length;
-    };
-    child.stdout?.on("data", push);
-    child.stderr?.on("data", push);
-    this.terminals.set(terminalId, term);
-    return { terminalId };
   }
 
-  private handleTerminalOutput(params: unknown): {
+  private handleTerminalOutput(rec: SessionRecord, params: unknown): {
     output: string;
     truncated: boolean;
-    exitStatus?: { exitCode: number | null; signal: string | null };
+    exitStatus?: { exitCode: number | null; signal: NodeJS.Signals | null };
   } {
     const p = (params ?? {}) as { terminalId?: string };
-    const t = p.terminalId ? this.terminals.get(p.terminalId) : undefined;
-    if (!t) throw Object.assign(new Error("unknown terminal"), { code: -32002 });
-    const output = Buffer.concat(t.chunks).toString("utf8");
-    const exited = t.child.exitCode !== null;
-    return {
-      output,
-      truncated: t.truncated,
-      ...(exited
-        ? { exitStatus: { exitCode: t.child.exitCode, signal: t.child.signalCode } }
-        : {}),
-    };
+    if (!p.terminalId) throw Object.assign(new Error("terminalId required"), { code: -32602 });
+    return this.terminals.output(rec.sessionId, p.terminalId);
   }
 
-  private handleTerminalKill(params: unknown): Record<string, never> {
+  private handleTerminalKill(rec: SessionRecord, params: unknown): Record<string, never> {
     const p = (params ?? {}) as { terminalId?: string };
-    const t = p.terminalId ? this.terminals.get(p.terminalId) : undefined;
-    if (t) {
-      killProcessTree(t.child, "SIGTERM");
-      this.terminals.delete(p.terminalId!);
-    }
+    if (p.terminalId) this.terminals.kill(rec.sessionId, p.terminalId);
     return {};
   }
 
-  private handleTerminalWait(params: unknown): Promise<{
-    exitCode: number | null;
-    signal: string | null;
-  }> {
+  private handleTerminalRelease(rec: SessionRecord, params: unknown): Record<string, never> {
     const p = (params ?? {}) as { terminalId?: string };
-    const t = p.terminalId ? this.terminals.get(p.terminalId) : undefined;
-    if (!t) {
-      return Promise.reject(Object.assign(new Error("unknown terminal"), { code: -32002 }));
+    if (p.terminalId) this.terminals.release(rec.sessionId, p.terminalId);
+    return {};
+  }
+
+  private handleTerminalWait(
+    rec: SessionRecord,
+    params: unknown,
+  ): Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }> {
+    const p = (params ?? {}) as { terminalId?: string };
+    if (!p.terminalId) {
+      return Promise.reject(Object.assign(new Error("terminalId required"), { code: -32602 }));
     }
-    return new Promise((resolve) => {
-      if (t.child.exitCode !== null || t.child.signalCode) {
-        resolve({ exitCode: t.child.exitCode, signal: t.child.signalCode });
-        return;
-      }
-      t.child.once("exit", (code, signal) => {
-        resolve({ exitCode: code, signal });
-      });
-    });
+    return this.terminals.wait(rec.sessionId, p.terminalId);
   }
 
   private broadcastLogged(
@@ -921,16 +1111,6 @@ export class SessionManager {
     });
   }
 
-  private killTerminals(sessionId?: string): void {
-    for (const [tid, t] of this.terminals) {
-      if (sessionId && t.sessionId !== sessionId) continue;
-      killProcessTree(t.child, "SIGTERM");
-      this.terminals.delete(tid);
-    }
-  }
-
-  private static readonly MAX_TERMINAL_BYTES = 1024 * 1024;
-
   private emitSessionStatus(rec: SessionRecord): void {
     const entry = rec.log.append({
       jsonrpc: "2.0",
@@ -944,7 +1124,153 @@ export class SessionManager {
       },
     });
     rec.lastSeq = entry.seq;
+    this.persist(rec);
     this.opts.broadcast?.(entry.event);
+  }
+
+  private detachForShutdown(sessionId: string): void {
+    const rec = this.sessions.get(sessionId);
+    if (!rec || rec.status === "closed") return;
+    rec.closing = true;
+    rec.cancelRequested = true;
+    this.opts.cancelPhoneRequests?.(sessionId);
+    rec.clientGeneration += 1;
+    rec.promptInFlight = false;
+    rec.client?.kill();
+    rec.client = null;
+    this.terminals.closeSession(sessionId);
+    if (rec.status === "running" || rec.status === "needs_approval") rec.status = "idle";
+    rec.updatedAt = new Date().toISOString();
+    this.persist(rec);
+  }
+
+  private restorePersisted(): void {
+    let metas: SessionMeta[];
+    try {
+      metas = loadPersistedMetas();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      log("warn", `could not read persisted sessions: ${message}`);
+      return;
+    }
+    for (const meta of metas) {
+      if (this.sessions.has(meta.sessionId)) continue;
+      const sessionLog = new SessionLog(meta.sessionId);
+      const stale = meta.status === "running" || meta.status === "needs_approval";
+      let workspaceOk = true;
+      try {
+        assertAllowedWorkspace(meta.cwd, this.opts.config.allowedRoots);
+        for (const extra of meta.additionalDirectories ?? []) {
+          assertAllowedRealPath(extra, this.opts.config.allowedRoots);
+        }
+      } catch {
+        workspaceOk = false;
+      }
+      const rec: SessionRecord = {
+        sessionId: meta.sessionId,
+        harness: meta.harness,
+        cwd: meta.cwd,
+        title: meta.title,
+        createdAt: meta.createdAt,
+        updatedAt: meta.updatedAt,
+        preview: workspaceOk ? meta.preview : "workspace is outside allowed roots",
+        branch: meta.branch,
+        status: workspaceOk ? (stale ? "idle" : meta.status) : "error",
+        permissionMode: meta.permissionMode,
+        lastSeq: sessionLog.lastSeq,
+        log: sessionLog,
+        client: null,
+        agentSessionId: meta.agentSessionId,
+        grants: meta.grants.map((g) => ({ ...g })),
+        sessionModes: meta.sessionModes,
+        agentInfo: meta.agentInfo,
+        authMethods: meta.authMethods,
+        mcpServers: meta.mcpServers ?? [],
+        additionalDirectories: meta.additionalDirectories ?? [],
+        configOptions: meta.configOptions,
+        clientGeneration: 0,
+        promptInFlight: false,
+        cancelRequested: false,
+        closing: false,
+      };
+      this.sessions.set(rec.sessionId, rec);
+      if (!workspaceOk || stale) this.persist(rec);
+    }
+  }
+
+  private persist(rec: SessionRecord): void {
+    if (!isSafeSessionId(rec.sessionId)) return;
+    try {
+      writeSessionMeta(dirname(rec.log.path), this.toMeta(rec));
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      log("warn", `could not persist session ${rec.sessionId}: ${message}`);
+    }
+  }
+
+  private toMeta(rec: SessionRecord): SessionMeta {
+    return {
+      version: 1,
+      sessionId: rec.sessionId,
+      harness: rec.harness,
+      cwd: rec.cwd,
+      title: rec.title,
+      createdAt: rec.createdAt,
+      updatedAt: rec.updatedAt,
+      preview: rec.preview,
+      ...(rec.branch ? { branch: rec.branch } : {}),
+      status: rec.status,
+      permissionMode: rec.permissionMode,
+      agentSessionId: rec.agentSessionId,
+      mcpServers: rec.mcpServers,
+      ...(rec.sessionModes !== undefined ? { sessionModes: rec.sessionModes } : {}),
+      ...(rec.configOptions !== undefined ? { configOptions: rec.configOptions } : {}),
+      ...(rec.agentInfo ? { agentInfo: rec.agentInfo } : {}),
+      ...(rec.authMethods ? { authMethods: rec.authMethods } : {}),
+      grants: rec.grants.map((g) => ({ ...g })),
+      additionalDirectories: rec.additionalDirectories,
+    };
+  }
+
+  private maybeTitle(rec: SessionRecord, params: unknown): void {
+    if (rec.title !== "New session") return;
+    const text = firstPromptText(params).slice(0, 80);
+    if (!text) return;
+    rec.title = text;
+  }
+
+  private assertSessionWorkspace(rec: SessionRecord): void {
+    assertAllowedWorkspace(rec.cwd, this.opts.config.allowedRoots);
+    for (const extra of rec.additionalDirectories) {
+      assertAllowedRealPath(extra, this.opts.config.allowedRoots);
+    }
+  }
+
+  private adoptAgentSession(rec: SessionRecord, tempId: string, agentSessionId: string): void {
+    if (!isSafeSessionId(agentSessionId)) {
+      throw new BridgeError(-32602, "invalid session id from harness", { harness: rec.harness });
+    }
+    if (agentSessionId === tempId) {
+      rec.agentSessionId = agentSessionId;
+      return;
+    }
+    if (this.sessions.has(agentSessionId)) {
+      throw new BridgeError(-32002, `session id already in use: ${agentSessionId}`, {
+        sessionId: agentSessionId,
+      });
+    }
+    rec.log.relocate(agentSessionId);
+    this.sessions.delete(tempId);
+    rec.sessionId = agentSessionId;
+    rec.agentSessionId = agentSessionId;
+    this.sessions.set(agentSessionId, rec);
+  }
+
+  private captureSessionPayload(rec: SessionRecord, result: unknown): void {
+    if (!result || typeof result !== "object") return;
+    const obj = result as Record<string, unknown>;
+    if (obj.modes && typeof obj.modes === "object") rec.sessionModes = obj.modes;
+    if ("configOptions" in obj && obj.configOptions != null) rec.configOptions = obj.configOptions;
   }
 }
 
@@ -954,6 +1280,22 @@ const PERMISSION_MODE_IDS = new Set<PermissionMode>(["ask", "auto-edit", "plan",
 
 function isPermissionMode(modeId: string): modeId is PermissionMode {
   return PERMISSION_MODE_IDS.has(modeId as PermissionMode);
+}
+
+function sandboxAdditionalDirectories(raw: string[] | undefined, allowedRoots: string[]): string[] {
+  if (!raw || raw.length === 0) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string" || !entry.trim()) {
+      throw new BridgeError(-32602, "additionalDirectories entries must be paths");
+    }
+    const real = assertAllowedRealPath(entry, allowedRoots);
+    if (seen.has(real)) continue;
+    seen.add(real);
+    out.push(real);
+  }
+  return out;
 }
 
 function readAgentInitialize(result: unknown): {
