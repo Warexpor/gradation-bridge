@@ -162,6 +162,12 @@ describe("getGitStatus / getGitDiff", () => {
       GIT_WORK_TREE: "/tmp/other-work",
       GIT_EDITOR: "/tmp/editor",
       EDITOR: "/tmp/editor",
+      GIT_CONFIG: "/tmp/other.cfg",
+      GIT_ASKPASS: "/tmp/askpass",
+      SSH_ASKPASS: "/tmp/askpass",
+      SSH_ASKPASS_REQUIRE: "force",
+      GIT_PROXY_COMMAND: "/tmp/proxy",
+      GIT_ALLOW_PROTOCOL: "ext",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.GIT_EXTERNAL_DIFF).toBeUndefined();
@@ -169,6 +175,12 @@ describe("getGitStatus / getGitDiff", () => {
     expect(env.GIT_WORK_TREE).toBeUndefined();
     expect(env.GIT_EDITOR).toBeUndefined();
     expect(env.EDITOR).toBeUndefined();
+    expect(env.GIT_CONFIG).toBeUndefined();
+    expect(env.GIT_ASKPASS).toBeUndefined();
+    expect(env.SSH_ASKPASS).toBeUndefined();
+    expect(env.SSH_ASKPASS_REQUIRE).toBeUndefined();
+    expect(env.GIT_PROXY_COMMAND).toBeUndefined();
+    expect(env.GIT_ALLOW_PROTOCOL).toBeUndefined();
     expect(env.GIT_CONFIG_COUNT).toBeUndefined();
     expect(env.GIT_CONFIG_KEY_0).toBeUndefined();
     expect(env.GIT_CONFIG_VALUE_0).toBeUndefined();
@@ -333,6 +345,71 @@ describe("getGitStatus / getGitDiff", () => {
     } finally {
       if (prev === undefined) delete process.env.PATH;
       else process.env.PATH = prev;
+    }
+  });
+
+  it("does not run a clean filter from per-worktree config", async () => {
+    tmp = mkdtempSync(join(tmpdir(), "gb-git-wt-"));
+    const repo = join(tmp, "repo");
+    mkdirSync(repo);
+    const marker = join(tmp, "marker");
+    const script = join(tmp, "helper.sh");
+    const inc = join(tmp, "inc.cfg");
+    writeFileSync(script, `#!/bin/sh\necho ran >> ${JSON.stringify(marker)}\ncat "$1" 2>/dev/null || cat\n`);
+    chmodSync(script, 0o755);
+    writeFileSync(inc, `[filter "evil"]\n\tclean = ${script}\n`);
+    git(repo, ["init"]);
+    git(repo, ["config", "user.email", "test@example.com"]);
+    git(repo, ["config", "user.name", "Test"]);
+    writeFileSync(join(repo, "a.txt"), "one\n");
+    git(repo, ["add", "a.txt"]);
+    git(repo, ["commit", "-m", "init"]);
+    writeFileSync(join(repo, "a.txt"), "two\n");
+    // Same file a linked worktree uses. --local does not list it.
+    git(repo, ["config", "extensions.worktreeConfig", "true"]);
+    git(repo, ["config", "--worktree", "include.path", inc]);
+    writeFileSync(join(repo, ".gitattributes"), "* filter=evil\n");
+
+    rmSync(marker, { force: true });
+    const diff = await getGitDiff(repo, "a.txt");
+    expect(diff.unified).toContain("+two");
+    expect(existsSync(marker)).toBe(false);
+    const st = await getGitStatus(repo);
+    expect(st.files.some((f) => f.path === "a.txt")).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("does not let GIT_CONFIG hide a repo clean filter", async () => {
+    tmp = mkdtempSync(join(tmpdir(), "gb-git-config-env-"));
+    const repo = join(tmp, "repo");
+    mkdirSync(repo);
+    const marker = join(tmp, "marker");
+    const script = join(tmp, "helper.sh");
+    const other = join(tmp, "other.cfg");
+    writeFileSync(script, `#!/bin/sh\necho ran >> ${JSON.stringify(marker)}\ncat "$1" 2>/dev/null || cat\n`);
+    chmodSync(script, 0o755);
+    writeFileSync(other, "# not the repo config\n");
+    git(repo, ["init"]);
+    git(repo, ["config", "user.email", "test@example.com"]);
+    git(repo, ["config", "user.name", "Test"]);
+    writeFileSync(join(repo, "a.txt"), "one\n");
+    git(repo, ["add", "a.txt"]);
+    git(repo, ["commit", "-m", "init"]);
+    writeFileSync(join(repo, "a.txt"), "two\n");
+    git(repo, ["config", "filter.evil.clean", script]);
+    writeFileSync(join(repo, ".gitattributes"), "* filter=evil\n");
+    const prev = process.env.GIT_CONFIG;
+    process.env.GIT_CONFIG = other;
+    try {
+      rmSync(marker, { force: true });
+      const diff = await getGitDiff(repo, "a.txt");
+      expect(diff.unified).toContain("+two");
+      expect(existsSync(marker)).toBe(false);
+      const st = await getGitStatus(repo);
+      expect(st.files.some((f) => f.path === "a.txt")).toBe(true);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      restoreEnv("GIT_CONFIG", prev);
     }
   });
 

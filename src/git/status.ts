@@ -40,9 +40,14 @@ export interface GitDiffResult {
  * `-c` is inherited by submodule git processes. A parent `diff.submodule=diff`
  * otherwise runs the submodule's `diff.external` even when the parent command
  * passed `--no-ext-diff`. Recurse and submodule summary stay off.
- * `include.path` is not visible in `git config --local --list`. Filter keys
- * from an included file still run on status and diff, so the listing passes
- * `--includes` and those keys are blanked the same way.
+ * `include.path` is not visible in `git config --local --list` without
+ * `--includes`. Per-worktree config (`extensions.worktreeConfig`,
+ * `.git/config.worktree`, including a linked worktree) is not visible with
+ * `--local` at all, and those clean filters still run on status and diff.
+ * The listing uses `--includes` with no scope so local and worktree keys are
+ * both blanked. `GIT_CONFIG` is removed from the child environment first.
+ * With it set, `git config --local` errors and an unscoped `git config --list`
+ * reads that other file, hiding the repo filters that status and diff still run.
  */
 const GIT_GUARD = [
   "-c",
@@ -116,10 +121,16 @@ const STRIPPED_GIT_ENV = new Set([
   "VISUAL",
   "GIT_EDITOR",
   "GIT_SEQUENCE_EDITOR",
+  "GIT_CONFIG",
   "GIT_CONFIG_PARAMETERS",
   "GIT_CONFIG_COUNT",
   "GIT_SSH",
   "GIT_SSH_COMMAND",
+  "GIT_ASKPASS",
+  "SSH_ASKPASS",
+  "SSH_ASKPASS_REQUIRE",
+  "GIT_PROXY_COMMAND",
+  "GIT_ALLOW_PROTOCOL",
   "GIT_EXEC_PATH",
   "GIT_DIR",
   "GIT_WORK_TREE",
@@ -201,7 +212,6 @@ async function localFilterKeys(
         "-c",
         "alias.config=",
         "config",
-        "--local",
         "--includes",
         "--name-only",
         "--list",
