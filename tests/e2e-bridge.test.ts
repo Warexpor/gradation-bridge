@@ -176,6 +176,10 @@ describe("bridge e2e with fake ACP agent", () => {
       _meta: { harness: "fake", permissionMode: "auto-edit" },
     })) as { sessionId: string };
     expect(created.sessionId).toMatch(/^fake-/);
+    expect(created).toMatchObject({
+      modes: { currentModeId: "agent" },
+      _meta: { harness: "fake", permissionMode: "auto-edit" },
+    });
 
     const promptResult = (await client.call("session/prompt", {
       sessionId: created.sessionId,

@@ -1,15 +1,21 @@
-import { accessSync, constants } from "node:fs";
 import { createRequire } from "node:module";
-import { delimiter, join } from "node:path";
 import type { BridgeConfig, HarnessConfig } from "../config/types.js";
+import { resolveHarnessLaunch, type HarnessLaunch, type HarnessReadiness } from "./catalog.js";
+import { which } from "./path.js";
 
 export interface HarnessInfo {
   id: string;
   name: string;
   available: boolean;
   command: string;
+  /** Display args (secrets redacted). */
   args: string[];
-  models?: string[];
+  readiness: HarnessReadiness;
+  detail: string;
+  install: string;
+  docs?: string;
+  authHint?: string;
+  notice?: string;
 }
 
 const ALIASES: Record<string, string> = {
@@ -17,50 +23,33 @@ const ALIASES: Record<string, string> = {
   "claude-code": "claude-code",
 };
 
-const require = createRequire(import.meta.url);
-
-function commandExists(command: string): boolean {
-  if (command.includes("/") || command.includes("\\")) {
-    try {
-      accessSync(command, constants.X_OK);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  const pathEnv = process.env.PATH ?? "";
-  for (const dir of pathEnv.split(delimiter)) {
-    if (!dir) continue;
-    try {
-      accessSync(join(dir, command), constants.X_OK);
-      return true;
-    } catch {
-      // continue
-    }
-  }
-  // npx ships with npm; available whenever we can run under node.
-  if (command === "npx" || command === "node") return true;
-  return false;
+export function toPublicHarness(launch: HarnessLaunch): HarnessInfo {
+  return {
+    id: launch.id,
+    name: launch.name,
+    available: launch.available,
+    command: launch.command,
+    args: launch.displayArgs,
+    readiness: launch.readiness,
+    detail: launch.detail,
+    install: launch.install,
+    ...(launch.docs ? { docs: launch.docs } : {}),
+    ...(launch.authHint ? { authHint: launch.authHint } : {}),
+    ...(launch.notice ? { notice: launch.notice } : {}),
+  };
 }
 
 /**
- * Detect / list configured harnesses. MVP: check command on PATH;
- * does not probe whether the ACP subcommand actually works.
+ * Detect / list configured harnesses.
+ * `available` is true for ready binaries and for npx on-demand launches.
+ * `readiness` says which of those it is. `missing` is not available.
  */
 export function listHarnesses(config: BridgeConfig): HarnessInfo[] {
   return config.harnesses.filter((h) => h.enabled !== false).map((h) => describeHarness(h));
 }
 
 export function describeHarness(h: HarnessConfig): HarnessInfo {
-  const args = h.args ?? [];
-  const available = commandExists(h.command);
-  return {
-    id: h.id,
-    name: h.name,
-    available,
-    command: h.command,
-    args,
-  };
+  return toPublicHarness(resolveHarnessLaunch(h));
 }
 
 export function findHarness(config: BridgeConfig, id: string): HarnessConfig | undefined {
@@ -70,22 +59,9 @@ export function findHarness(config: BridgeConfig, id: string): HarnessConfig | u
   );
 }
 
-export function which(command: string): string | undefined {
-  if (command.includes("/") || command.includes("\\")) {
-    return commandExists(command) ? command : undefined;
-  }
-  const pathEnv = process.env.PATH ?? "";
-  for (const dir of pathEnv.split(delimiter)) {
-    const candidate = join(dir, command);
-    try {
-      accessSync(candidate, constants.X_OK);
-      return candidate;
-    } catch {
-      // continue
-    }
-  }
-  return undefined;
-}
+export { which };
+
+const require = createRequire(import.meta.url);
 
 /** Build a HarnessConfig that launches the in-repo fake ACP agent via tsx. */
 export function fakeHarnessConfig(agentScriptPath: string): HarnessConfig {

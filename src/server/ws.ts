@@ -10,8 +10,12 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { parseAuthorizationHeader, verifyBearerToken } from "../auth/token.js";
+import { PERMISSION_MODES } from "../approval/policy.js";
 import type { BridgeConfig, PermissionMode } from "../config/types.js";
+import { saveConfig } from "../config/load.js";
+import { BridgeError } from "../errors.js";
 import { listHarnesses } from "../harness/registry.js";
+import { log, recentLogs } from "../log/diagnostics.js";
 import { SessionManager, SandboxError } from "../session/manager.js";
 import { assertAllowedRealPath } from "../approval/sandbox.js";
 import { getGitDiff, getGitStatus } from "../git/status.js";
@@ -120,6 +124,7 @@ export async function startBridgeServer(opts: WsServerOptions): Promise<BridgeSe
     }
     const token = extractToken(req);
     if (!verifyBearerToken(token)) {
+      log("warn", "rejected websocket upgrade: missing or invalid credentials");
       socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
@@ -229,13 +234,17 @@ async function handleMessage(
     const result = await dispatch(msg.method, msg.params, opts, ws);
     send(ws, { jsonrpc: "2.0", id: msg.id, result });
   } catch (e) {
-    const err = e as Error & { code?: number };
-    const code =
-      e instanceof SandboxError ? -32003 : (err.code ?? -32603);
+    const err = e as Error & { code?: number; data?: unknown };
+    const code = e instanceof SandboxError ? -32003 : (err.code ?? -32603);
+    const data = e instanceof BridgeError ? e.data : err.data;
     send(ws, {
       jsonrpc: "2.0",
       id: msg.id,
-      error: { code, message: err.message || "Internal error" },
+      error: {
+        code,
+        message: err.message || "Internal error",
+        ...(data !== undefined ? { data } : {}),
+      },
     });
   }
 }
@@ -260,26 +269,57 @@ async function dispatch(
   const p = (params ?? {}) as Record<string, unknown>;
   switch (method) {
     case "initialize": {
-      const harnesses = listHarnesses(opts.config).map(({ id, name, available }) => ({
-        id,
-        name,
-        available,
-      }));
+      opts.sessions.notePhoneInitialize(p);
+      const requested = p.protocolVersion;
+      if (requested != null && requested !== 1) {
+        log("warn", `phone requested protocolVersion ${String(requested)}; bridge speaks ACP 1`);
+      }
+      const harnesses = listHarnesses(opts.config).map(
+        ({ id, name, available, readiness, detail, notice }) => ({
+          id,
+          name,
+          available,
+          readiness,
+          detail,
+          ...(notice ? { notice } : {}),
+        }),
+      );
       return {
         protocolVersion: 1,
         agentCapabilities: {
           loadSession: true,
           promptCapabilities: { image: false, audio: false, embeddedContext: true },
         },
+        // WebSocket bearer auth already happened. Per-harness auth is on session/new _meta.
+        authMethods: [],
         agentInfo: { name: "gradation-bridge", version: opts.version },
         _meta: {
           bridge: {
             version: opts.version,
             harnesses,
             hostName: opts.config.hostName ?? hostname(),
+            permissionModes: PERMISSION_MODES,
           },
         },
       };
+    }
+    case "bridge/diagnostics": {
+      return {
+        version: opts.version,
+        permissionMode: opts.config.defaultPermissionMode,
+        harnesses: listHarnesses(opts.config),
+        sessions: opts.sessions.list().length,
+        log: recentLogs(),
+      };
+    }
+    case "bridge/setPermissionMode": {
+      const sessionId = String(p.sessionId ?? "");
+      const modeId = String(p.permissionMode ?? p.modeId ?? "");
+      if (!VALID_MODES.has(modeId as PermissionMode)) {
+        throw new BridgeError(-32602, `unknown permission mode: ${modeId}`, { modeId });
+      }
+      opts.sessions.setPermissionMode(sessionId, modeId as PermissionMode);
+      return { permissionMode: modeId };
     }
     case "bridge/listHarnesses":
       return { harnesses: listHarnesses(opts.config) };
@@ -365,16 +405,22 @@ async function dispatch(
         mcpServers: Array.isArray(p.mcpServers) ? p.mcpServers : [],
         model: typeof meta.model === "string" ? meta.model : undefined,
       });
-      // Remember workspace
-      if (!opts.config.workspaces?.includes(cwd)) {
-        opts.config.workspaces = [cwd, ...(opts.config.workspaces ?? [])].slice(0, 20);
-      }
-      return { sessionId: rec.sessionId };
+      rememberWorkspace(opts.config, cwd);
+      return {
+        sessionId: rec.sessionId,
+        ...(rec.sessionModes ? { modes: rec.sessionModes } : {}),
+        _meta: {
+          permissionMode: rec.permissionMode,
+          harness: rec.harness,
+          ...(rec.agentInfo ? { agentInfo: rec.agentInfo } : {}),
+          ...(rec.authMethods ? { authMethods: rec.authMethods } : {}),
+        },
+      };
     }
 
     case "session/prompt": {
       const sessionId = String(p.sessionId ?? "");
-      return opts.sessions.prompt(sessionId, p.prompt);
+      return opts.sessions.prompt(sessionId, p);
     }
 
     case "session/load": {
@@ -397,19 +443,25 @@ async function dispatch(
     case "session/set_mode": {
       const sessionId = String(p.sessionId ?? "");
       const modeId = String(p.modeId ?? "");
-      if (!VALID_MODES.has(modeId as PermissionMode)) {
-        const err = new Error(`unknown modeId: ${modeId}`) as Error & { code?: number };
-        err.code = -32602;
-        throw err;
+      if (!modeId) {
+        throw new BridgeError(-32602, "modeId required");
       }
-      opts.sessions.setPermissionMode(sessionId, modeId as PermissionMode);
-      return {};
+      return opts.sessions.applyMode(sessionId, modeId);
     }
 
     default: {
-      const err = new Error(`Method not found: ${method}`) as Error & { code?: number };
-      err.code = -32601;
-      throw err;
+      throw new BridgeError(-32601, `Method not found: ${method}`);
     }
+  }
+}
+
+function rememberWorkspace(config: BridgeConfig, cwd: string): void {
+  if (!cwd || config.workspaces?.includes(cwd)) return;
+  config.workspaces = [cwd, ...(config.workspaces ?? [])].slice(0, 20);
+  try {
+    saveConfig(config);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    log("warn", `could not save recent workspace: ${message}`);
   }
 }

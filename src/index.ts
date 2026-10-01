@@ -10,7 +10,7 @@
  *   npx gradation-bridge revoke <id>
  */
 
-import { networkInterfaces } from "node:os";
+import { hostname, networkInterfaces } from "node:os";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -21,7 +21,9 @@ import {
   listDevices,
   revokeDevice,
 } from "./auth/token.js";
+import { formatDoctorReport } from "./cli/doctor.js";
 import { ensureDirs, loadConfig } from "./config/load.js";
+import { log, parseLogLevel, setLogLevel } from "./log/diagnostics.js";
 import { SessionManager } from "./session/manager.js";
 import { startBridgeServer } from "./server/ws.js";
 
@@ -43,7 +45,7 @@ function parseArgs(argv: string[]): {
   lan: boolean;
   tailscale: boolean;
   port?: number;
-  command?: "devices" | "revoke";
+  command?: "devices" | "revoke" | "doctor";
   revokeId?: string;
 } {
   const out: ReturnType<typeof parseArgs> = { lan: false, tailscale: false };
@@ -53,8 +55,14 @@ function parseArgs(argv: string[]): {
     if (a === "--lan") out.lan = true;
     else if (a === "--tailscale") out.tailscale = true;
     else if (a === "--port" && args[i + 1]) {
-      out.port = Number(args[++i]);
+      const n = Number(args[++i]);
+      if (!Number.isInteger(n) || n < 1 || n > 65535) {
+        process.stderr.write(`Invalid port: ${args[i]}\n`);
+        process.exit(2);
+      }
+      out.port = n;
     } else if (a === "devices") out.command = "devices";
+    else if (a === "doctor") out.command = "doctor";
     else if (a === "revoke" && args[i + 1]) {
       out.command = "revoke";
       out.revokeId = args[++i];
@@ -64,6 +72,10 @@ function parseArgs(argv: string[]): {
     } else if (a === "--version" || a === "-v") {
       process.stdout.write(`gradation-bridge ${VERSION}\n`);
       process.exit(0);
+    } else {
+      process.stderr.write(`Unknown argument: ${a}\n`);
+      printHelp();
+      process.exit(2);
     }
   }
   return out;
@@ -76,6 +88,7 @@ ACP bridge daemon for GradatiON Code mode.
 
 Usage:
   gradation-bridge [--lan | --tailscale] [--port N]
+  gradation-bridge doctor
   gradation-bridge devices
   gradation-bridge revoke <deviceId>
 
@@ -83,6 +96,9 @@ Options:
   --lan         Bind to a non-loopback IPv4 address (LAN)
   --tailscale   Bind to a Tailscale (100.x / fd7a:) address if present
   --port N      Override listen port (default from config, usually 8787)
+
+doctor prints harness readiness and pairing safety without printing tokens.
+The pairing link is a secret: anyone with it can run code on this machine.
 
 On first run a 32-byte bearer token and self-signed TLS cert are generated.
 Config: ~/.config/gradation-bridge/config.json
@@ -135,6 +151,14 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (flags.command === "doctor") {
+    ensureDirs();
+    const config = loadConfig();
+    applyLogLevel(config.logLevel);
+    process.stdout.write(formatDoctorReport(config));
+    return;
+  }
+
   if (flags.command === "revoke") {
     ensureDirs();
     const ok = revokeDevice(flags.revokeId!);
@@ -144,6 +168,7 @@ async function main(): Promise<void> {
 
   ensureDirs();
   const config = loadConfig();
+  applyLogLevel(config.logLevel);
   const { token, created: tokenCreated } = ensurePrimaryToken();
   const tls = ensureTlsMaterial();
   const host = pickBindHost(flags);
@@ -168,10 +193,12 @@ async function main(): Promise<void> {
     url: advertiseUrl,
     token,
     fingerprintSha256: tls.fingerprintSha256,
+    name: config.hostName ?? hostname(),
     host,
     port,
     created: tokenCreated || tls.created,
   });
+  log("info", `listening on ${advertiseUrl}`);
 
   if (!hasRealCert) {
     process.stderr.write(
@@ -186,6 +213,11 @@ async function main(): Promise<void> {
   };
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
+}
+
+function applyLogLevel(configLevel: string | undefined): void {
+  const level = parseLogLevel(process.env.GRADATION_LOG) ?? parseLogLevel(configLevel) ?? "info";
+  setLogLevel(level);
 }
 
 main().catch((err) => {
