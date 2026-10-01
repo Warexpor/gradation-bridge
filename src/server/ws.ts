@@ -462,6 +462,7 @@ async function dispatch(
             close: {},
             resume: {},
             delete: {},
+            additionalDirectories: {},
           },
         },
         // WebSocket bearer auth already happened. Per-harness auth is on session/new _meta.
@@ -552,6 +553,7 @@ async function dispatch(
       return opts.sessions.resume(sessionId, {
         cwd: typeof p.cwd === "string" ? p.cwd : undefined,
         mcpServers: Array.isArray(p.mcpServers) ? p.mcpServers : [],
+        additionalDirectories: directoryList(p.additionalDirectories),
       });
     }
     case "session/set_config_option": {
@@ -643,6 +645,7 @@ async function dispatch(
         cwd: typeof p.cwd === "string" ? p.cwd : undefined,
         afterSeq: Number.isFinite(afterSeq) ? afterSeq : 0,
         mcpServers: Array.isArray(p.mcpServers) ? p.mcpServers : [],
+        additionalDirectories: directoryList(p.additionalDirectories),
         send: (frame) => sendImportant(ws, frame),
       });
     }
@@ -726,6 +729,11 @@ function cancelInflightPhoneCall(method: string, params: unknown, opts: WsServer
       cwd: typeof p.cwd === "string" ? p.cwd : typeof meta.cwd === "string" ? meta.cwd : undefined,
     });
   }
+}
+
+function directoryList(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  return raw as string[];
 }
 
 function rememberWorkspace(config: BridgeConfig, cwd: string): void {

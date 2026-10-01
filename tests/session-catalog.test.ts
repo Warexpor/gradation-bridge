@@ -268,4 +268,52 @@ describe("session catalog edges", () => {
     expect(readFileSync(join(dir, "authed", "meta.json"), "utf8")).not.toContain("sekret-value");
     expect(readFileSync(leak, "utf8")).toBe("LEAK-OUTSIDE\n");
   });
+
+  it("skips a mismatched agent session id and a symlinked sessions directory", () => {
+    const { root, workspace } = useDataDir();
+    const dir = sessionsRoot();
+    const body = meta(workspace, { sessionId: "diverged", title: "should-not-load" });
+    body.agentSessionId = "other-id";
+    mkdirSync(join(dir, "diverged"), { recursive: true });
+    writeFileSync(join(dir, "diverged", "meta.json"), JSON.stringify(body));
+    expect(manager(workspace).list().map((s) => s.sessionId)).not.toContain("diverged");
+
+    rmSync(dir, { recursive: true, force: true });
+    const outside = join(root, "outside-sessions", "hidden");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(
+      join(outside, "meta.json"),
+      JSON.stringify(meta(workspace, { sessionId: "hidden", title: "via-symlink" })),
+    );
+    symlinkSync(join(root, "outside-sessions"), dir);
+    const sessions = manager(workspace);
+    expect(sessions.list()).toEqual([]);
+    expect(JSON.stringify(sessions.listForProtocol({}))).not.toContain("via-symlink");
+  });
+
+  it("replaces additional directories on load and refuses a closed session", async () => {
+    const { workspace } = useDataDir();
+    const extra = join(workspace, "extra");
+    mkdirSync(extra);
+    const dir = sessionsRoot();
+    writeSessionMeta(
+      join(dir, "rooted"),
+      meta(workspace, { sessionId: "rooted", additionalDirectories: [extra] }),
+    );
+    const sessions = manager(workspace);
+    await expect(
+      sessions.load("rooted", { additionalDirectories: ["/etc"], send: async () => true }),
+    ).rejects.toThrow(SandboxError);
+    expect(sessions.get("rooted")?.additionalDirectories).toEqual([extra]);
+
+    const loaded = await sessions.load("rooted", {
+      additionalDirectories: [],
+      send: async () => true,
+    });
+    expect(sessions.get("rooted")?.additionalDirectories).toEqual([]);
+    expect(loaded.agentAlive).toBe(false);
+
+    sessions.close("rooted");
+    await expect(sessions.load("rooted", { send: async () => true })).rejects.toThrow(/unknown session/);
+  });
 });

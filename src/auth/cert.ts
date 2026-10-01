@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { createHash, generateKeyPairSync } from "node:crypto";
+import { createHash, createPrivateKey, generateKeyPairSync, X509Certificate } from "node:crypto";
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { isIP } from "node:net";
 import { join } from "node:path";
 import { dataDir, ensureDirs } from "../config/load.js";
 
@@ -9,8 +10,12 @@ export interface TlsMaterial {
   certPath: string;
   keyPem: string;
   certPem: string;
-  /** SHA-256 fingerprint of the DER cert, lowercase hex (no colons). */
+  /** SHA-256 fingerprint of the DER cert, lowercase hex (no colons). Empty when unusable. */
   fingerprintSha256: string;
+  /** False for the openssl stub. A mismatched pair throws instead of returning. */
+  usable: boolean;
+  /** Set when a real cert's SAN does not include the bind host. The cert is not replaced. */
+  sanWarning?: string;
   created: boolean;
 }
 
@@ -37,15 +42,46 @@ export function tlsDiagnostics(certPem: string | undefined): {
  */
 export function inspectTlsFiles(): {
   certPath: string;
-  state: "missing" | "stub" | "ready";
+  state: "missing" | "stub" | "incomplete" | "invalid" | "ready";
   fingerprintSha256?: string;
+  detail?: string;
 } {
-  const { certPath } = certPaths();
+  const { keyPath, certPath } = certPaths();
   if (!existsSync(certPath)) return { certPath, state: "missing" };
   const certPem = readFileSync(certPath, "utf8");
   const diag = tlsDiagnostics(certPem);
   if (!diag.tls || !diag.certFingerprint) return { certPath, state: "stub" };
+  if (!existsSync(keyPath)) {
+    return { certPath, state: "incomplete", detail: "certificate without a private key" };
+  }
+  const problem = tlsPairProblem(readFileSync(keyPath, "utf8"), certPem);
+  if (problem) return { certPath, state: "invalid", detail: problem };
   return { certPath, state: "ready", fingerprintSha256: diag.certFingerprint };
+}
+
+/** Why this key cannot serve this cert, or undefined when the pair matches. */
+export function tlsPairProblem(keyPem: string, certPem: string): string | undefined {
+  try {
+    const cert = new X509Certificate(certPem);
+    const key = createPrivateKey(keyPem);
+    if (!cert.checkPrivateKey(key)) return "private key does not match the certificate";
+    return undefined;
+  } catch {
+    return "certificate or private key is unreadable";
+  }
+}
+
+/** True when the cert's SAN matches an IP or DNS bind host. Does not remint. */
+export function bindHostCoveredByCert(certPem: string, bindHost: string): boolean {
+  let cert: X509Certificate;
+  try {
+    cert = new X509Certificate(certPem);
+  } catch {
+    return false;
+  }
+  const bare = bindHost.replace(/^\[|\]$/g, "");
+  if (isIP(bare)) return cert.checkIP(bare) != null;
+  return cert.checkHost(bare) != null;
 }
 
 export function fingerprintOfPem(certPem: string): string {
@@ -63,16 +99,16 @@ export function fingerprintOfPem(certPem: string): string {
  */
 export function tlsSubjectAltNames(bindHost?: string): string[] {
   const sans = ["DNS:localhost", "DNS:gradation-bridge", "IP:127.0.0.1", "IP:::1"];
-  if (!bindHost || bindHost === "127.0.0.1" || bindHost === "localhost" || bindHost === "::1") {
+  if (!bindHost) return sans;
+  const bare = bindHost.replace(/^\[|\]$/g, "");
+  if (!bare || bare === "127.0.0.1" || bare === "localhost" || bare === "::1") return sans;
+  // Only a real IP or a single DNS label list. Commas would inject extra SANs into openssl -addext.
+  if (isIP(bare)) {
+    sans.push(`IP:${bare}`);
     return sans;
   }
-  if (bindHost.includes(":")) {
-    const bare = bindHost.replace(/^\[|\]$/g, "");
-    sans.push(`IP:${bare}`);
-  } else if (/^\d{1,3}(\.\d{1,3}){3}$/.test(bindHost)) {
-    sans.push(`IP:${bindHost}`);
-  } else {
-    sans.push(`DNS:${bindHost}`);
+  if (/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/.test(bare)) {
+    sans.push(`DNS:${bare}`);
   }
   return sans;
 }
@@ -128,16 +164,32 @@ export function ensureTlsMaterial(opts?: { bindHost?: string }): TlsMaterial {
   const { keyPath, certPath } = certPaths();
   const sans = tlsSubjectAltNames(opts?.bindHost);
 
-  if (existsSync(keyPath) && existsSync(certPath)) {
-    const keyPem = readFileSync(keyPath, "utf8");
+  if (existsSync(certPath)) {
     const certPem = readFileSync(certPath, "utf8");
     if (certPem.includes("BEGIN CERTIFICATE")) {
+      if (!existsSync(keyPath)) {
+        throw new Error(
+          `TLS certificate has no private key (${certPath}). Delete server.crt to mint a new pair. Refusing to replace a cert a phone may already have pinned.`,
+        );
+      }
+      const keyPem = readFileSync(keyPath, "utf8");
+      const problem = tlsPairProblem(keyPem, certPem);
+      if (problem) {
+        throw new Error(
+          `TLS ${problem} (${certPath}). Delete server.key and server.crt to mint a new pair. Refusing to start with a cert the phone cannot use.`,
+        );
+      }
+      const sanWarning = opts?.bindHost && !bindHostCoveredByCert(certPem, opts.bindHost)
+        ? `Cert has no SAN for ${opts.bindHost}. Phones may reject TLS. The pinned cert was left in place.`
+        : undefined;
       return {
         keyPath,
         certPath,
         keyPem,
         certPem,
         fingerprintSha256: fingerprintOfPem(certPem),
+        usable: true,
+        ...(sanWarning ? { sanWarning } : {}),
         created: false,
       };
     }
@@ -146,12 +198,17 @@ export function ensureTlsMaterial(opts?: { bindHost?: string }): TlsMaterial {
   if (tryOpensslSelfSigned(keyPath, certPath, sans)) {
     const keyPem = readFileSync(keyPath, "utf8");
     const certPem = readFileSync(certPath, "utf8");
+    const sanWarning = opts?.bindHost && !bindHostCoveredByCert(certPem, opts.bindHost)
+      ? `Cert has no SAN for ${opts.bindHost}. Phones may reject TLS. The pinned cert was left in place.`
+      : undefined;
     return {
       keyPath,
       certPath,
       keyPem,
       certPem,
       fingerprintSha256: fingerprintOfPem(certPem),
+      usable: true,
+      ...(sanWarning ? { sanWarning } : {}),
       created: true,
     };
   }
@@ -170,7 +227,8 @@ export function ensureTlsMaterial(opts?: { bindHost?: string }): TlsMaterial {
     certPath,
     keyPem: privateKey,
     certPem: stub,
-    fingerprintSha256: createHash("sha256").update(stub).digest("hex"),
+    fingerprintSha256: "",
+    usable: false,
     created: true,
   };
 }

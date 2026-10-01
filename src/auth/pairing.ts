@@ -6,18 +6,28 @@
 export interface PairingInfo {
   url: string;
   token: string;
-  fingerprintSha256: string;
+  /** Omitted when TLS is not actually serving a certificate. */
+  fingerprintSha256?: string;
   /** Machine label shown by GradatiON. Optional; ignored by older apps. */
   name?: string;
+  /** Non-secret warning, for example a bind address missing from the cert SAN. */
+  tlsWarning?: string;
+}
+
+function pairingLabel(name: string): string {
+  return name.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 80);
 }
 
 export function buildPairingPayload(info: PairingInfo): string {
   const params = new URLSearchParams({
     url: info.url,
     token: info.token,
-    fp: info.fingerprintSha256,
   });
-  if (info.name) params.set("name", info.name);
+  if (info.fingerprintSha256) params.set("fp", info.fingerprintSha256);
+  if (info.name) {
+    const label = pairingLabel(info.name);
+    if (label) params.set("name", label);
+  }
   return `gradation://pair?${params.toString()}`;
 }
 
@@ -43,12 +53,16 @@ export function printPairingBanner(info: PairingInfo & { host: string; port: num
     `  Address : ${info.url}`,
     `  Bind    : ${info.host}:${info.port}`,
     `  Token   : ${info.token}`,
-    `  Cert fp : ${info.fingerprintSha256}`,
+    ...(info.fingerprintSha256 ? [`  Cert fp : ${info.fingerprintSha256}`] : []),
     "",
     "  Scan / paste this pairing link in GradatiON:",
     `  ${payload}`,
     "",
     ...pairingSafetyLines(info.host),
+    ...(info.fingerprintSha256
+      ? []
+      : ["  TLS is off, so this link has no cert fingerprint. Install openssl and restart to pin one."]),
+    ...(info.tlsWarning ? [`  ${info.tlsWarning}`] : []),
     "",
   ];
   if (info.created) {

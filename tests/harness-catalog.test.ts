@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -62,6 +62,19 @@ describe("harness launch resolution", () => {
     expect(launch.args).toEqual(["acp"]);
     expect(launch.readiness).toBe("ready");
     expect(launch.notice).toMatch(/Grok/);
+  });
+
+  it("does not treat a directory named cursor-agent as the CLI", () => {
+    const dir = binDir("agent");
+    mkdirSync(join(dir, "cursor-agent"));
+    const launch = resolveHarnessLaunch({
+      id: "cursor-cli",
+      name: "Cursor CLI",
+      command: "cursor-agent",
+      args: ["acp"],
+    });
+    expect(launch.command).toBe("agent");
+    expect(launch.readiness).toBe("ready");
   });
 
   it("falls back to agent and warns when cursor-agent is absent", () => {

@@ -1,4 +1,4 @@
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, statSync } from "node:fs";
 import { delimiter, join } from "node:path";
 
 function pathExtensions(): string[] {
@@ -10,6 +10,9 @@ function pathExtensions(): string[] {
 
 function canExec(file: string): boolean {
   try {
+    // Directories are executable on Unix. A directory named like the CLI
+    // must not be reported as the harness binary.
+    if (!statSync(file).isFile()) return false;
     accessSync(file, constants.X_OK);
     return true;
   } catch {

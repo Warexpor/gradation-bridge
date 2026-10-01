@@ -3,7 +3,7 @@
  * A harness must not be able to pull an unbounded file into the bridge.
  */
 
-import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { closeSync, constants, existsSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 
 export const MAX_TEXT_FILE_BYTES = 8 * 1024 * 1024;
 /** How far a line/limit read may scan into a file that is over the full-read cap. */
@@ -80,6 +80,29 @@ export function trimIncompleteUtf8(buf: Buffer, n: number): number {
   const need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : 2;
   if (cont + 1 < need) return i;
   return n;
+}
+
+/**
+ * Write `content` to the real path. `O_NOFOLLOW` refuses a last-component
+ * symlink swapped in after the sandbox check.
+ */
+export function writeTextNoFollow(path: string, content: string): void {
+  assertWritableContent(content);
+  const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | (constants.O_NOFOLLOW ?? 0);
+  let fd: number;
+  try {
+    fd = openSync(path, flags, 0o666);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ELOOP") {
+      throw coded("refusing to write through a symlink", -32003);
+    }
+    throw e;
+  }
+  try {
+    writeFileSync(fd, content);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export function assertNotDirectory(path: string): void {

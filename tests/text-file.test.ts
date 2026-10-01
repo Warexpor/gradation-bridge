@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,6 +7,7 @@ import {
   MAX_TEXT_FILE_BYTES,
   readTextFileWindow,
   trimIncompleteUtf8,
+  writeTextNoFollow,
 } from "../src/acp/text-file.js";
 
 const dirs: string[] = [];
@@ -36,5 +37,19 @@ describe("readTextFileWindow", () => {
     const bytes = Buffer.from("é", "utf8");
     expect(trimIncompleteUtf8(bytes, bytes.length)).toBe(bytes.length);
     expect(trimIncompleteUtf8(bytes, 1)).toBe(0);
+  });
+
+  it("refuses to write through a symlink", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-fs-link-"));
+    dirs.push(root);
+    const outside = join(root, "outside.txt");
+    const link = join(root, "link.txt");
+    writeFileSync(outside, "secret\n");
+    symlinkSync(outside, link);
+    expect(() => writeTextNoFollow(link, "pwned\n")).toThrow(/symlink/);
+    expect(readFileSync(outside, "utf8")).toBe("secret\n");
+    const real = join(root, "real.txt");
+    writeTextNoFollow(real, "ok\n");
+    expect(readFileSync(real, "utf8")).toBe("ok\n");
   });
 });

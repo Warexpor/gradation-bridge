@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { formatDoctorReport } from "../src/cli/doctor.js";
 import { ensurePrimaryToken } from "../src/auth/token.js";
 import { log, recentLogs, resetLogsForTests, setLogLevel } from "../src/log/diagnostics.js";
-import { fingerprintOfPem } from "../src/auth/cert.js";
+import { ensureTlsMaterial } from "../src/auth/cert.js";
 import { buildPairingPayload, pairingSafetyLines } from "../src/auth/pairing.js";
 
 const dirs: string[] = [];
@@ -70,10 +70,9 @@ describe("diagnostics and pairing safety", () => {
     dirs.push(root);
     process.env.XDG_CONFIG_HOME = join(root, "config");
     process.env.XDG_DATA_HOME = join(root, "data");
-    mkdirSync(join(process.env.XDG_DATA_HOME, "gradation-bridge", "certs"), { recursive: true });
-    const body = Buffer.from("pairing-cert").toString("base64");
-    const pem = `-----BEGIN CERTIFICATE-----\n${body}\n-----END CERTIFICATE-----\n`;
-    writeFileSync(join(process.env.XDG_DATA_HOME, "gradation-bridge", "certs", "server.crt"), pem);
+    mkdirSync(process.env.XDG_CONFIG_HOME, { recursive: true });
+    mkdirSync(process.env.XDG_DATA_HOME, { recursive: true });
+    const tls = ensureTlsMaterial({ bindHost: "127.0.0.1" });
     const token = ensurePrimaryToken().token;
     const report = formatDoctorReport({
       allowedRoots: ["/tmp/project"],
@@ -81,10 +80,28 @@ describe("diagnostics and pairing safety", () => {
       port: 8787,
       harnesses: [],
     });
-    const fingerprint = fingerprintOfPem(pem);
-    expect(report).toContain(`cert fp: ${fingerprint}`);
+    expect(report).toContain(`cert fp: ${tls.fingerprintSha256}`);
     expect(report).toContain("tls:     ready");
     expect(report).not.toContain(token);
+    expect(report).not.toContain(tls.keyPem);
+  });
+
+  it("does not treat a certificate without a key as ready", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-doc-nokey-"));
+    dirs.push(root);
+    process.env.XDG_CONFIG_HOME = join(root, "config");
+    process.env.XDG_DATA_HOME = join(root, "data");
+    mkdirSync(join(process.env.XDG_DATA_HOME, "gradation-bridge", "certs"), { recursive: true });
+    const body = Buffer.from("pairing-cert").toString("base64");
+    const pem = `-----BEGIN CERTIFICATE-----\n${body}\n-----END CERTIFICATE-----\n`;
+    writeFileSync(join(process.env.XDG_DATA_HOME, "gradation-bridge", "certs", "server.crt"), pem);
+    const report = formatDoctorReport({
+      allowedRoots: ["/tmp/project"],
+      defaultPermissionMode: "ask",
+      harnesses: [],
+    });
+    expect(report).toContain("tls:     incomplete");
+    expect(report).not.toMatch(/cert fp:/);
     expect(report).not.toContain("pairing-cert");
   });
 
@@ -99,6 +116,15 @@ describe("diagnostics and pairing safety", () => {
     expect(url.protocol).toBe("gradation:");
     expect(url.searchParams.get("name")).toBe("dev-box");
     expect(url.searchParams.get("fp")).toBe("ff");
+    const unpinned = buildPairingPayload({
+      url: "ws://127.0.0.1:8787/v1",
+      token: "abc",
+      name: "box\nnot-a-second-line",
+    });
+    const plain = new URL(unpinned);
+    expect(plain.searchParams.get("fp")).toBeNull();
+    expect(plain.searchParams.get("name")).toBe("boxnot-a-second-line");
+    expect(unpinned).not.toContain("\n");
     expect(pairingSafetyLines("127.0.0.1").join("\n")).not.toMatch(/loopback/);
     expect(pairingSafetyLines("192.168.1.9").join("\n")).toMatch(/beyond loopback/);
   });
