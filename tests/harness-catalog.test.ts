@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { resolveHarnessLaunch } from "../src/harness/catalog.js";
+import { resolveExecutable } from "../src/harness/path.js";
 import { describeHarness } from "../src/harness/registry.js";
 import { DEFAULT_HARNESSES } from "../src/config/types.js";
 
@@ -156,6 +157,38 @@ describe("harness launch resolution", () => {
     });
     expect(launch.available).toBe(false);
     expect(launch.command).toBe("/opt/opencode");
+  });
+
+  it("resolves a bare name on the bridge PATH ahead of an extra PATH", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-resolve-"));
+    dirs.push(root);
+    const bridge = join(root, "bridge");
+    const shadow = join(root, "shadow");
+    mkdirSync(bridge);
+    mkdirSync(shadow);
+    const real = join(bridge, "gb-tool");
+    writeFileSync(real, "#!/bin/sh\nexit 0\n");
+    chmodSync(real, 0o755);
+    writeFileSync(join(shadow, "gb-tool"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(shadow, "gb-tool"), 0o755);
+    process.env.PATH = bridge;
+    expect(resolveExecutable("gb-tool", root, shadow)).toBe(real);
+  });
+
+  it("finds a name that exists only on the extra PATH, against cwd", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-extra-"));
+    dirs.push(root);
+    const cwd = join(root, "ws");
+    const bin = join(cwd, "node_modules", ".bin");
+    mkdirSync(bin, { recursive: true });
+    const tool = join(bin, "gb-only");
+    writeFileSync(tool, "#!/bin/sh\nexit 0\n");
+    chmodSync(tool, 0o755);
+    process.env.PATH = join(root, "empty");
+    mkdirSync(process.env.PATH);
+    expect(resolveExecutable("gb-only", cwd, "node_modules/.bin")).toBe(tool);
+    expect(resolveExecutable("./node_modules/.bin/gb-only", cwd)).toBe(tool);
+    expect(resolveExecutable("gb-missing", cwd, "node_modules/.bin")).toBeUndefined();
   });
 
   it("redacts secrets in the harness description sent to the phone", () => {

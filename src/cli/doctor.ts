@@ -56,6 +56,7 @@ export function formatDoctorReport(config: BridgeConfig): string {
     "- Default bind is 127.0.0.1. --lan and --tailscale expose that token; prefer Tailscale.",
     "- In GradatiON, confirm the cert fingerprint matches this machine before trusting it.",
     "- Plan mode rejects writes and terminal commands on the bridge, not only in the agent.",
+    "- Harness env PATH cannot replace the binary. The command is resolved on this process's PATH, then that file is started.",
     "",
     `permission default: ${config.defaultPermissionMode}`,
     `allowed roots: ${config.allowedRoots.length ? config.allowedRoots.join(", ") : "(none — every path is refused)"}`,

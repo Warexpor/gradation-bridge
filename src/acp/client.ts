@@ -8,6 +8,7 @@ import { createInterface } from "node:readline";
 import type { HarnessConfig } from "../config/types.js";
 import { log } from "../log/diagnostics.js";
 import { redactSecrets } from "../log/redact.js";
+import { resolveExecutable } from "../harness/path.js";
 import { killProcessTree, signalProcessGroup } from "../proc/tree.js";
 import { isCancelRequest, readCancelRequestId, REQUEST_CANCELLED } from "./cancel.js";
 import { ACP_PROTOCOL_VERSION } from "./protocol.js";
@@ -105,7 +106,11 @@ export class AcpStdioClient {
       ...this.opts.env,
       ...this.harness.env,
     };
-    this.child = spawn(this.harness.command, this.harness.args ?? [], {
+    // Resolve on the bridge PATH before the child env is applied. A harness
+    // `env.PATH` still reaches the process, but it cannot select a different binary.
+    const command =
+      resolveExecutable(this.harness.command, this.opts.cwd) ?? this.harness.command;
+    this.child = spawn(command, this.harness.args ?? [], {
       cwd: this.opts.cwd,
       env,
       stdio: ["pipe", "pipe", "pipe"],

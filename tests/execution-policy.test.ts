@@ -251,6 +251,44 @@ describe("execution policy and protocol surfaces", () => {
     await allowed.client.close();
   });
 
+  it("does not spend an allow_once grant on a missing terminal command", async () => {
+    await boot({
+      mode: "ask",
+      env: {
+        FAKE_ACP_TERMINAL: "1",
+        FAKE_ACP_TERMINAL_MISS: "1",
+        FAKE_ACP_PERMISSION: "1",
+        FAKE_ACP_PERMISSION_KIND: "execute",
+      },
+    });
+    const { client, sessionId } = await session("ask", true);
+    await client.call("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "run" }],
+    });
+    const body = texts(client.updates).join("\n");
+    expect(body).not.toMatch(/terminal failed/);
+    expect(body).toMatch(/Echo: run/);
+    await client.close();
+  });
+
+  it("cancel unblocks a terminal that ignores SIGTERM", async () => {
+    await boot({ mode: "full-auto", env: { FAKE_ACP_TERMINAL_HANG: "1" } });
+    const { client, sessionId } = await session("full-auto");
+    const pending = client.call("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "hang" }],
+    });
+    const deadline = Date.now() + 5_000;
+    while (!texts(client.updates).join("\n").includes("term-hanging") && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(texts(client.updates).join("\n")).toContain("term-hanging");
+    client.notify("session/cancel", { sessionId });
+    await expect(pending).resolves.toMatchObject({ stopReason: "cancelled" });
+    await client.close();
+  });
+
   it("ask mode runs a terminal only after an execute approval", async () => {
     await boot({
       mode: "ask",

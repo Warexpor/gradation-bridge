@@ -61,6 +61,7 @@ describe("diagnostics and pairing safety", () => {
     expect(report).not.toContain(token);
     expect(report).not.toContain("sk-supersecretvalue");
     expect(report).toMatch(/prefer Tailscale/);
+    expect(report).toMatch(/Harness env PATH cannot replace the binary/);
     expect(report).toContain("tls:     missing");
     expect(report).not.toMatch(/cert fp:/);
   });
