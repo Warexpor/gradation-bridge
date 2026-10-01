@@ -350,11 +350,13 @@ export class AcpStdioClient {
   async newSession(params: {
     cwd: string;
     mcpServers?: unknown[];
+    additionalDirectories?: string[];
     _meta?: Record<string, unknown>;
   }): Promise<Record<string, unknown> & { sessionId: string }> {
     const result = (await this.request("session/new", {
       cwd: params.cwd,
       mcpServers: params.mcpServers ?? [],
+      ...extraRoots(params.additionalDirectories),
       ...(params._meta ? { _meta: params._meta } : {}),
     })) as { sessionId?: unknown };
     if (!result || typeof result.sessionId !== "string" || !result.sessionId) {
@@ -371,6 +373,28 @@ export class AcpStdioClient {
     return this.request("session/set_mode", { sessionId, modeId }, 30_000);
   }
 
+  async setConfigOption(params: Record<string, unknown>): Promise<unknown> {
+    return this.request("session/set_config_option", params, 30_000);
+  }
+
+  async resumeSession(params: {
+    sessionId: string;
+    cwd: string;
+    mcpServers?: unknown[];
+    additionalDirectories?: string[];
+  }): Promise<unknown> {
+    return this.request("session/resume", {
+      sessionId: params.sessionId,
+      cwd: params.cwd,
+      mcpServers: params.mcpServers ?? [],
+      ...extraRoots(params.additionalDirectories),
+    });
+  }
+
+  async closeSession(sessionId: string): Promise<unknown> {
+    return this.request("session/close", { sessionId }, 2_000);
+  }
+
   cancel(sessionId: string): void {
     this.notify("session/cancel", { sessionId });
   }
@@ -379,11 +403,13 @@ export class AcpStdioClient {
     sessionId: string;
     cwd: string;
     mcpServers?: unknown[];
+    additionalDirectories?: string[];
   }): Promise<unknown> {
     return this.request("session/load", {
       sessionId: params.sessionId,
       cwd: params.cwd,
       mcpServers: params.mcpServers ?? [],
+      ...extraRoots(params.additionalDirectories),
     });
   }
 
@@ -404,3 +430,12 @@ export class AcpStdioClient {
 }
 
 export const ACP_SDK_PACKAGE = "@agentclientprotocol/sdk";
+
+function extraRoots(dirs: string[] | undefined): { additionalDirectories?: string[] } {
+  if (!dirs || dirs.length === 0) return {};
+  return { additionalDirectories: dirs };
+}
+
+export function isMethodNotFound(err: unknown): boolean {
+  return Boolean(err && typeof err === "object" && (err as { code?: number }).code === -32601);
+}

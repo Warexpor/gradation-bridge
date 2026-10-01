@@ -183,7 +183,12 @@ describe("bridge e2e with fake ACP agent", () => {
     expect(created.sessionId).toMatch(/^fake-/);
     expect(created).toMatchObject({
       modes: { currentModeId: "agent" },
-      _meta: { harness: "fake", permissionMode: "auto-edit" },
+      configOptions: [{ id: "model", currentValue: "small" }],
+      _meta: {
+        harness: "fake",
+        permissionMode: "auto-edit",
+        agentInfo: { name: "fake-acp-agent" },
+      },
     });
 
     const promptResult = (await client.call("session/prompt", {
@@ -203,10 +208,11 @@ describe("bridge e2e with fake ACP agent", () => {
     expect(withSeq.length).toBeGreaterThan(0);
 
     const listed = (await client.call("bridge/listSessions")) as {
-      sessions: Array<{ sessionId: string; lastSeq: number }>;
+      sessions: Array<{ sessionId: string; lastSeq: number; title: string }>;
     };
     expect(listed.sessions[0]?.sessionId).toBe(created.sessionId);
     expect(listed.sessions[0]?.lastSeq).toBeGreaterThan(0);
+    expect(listed.sessions[0]?.title).toBe("hello bridge");
 
     const lastSeq = listed.sessions[0]!.lastSeq;
     const beforeLoad = client.updates.length;
@@ -605,6 +611,219 @@ describe("bridge e2e with fake ACP agent", () => {
       prompt: [{ type: "text", text: "still here" }],
     })) as { stopReason: string };
     expect(second.stopReason).toBe("end_turn");
+    await client.close();
+  }, 20_000);
+
+  it("restores a session after the bridge process restarts", async () => {
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", { protocolVersion: 1 });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "auto-edit" },
+    })) as { sessionId: string };
+    await client.call("session/prompt", {
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "remember me" }],
+    });
+    await client.close();
+    await server!.close();
+    server = undefined;
+
+    const config: BridgeConfig = {
+      allowedRoots: [workspace],
+      workspaces: [workspace],
+      defaultPermissionMode: "auto-edit",
+      port: 0,
+      harnesses: [fakeHarnessConfig(fakeAgent)],
+    };
+    const restored = new SessionManager({ config, version: "0.1.0-test" });
+    expect(restored.list().map((s) => s.sessionId)).toContain(created.sessionId);
+    expect(restored.get(created.sessionId)?.title).toBe("remember me");
+
+    server = await startBridgeServer({
+      host: "127.0.0.1",
+      port: 0,
+      config,
+      sessions: restored,
+      version: "0.1.0-test",
+    });
+    const client2 = await openClient(server.url, token);
+    await client2.call("initialize", { protocolVersion: 1 });
+    const listed = (await client2.call("session/list", {})) as {
+      sessions: Array<{ sessionId: string; cwd: string }>;
+    };
+    expect(listed.sessions.map((s) => s.sessionId)).toContain(created.sessionId);
+    const cwd = listed.sessions.find((s) => s.sessionId === created.sessionId)?.cwd;
+    const filtered = (await client2.call("session/list", { cwd })) as {
+      sessions: Array<{ sessionId: string }>;
+    };
+    expect(filtered.sessions.map((s) => s.sessionId)).toContain(created.sessionId);
+    await expect(client2.call("session/list", { cwd: "/etc" })).rejects.toThrow(/outside allowed/);
+
+    const loaded = (await client2.call("session/load", {
+      sessionId: created.sessionId,
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { afterSeq: 0 },
+    })) as { agentAlive: boolean; replayed: number };
+    expect(loaded.replayed).toBeGreaterThan(0);
+    expect(loaded.agentAlive).toBe(true);
+    const again = (await client2.call("session/prompt", {
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "still here" }],
+    })) as { stopReason: string };
+    expect(again.stopReason).toBe("end_turn");
+
+    await client2.call("session/delete", { sessionId: created.sessionId });
+    const after = (await client2.call("session/list", {})) as { sessions: unknown[] };
+    expect(after.sessions).toHaveLength(0);
+    await expect(
+      client2.call("session/close", { sessionId: created.sessionId }),
+    ).rejects.toThrow(/unknown session/);
+    await client2.close();
+    await server.close();
+    server = undefined;
+    const gone = new SessionManager({ config, version: "0.1.0-test" });
+    expect(gone.list()).toHaveLength(0);
+  }, 20_000);
+
+  it("rejects image prompts, unsafe session ids, and extra roots outside the sandbox", async () => {
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", { protocolVersion: 1 });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "auto-edit" },
+    })) as { sessionId: string };
+    await expect(
+      client.call("session/prompt", {
+        sessionId: created.sessionId,
+        prompt: [{ type: "image", data: "aa", mimeType: "image/png" }],
+      }),
+    ).rejects.toThrow(/image is not supported/);
+    await expect(
+      client.call("session/new", {
+        cwd: workspace,
+        additionalDirectories: [dirname(workspace)],
+        mcpServers: [],
+        _meta: { harness: "fake", permissionMode: "auto-edit" },
+      }),
+    ).rejects.toThrow(/outside allowed/);
+    await client.close();
+
+    await boot({
+      allowedRoots: [workspace],
+      workspaces: [workspace],
+      defaultPermissionMode: "auto-edit",
+      port: 0,
+      harnesses: [{ ...fakeHarnessConfig(fakeAgent), env: { FAKE_ACP_SESSION_ID: "../outside" } }],
+    });
+    const client2 = await openClient(server!.url, token);
+    await client2.call("initialize", { protocolVersion: 1 });
+    await expect(
+      client2.call("session/new", {
+        cwd: workspace,
+        mcpServers: [],
+        _meta: { harness: "fake", permissionMode: "auto-edit" },
+      }),
+    ).rejects.toThrow(/invalid session id/);
+    await client2.close();
+  }, 20_000);
+
+  it("forwards config options and keeps the terminal output tail", async () => {
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", { protocolVersion: 1 });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "auto-edit" },
+    })) as { sessionId: string };
+    const configured = (await client.call("session/set_config_option", {
+      sessionId: created.sessionId,
+      configId: "model",
+      value: "large",
+    })) as { configOptions: Array<{ currentValue: string }> };
+    expect(configured.configOptions[0]?.currentValue).toBe("large");
+    await client.call("session/delete", { sessionId: created.sessionId });
+    await client.close();
+
+    await boot({
+      allowedRoots: [workspace],
+      workspaces: [workspace],
+      defaultPermissionMode: "full-auto",
+      port: 0,
+      harnesses: [{ ...fakeHarnessConfig(fakeAgent), env: { FAKE_ACP_TERMINAL_TAIL: "1" } }],
+    });
+    const client2 = await openClient(server!.url, token);
+    await client2.call("initialize", { protocolVersion: 1 });
+    const session = (await client2.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "full-auto" },
+    })) as { sessionId: string };
+    await client2.call("session/prompt", {
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "tail" }],
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    const texts = client2.updates
+      .map((u) => {
+        const update = (u as { params?: { update?: { content?: { text?: string } } } }).params?.update;
+        return update?.content?.text ?? "";
+      })
+      .join("\n");
+    expect(texts).toContain('"truncated":true');
+    expect(texts).toContain('"output":"XYZ"');
+    await client2.close();
+  }, 20_000);
+
+  it("session/resume respawns without replaying the transcript", async () => {
+    await boot({
+      allowedRoots: [workspace],
+      workspaces: [workspace],
+      defaultPermissionMode: "auto-edit",
+      port: 0,
+      harnesses: [
+        {
+          ...fakeHarnessConfig(fakeAgent),
+          env: { FAKE_ACP_EXIT_AFTER_PROMPT: "1", FAKE_ACP_NO_RESUME: "1" },
+        },
+      ],
+    });
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", { protocolVersion: 1 });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "auto-edit" },
+    })) as { sessionId: string };
+    await client.call("session/prompt", {
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "resume later" }],
+    });
+    const deadline = Date.now() + 5_000;
+    let status = "";
+    while (Date.now() < deadline) {
+      const listed = (await client.call("bridge/listSessions")) as {
+        sessions: Array<{ status: string }>;
+      };
+      status = listed.sessions[0]?.status ?? "";
+      if (status === "error") break;
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    expect(status).toBe("error");
+    const before = client.updates.length;
+    const resumed = (await client.call("session/resume", {
+      sessionId: created.sessionId,
+      cwd: workspace,
+      mcpServers: [],
+    })) as { agentAlive: boolean; warning?: string };
+    expect(resumed.agentAlive).toBe(true);
+    expect(resumed.warning).toBeUndefined();
+    await new Promise((r) => setTimeout(r, 50));
+    const fresh = client.updates.slice(before).map((u) => (u as { method?: string }).method);
+    expect(fresh).not.toContain("session/update");
     await client.close();
   }, 20_000);
 
