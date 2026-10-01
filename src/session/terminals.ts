@@ -3,12 +3,15 @@
  *
  * `outputByteLimit` keeps the newest bytes (the spec truncates from the start)
  * and never splits a UTF-8 character. `terminal/kill` leaves the id usable;
- * `terminal/release` frees it.
+ * `terminal/release` frees it. A command that ignores SIGTERM is SIGKILLed
+ * so `terminal/wait_for_exit` and the per-session cap cannot stick.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { killProcessTree } from "../proc/tree.js";
+
+const KILL_GRACE_MS = 2_000;
 
 export const MAX_TERMINAL_OUTPUT_BYTES = 1024 * 1024;
 export const MAX_TERMINALS_PER_SESSION = 32;
@@ -28,6 +31,7 @@ interface TerminalRecord extends TerminalOutputState {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   waiters: Array<(status: { exitCode: number | null; signal: NodeJS.Signals | null }) => void>;
+  killTimer?: ReturnType<typeof setTimeout>;
 }
 
 export function resolveOutputByteLimit(requested: unknown): number {
@@ -181,6 +185,10 @@ export class TerminalTable {
       term.exited = true;
       term.exitCode = code;
       term.signal = signal;
+      if (term.killTimer) {
+        clearTimeout(term.killTimer);
+        term.killTimer = undefined;
+      }
       const waiters = term.waiters;
       term.waiters = [];
       for (const waiter of waiters) waiter({ exitCode: code, signal });
@@ -217,14 +225,25 @@ export class TerminalTable {
   /** Stop the command and keep the id so a later `terminal/output` still works. */
   kill(sessionId: string, terminalId: string): void {
     const term = this.require(sessionId, terminalId);
-    killProcessTree(term.child, "SIGTERM");
+    this.stop(term);
+  }
+
+  /**
+   * Stop every still-running command for `sessionId` and keep the ids.
+   * Used when the phone cancels a prompt so `terminal/wait_for_exit` can return.
+   */
+  interruptSession(sessionId: string): void {
+    for (const term of this.terminals.values()) {
+      if (term.sessionId !== sessionId || term.exited) continue;
+      this.stop(term);
+    }
   }
 
   /** Stop the command and invalidate the id. */
   release(sessionId: string, terminalId: string): void {
     const term = this.require(sessionId, terminalId);
     this.terminals.delete(terminalId);
-    killProcessTree(term.child, "SIGTERM");
+    this.stop(term);
   }
 
   wait(
@@ -242,8 +261,21 @@ export class TerminalTable {
     for (const [id, term] of this.terminals) {
       if (sessionId && term.sessionId !== sessionId) continue;
       this.terminals.delete(id);
-      killProcessTree(term.child, "SIGTERM");
+      this.stop(term);
     }
+  }
+
+  /** SIGTERM now, SIGKILL if the command is still alive after the grace period. */
+  private stop(term: TerminalRecord): void {
+    if (term.exited) return;
+    killProcessTree(term.child, "SIGTERM");
+    if (term.killTimer) return;
+    const timer = setTimeout(() => {
+      if (term.exited) return;
+      killProcessTree(term.child, "SIGKILL");
+    }, KILL_GRACE_MS);
+    timer.unref?.();
+    term.killTimer = timer;
   }
 
   private overCap(sessionId: string): boolean {

@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { BridgeConfig, PermissionMode } from "../config/types.js";
 import { BridgeError } from "../errors.js";
+import { resolveExecutable } from "../harness/path.js";
 import { findHarness } from "../harness/registry.js";
 import { launchErrorData, resolveHarnessLaunch, type HarnessLaunch } from "../harness/catalog.js";
 import {
@@ -655,7 +656,9 @@ export class SessionManager {
     const rec = this.sessions.get(sessionId);
     if (!rec || rec.status === "closed") return;
     rec.cancelRequested = true;
-    // Unblock an agent waiting on session/request_permission or elicitation/create.
+    // Unblock an agent waiting on session/request_permission, elicitation/create,
+    // or terminal/wait_for_exit. A command that ignores SIGTERM is SIGKILLed.
+    this.terminals.interruptSession(sessionId);
     this.opts.cancelPhoneRequests?.({ sessionId });
     if (rec.client?.running) rec.client.cancel(rec.agentSessionId);
   }
@@ -1455,13 +1458,23 @@ export class SessionManager {
       }
       env[row.name] = row.value;
     }
+    // Resolve before the grant is spent. Bridge PATH wins so an agent PATH
+    // cannot swap `git`; a name that exists only on the agent PATH still runs.
+    const executable = resolveExecutable(
+      checked.command,
+      cwd,
+      typeof env.PATH === "string" ? env.PATH : undefined,
+    );
+    if (!executable) {
+      throw Object.assign(new Error(`command not found: ${checked.command}`), { code: -32602 });
+    }
     if (!this.terminals.hasRoom(rec.sessionId)) {
       throw Object.assign(new Error("too many terminals"), { code: -32003 });
     }
     this.assertMutatingTool(rec, "exec");
     return this.terminals.create({
       sessionId: rec.sessionId,
-      command: checked.command,
+      command: executable,
       args: checked.args,
       cwd,
       env,

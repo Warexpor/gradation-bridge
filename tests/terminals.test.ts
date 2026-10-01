@@ -92,6 +92,46 @@ describe("TerminalTable", () => {
     expect(() => terminals.output("s", terminalId)).toThrow(/unknown terminal/);
   });
 
+  it("SIGKILLs a command that ignores SIGTERM and keeps the id", async () => {
+    const terminals = table();
+    const { terminalId } = terminals.create({
+      sessionId: "s",
+      command: process.execPath,
+      args: [
+        "-e",
+        "process.stdout.write('up'); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)",
+      ],
+      cwd: process.cwd(),
+      env: process.env,
+    });
+    const ready = Date.now() + 3_000;
+    while (Date.now() < ready && !terminals.output("s", terminalId).output.includes("up")) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(terminals.output("s", terminalId).output).toContain("up");
+    terminals.kill("s", terminalId);
+    const status = await terminals.wait("s", terminalId);
+    expect(status.signal).toBe("SIGKILL");
+    expect(terminals.output("s", terminalId).exitStatus?.signal).toBe("SIGKILL");
+  });
+
+  it("interruptSession stops a live command and keeps the id", async () => {
+    const terminals = table();
+    const { terminalId } = terminals.create({
+      sessionId: "s",
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      cwd: process.cwd(),
+      env: process.env,
+    });
+    terminals.interruptSession("other");
+    expect(terminals.output("s", terminalId).exitStatus).toBeUndefined();
+    terminals.interruptSession("s");
+    const status = await terminals.wait("s", terminalId);
+    expect(status.signal === "SIGTERM" || status.signal === "SIGKILL").toBe(true);
+    expect(terminals.output("s", terminalId).output).toBe("");
+  });
+
   it("does not let another session read the terminal", async () => {
     const terminals = table();
     const { terminalId } = terminals.create({

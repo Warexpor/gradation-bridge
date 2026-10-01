@@ -11,6 +11,8 @@
  *   FAKE_ACP_PERMISSION_KIND    — tool kind for that request (default edit)
  *   FAKE_ACP_FS_WRITE=1         — call fs/write_text_file during the prompt
  *   FAKE_ACP_TERMINAL=1         — call terminal/create during the prompt
+ *   FAKE_ACP_TERMINAL_MISS=1    — try a missing command first; the grant must survive
+ *   FAKE_ACP_TERMINAL_HANG=1    — wait on a command that ignores SIGTERM until cancel
  *   FAKE_ACP_AUTH=1             — advertise an agent auth method from initialize
  *   FAKE_ACP_AUTH_REQUIRED=1    — session/new fails until authenticate succeeds
  *   FAKE_ACP_AUTH_ALIAS=1       — authenticate is method-not-found; auth/login works
@@ -76,6 +78,8 @@ const forcedSessionId = process.env.FAKE_ACP_SESSION_ID;
 const noResume = process.env.FAKE_ACP_NO_RESUME === "1";
 const dumpNewPath = process.env.FAKE_ACP_DUMP_NEW;
 const terminalTail = process.env.FAKE_ACP_TERMINAL_TAIL === "1";
+const terminalMiss = process.env.FAKE_ACP_TERMINAL_MISS === "1";
+const terminalHang = process.env.FAKE_ACP_TERMINAL_HANG === "1";
 
 function write(obj: unknown): void {
   process.stdout.write(JSON.stringify(obj) + "\n");
@@ -298,8 +302,61 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     }
   }
 
-  if (wantTerminal || terminalTail) {
+  if (wantTerminal || terminalTail || terminalMiss || terminalHang) {
     try {
+      if (terminalMiss) {
+        try {
+          await requestClient("terminal/create", {
+            sessionId,
+            command: "gradation-bridge-missing-bin",
+            args: [],
+            cwd: session.cwd,
+          });
+        } catch (e) {
+          const message = e instanceof Error ? e.message : String(e);
+          if (!message.includes("command not found")) throw e;
+        }
+      }
+      if (terminalHang) {
+        const created = (await requestClient("terminal/create", {
+          sessionId,
+          command: process.execPath,
+          args: ["-e", "process.stdout.write('up'); process.on('SIGTERM',()=>{}); setInterval(()=>{},1000)"],
+          cwd: session.cwd,
+        })) as { terminalId?: string };
+        const terminalId = String(created?.terminalId ?? "");
+        const readyDeadline = Date.now() + 3_000;
+        while (Date.now() < readyDeadline) {
+          const output = (await requestClient("terminal/output", { sessionId, terminalId })) as {
+            output?: string;
+          };
+          if (String(output?.output ?? "").includes("up")) break;
+          await sleep(20);
+        }
+        notify("session/update", {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "term-hanging" },
+          },
+        });
+        await requestClient("terminal/wait_for_exit", { sessionId, terminalId });
+        if (session.cancelled) {
+          respond(id, { stopReason: "cancelled" });
+          return;
+        }
+      }
+      if (!wantTerminal && !terminalTail && !terminalMiss) {
+        notify("session/update", {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: userText ? `Echo: ${userText}` : "Hello from fake ACP agent." },
+          },
+        });
+        respond(id, { stopReason: "end_turn" });
+        return;
+      }
       const created = (await requestClient("terminal/create", {
         sessionId,
         command: process.execPath,
