@@ -11,7 +11,7 @@
  */
 
 import { hostname, networkInterfaces } from "node:os";
-import { chooseBindHost, formatAdvertiseHost, isTailscaleAddress, type BindCandidate } from "./net/bind.js";
+import { chooseBindHost, formatListenUrl, isTailscaleAddress, type BindCandidate } from "./net/bind.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -179,7 +179,7 @@ async function main(): Promise<void> {
 
   // Prefer advertising the listen host; for loopback, wss://127.0.0.1 works for same-machine tests.
   const scheme = hasRealCert ? "wss" : "ws";
-  const advertiseUrl = `${scheme}://${formatAdvertiseHost(host)}:${port}/v1`;
+  const advertiseUrl = formatListenUrl(scheme, host, port);
 
   printPairingBanner({
     url: advertiseUrl,

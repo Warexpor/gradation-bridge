@@ -21,7 +21,7 @@ import { z } from "zod";
 import type { ToolGrant } from "../approval/grants.js";
 import { dataDir } from "../config/load.js";
 import { log } from "../log/diagnostics.js";
-import { isSafeSessionId } from "./ids.js";
+import { compareRecentSession, isSafeSessionId } from "./ids.js";
 
 const MAX_RESTORED = 200;
 
@@ -182,7 +182,7 @@ export function loadPersistedMetas(): SessionMeta[] {
       grants: (parsed.data.grants ?? []) as ToolGrant[],
     });
   }
-  found.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  found.sort(compareRecentSession);
   if (found.length > MAX_RESTORED) {
     log("warn", `restoring ${MAX_RESTORED} of ${found.length} persisted sessions`);
   }
@@ -195,4 +195,70 @@ export function loadPersistedMetas(): SessionMeta[] {
 export function removeSessionStorage(sessionId: string): void {
   if (!isSafeSessionId(sessionId)) return;
   rmSync(join(sessionsRoot(), sessionId), { recursive: true, force: true });
+}
+
+/**
+ * One catalog entry the bridge would trust: real directory, regular meta.json,
+ * ids that match the folder. Closed rows are included; symlinks are not.
+ */
+export function readPersistedSession(sessionId: string): SessionMeta | undefined {
+  if (!isSafeSessionId(sessionId)) return undefined;
+  try {
+    assertRealSessionsRoot();
+  } catch {
+    return undefined;
+  }
+  const dir = join(sessionsRoot(), sessionId);
+  let info: ReturnType<typeof lstatSync>;
+  try {
+    info = lstatSync(dir);
+  } catch {
+    return undefined;
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) return undefined;
+  const metaPath = join(dir, "meta.json");
+  let metaInfo: ReturnType<typeof lstatSync>;
+  try {
+    metaInfo = lstatSync(metaPath);
+  } catch {
+    return undefined;
+  }
+  if (metaInfo.isSymbolicLink() || !metaInfo.isFile()) return undefined;
+  let parsed: z.SafeParseReturnType<unknown, z.infer<typeof MetaSchema>>;
+  try {
+    parsed = MetaSchema.safeParse(JSON.parse(readRegular(metaPath)));
+  } catch {
+    return undefined;
+  }
+  if (!parsed.success) return undefined;
+  if (parsed.data.sessionId !== sessionId || parsed.data.agentSessionId !== sessionId) {
+    return undefined;
+  }
+  return {
+    ...parsed.data,
+    grants: (parsed.data.grants ?? []) as ToolGrant[],
+  };
+}
+
+/** Remove a trusted on-disk session that is not currently loaded. */
+export function deletePersistedSession(sessionId: string): boolean {
+  if (!readPersistedSession(sessionId)) return false;
+  rmSync(join(sessionsRoot(), sessionId), { recursive: true, force: true });
+  return true;
+}
+
+/**
+ * Mark an on-disk session closed without loading it.
+ * Returns false when there is no trusted catalog entry.
+ */
+export function sealPersistedClosed(sessionId: string): boolean {
+  const meta = readPersistedSession(sessionId);
+  if (!meta) return false;
+  if (meta.status === "closed") return true;
+  writeSessionMeta(join(sessionsRoot(), sessionId), {
+    ...meta,
+    status: "closed",
+    updatedAt: new Date().toISOString(),
+  });
+  return true;
 }

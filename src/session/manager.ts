@@ -44,15 +44,17 @@ import {
 import { assertAllowedRealPath, assertAllowedWorkspace, SandboxError } from "../approval/sandbox.js";
 import { log } from "../log/diagnostics.js";
 import { redactSecrets } from "../log/redact.js";
-import { isSafeSessionId } from "./ids.js";
+import { compareRecentSession, isSafeSessionId } from "./ids.js";
 import { SessionLog, type LoggedEvent } from "./log.js";
 import {
+  deletePersistedSession,
   loadPersistedMetas,
   removeSessionStorage,
+  sealPersistedClosed,
   writeSessionMeta,
   type SessionMeta,
 } from "./persist.js";
-import { isEnvName, TerminalTable } from "./terminals.js";
+import { assertTerminalCreateParams, isEnvName, TerminalTable } from "./terminals.js";
 
 export type SessionStatus = "idle" | "running" | "needs_approval" | "error" | "closed";
 
@@ -215,7 +217,7 @@ export class SessionManager {
   list(opts?: { limit?: number; before?: string }): SessionSummary[] {
     let items = [...this.sessions.values()]
       .filter((s) => s.status !== "closed")
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      .sort(compareRecentSession);
     if (opts?.before) items = items.filter((s) => s.updatedAt < opts.before!);
     if (opts?.limit != null && Number.isFinite(opts.limit)) {
       items = items.slice(0, Math.max(0, Math.floor(opts.limit)));
@@ -358,10 +360,10 @@ export class SessionManager {
   ): Promise<Record<string, never>> {
     const rec = this.sessions.get(sessionId);
     if (!rec) {
-      if (opts?.missing === "error") {
-        throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
-      }
-      return {};
+      // Closed sessions and rows past the restore cap are not in memory.
+      // Close still applies so a retry after restart does not look unknown.
+      if (sealPersistedClosed(sessionId) || opts?.missing !== "error") return {};
+      throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
     }
     if (rec.status === "closed") return {};
     rec.closing = true;
@@ -382,7 +384,10 @@ export class SessionManager {
   async deleteSession(sessionId: string): Promise<Record<string, never>> {
     const rec = this.sessions.get(sessionId);
     if (!rec) {
-      throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
+      if (!deletePersistedSession(sessionId)) {
+        throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
+      }
+      return {};
     }
     if (rec.status !== "closed") await this.closeSession(sessionId, { missing: "error" });
     this.sessions.delete(sessionId);
@@ -412,7 +417,13 @@ export class SessionManager {
     }
     if (opts?.cursor) {
       const idx = items.findIndex((s) => s.sessionId === opts.cursor);
-      items = idx >= 0 ? items.slice(idx + 1) : [];
+      // An empty page means "end". An unknown cursor must not look like the end.
+      if (idx < 0) {
+        throw new BridgeError(-32602, "invalid session cursor", {
+          cursor: opts.cursor.slice(0, 200),
+        });
+      }
+      items = items.slice(idx + 1);
     }
     const page = items.slice(0, pageSize);
     const next = items.length > pageSize ? page[page.length - 1]?.sessionId : undefined;
@@ -1413,34 +1424,48 @@ export class SessionManager {
     params: unknown,
   ): { terminalId: string } {
     const p = (params ?? {}) as {
-      command?: string;
-      args?: string[];
-      cwd?: string;
-      env?: Array<{ name: string; value: string }>;
+      command?: unknown;
+      args?: unknown;
+      cwd?: unknown;
+      env?: unknown;
       outputByteLimit?: unknown;
     };
-    if (!p.command) throw Object.assign(new Error("command required"), { code: -32602 });
+    if (p.cwd != null && typeof p.cwd !== "string") {
+      throw Object.assign(new Error("terminal cwd must be a string"), { code: -32602 });
+    }
+    // Reject bad params before an allow_once grant is spent on a command that cannot start.
+    const checked = assertTerminalCreateParams({
+      command: p.command,
+      args: p.args,
+      env: p.env,
+      outputByteLimit: p.outputByteLimit,
+    });
     const cwd = p.cwd
       ? assertAllowedRealPath(p.cwd, this.opts.config.allowedRoots, rec.cwd)
       : rec.cwd;
-    this.assertMutatingTool(rec, "exec");
     const env: NodeJS.ProcessEnv = { ...process.env };
-    for (const entry of p.env ?? []) {
-      if (!entry || typeof entry.name !== "string" || typeof entry.value !== "string") {
+    const entries = Array.isArray(p.env) ? p.env : [];
+    for (const entry of entries) {
+      const row = entry as { name?: unknown; value?: unknown } | null;
+      if (!row || typeof row.name !== "string" || typeof row.value !== "string") {
         throw Object.assign(new Error("terminal env entries must be strings"), { code: -32602 });
       }
-      if (!isEnvName(entry.name) || entry.value.includes("\0")) {
-        throw Object.assign(new Error(`invalid env var: ${entry.name}`), { code: -32602 });
+      if (!isEnvName(row.name) || row.value.includes("\0")) {
+        throw Object.assign(new Error(`invalid env var: ${row.name}`), { code: -32602 });
       }
-      env[entry.name] = entry.value;
+      env[row.name] = row.value;
     }
+    if (!this.terminals.hasRoom(rec.sessionId)) {
+      throw Object.assign(new Error("too many terminals"), { code: -32003 });
+    }
+    this.assertMutatingTool(rec, "exec");
     return this.terminals.create({
       sessionId: rec.sessionId,
-      command: p.command,
-      args: p.args ?? [],
+      command: checked.command,
+      args: checked.args,
       cwd,
       env,
-      outputByteLimit: p.outputByteLimit,
+      outputByteLimit: checked.outputByteLimit,
     });
   }
 
@@ -1455,14 +1480,12 @@ export class SessionManager {
   }
 
   private handleTerminalKill(rec: SessionRecord, params: unknown): Record<string, never> {
-    const p = (params ?? {}) as { terminalId?: string };
-    if (p.terminalId) this.terminals.kill(rec.sessionId, p.terminalId);
+    this.terminals.kill(rec.sessionId, requireTerminalId(params));
     return {};
   }
 
   private handleTerminalRelease(rec: SessionRecord, params: unknown): Record<string, never> {
-    const p = (params ?? {}) as { terminalId?: string };
-    if (p.terminalId) this.terminals.release(rec.sessionId, p.terminalId);
+    this.terminals.release(rec.sessionId, requireTerminalId(params));
     return {};
   }
 
@@ -1915,6 +1938,14 @@ function eventMethod(entry: LoggedEvent | undefined): string | undefined {
   if (!event || typeof event !== "object") return undefined;
   const method = (event as { method?: unknown }).method;
   return typeof method === "string" ? method : undefined;
+}
+
+function requireTerminalId(params: unknown): string {
+  const id = (params as { terminalId?: unknown } | null)?.terminalId;
+  if (typeof id !== "string" || !id) {
+    throw Object.assign(new Error("terminalId required"), { code: -32602 });
+  }
+  return id;
 }
 
 function isPermissionMode(modeId: string): modeId is PermissionMode {

@@ -27,13 +27,30 @@ function certPaths(): { keyPath: string; certPath: string } {
   };
 }
 
+/** Subject alternative names, or undefined when the PEM is not a certificate. */
+export function certSubjectAltName(certPem: string): string | undefined {
+  try {
+    const name = new X509Certificate(certPem).subjectAltName;
+    return name || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** What `doctor` and `bridge/diagnostics` may say about TLS. Never includes a token. */
 export function tlsDiagnostics(certPem: string | undefined): {
   tls: boolean;
   certFingerprint?: string;
+  /** Hosts this cert can serve. A reconnect to any other host fails TLS. */
+  certSan?: string;
 } {
   if (!certPem || !certPem.includes("BEGIN CERTIFICATE")) return { tls: false };
-  return { tls: true, certFingerprint: fingerprintOfPem(certPem) };
+  const certSan = certSubjectAltName(certPem);
+  return {
+    tls: true,
+    certFingerprint: fingerprintOfPem(certPem),
+    ...(certSan ? { certSan } : {}),
+  };
 }
 
 /**
@@ -44,6 +61,8 @@ export function inspectTlsFiles(): {
   certPath: string;
   state: "missing" | "stub" | "incomplete" | "invalid" | "ready";
   fingerprintSha256?: string;
+  /** Present when the cert parses. Doctor prints this so a reconnect host can be checked. */
+  subjectAltName?: string;
   detail?: string;
 } {
   const { keyPath, certPath } = certPaths();
@@ -55,8 +74,13 @@ export function inspectTlsFiles(): {
     return { certPath, state: "incomplete", detail: "certificate without a private key" };
   }
   const problem = tlsPairProblem(readFileSync(keyPath, "utf8"), certPem);
-  if (problem) return { certPath, state: "invalid", detail: problem };
-  return { certPath, state: "ready", fingerprintSha256: diag.certFingerprint };
+  if (problem) return { certPath, state: "invalid", detail: problem, ...(diag.certSan ? { subjectAltName: diag.certSan } : {}) };
+  return {
+    certPath,
+    state: "ready",
+    fingerprintSha256: diag.certFingerprint,
+    ...(diag.certSan ? { subjectAltName: diag.certSan } : {}),
+  };
 }
 
 /** Why this key cannot serve this cert, or undefined when the pair matches. */

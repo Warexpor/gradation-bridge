@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { chooseBindHost, formatAdvertiseHost, isTailscaleAddress } from "../src/net/bind.js";
+import { chooseBindHost, formatAdvertiseHost, formatListenUrl, isTailscaleAddress } from "../src/net/bind.js";
 
 describe("bind address selection", () => {
   it("treats only the Tailscale CGNAT range and fd7a: as Tailscale", () => {
@@ -33,5 +33,9 @@ describe("bind address selection", () => {
     expect(chooseBindHost({ lan: false, tailscale: false }, candidates)).toBe("127.0.0.1");
     expect(formatAdvertiseHost("fd7a:115c:a1e0::8")).toBe("[fd7a:115c:a1e0::8]");
     expect(formatAdvertiseHost("127.0.0.1")).toBe("127.0.0.1");
+    expect(formatListenUrl("wss", "fd7a:115c:a1e0::8", 8787)).toBe(
+      "wss://[fd7a:115c:a1e0::8]:8787/v1",
+    );
+    expect(formatListenUrl("ws", "127.0.0.1", 8787)).toBe("ws://127.0.0.1:8787/v1");
   });
 });
