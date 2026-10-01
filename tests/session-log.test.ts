@@ -1,4 +1,4 @@
-import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -61,6 +61,68 @@ describe("SessionLog", () => {
     const again = new SessionLog("fake-1", join(root, "sessions", "fake-1"));
     expect(again.lastSeq).toBe(1);
     expect([...again.replay(0)]).toHaveLength(1);
+  });
+
+  it("stores a short notice instead of an oversized update", () => {
+    const base = mkdtempSync(join(tmpdir(), "gb-log-"));
+    dirs.push(base);
+    const log = new SessionLog("big", base, { maxEventBytes: 1024, maxBytes: 16_000 });
+    const pad = "z".repeat(4000);
+    const entry = log.append({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: { sessionId: "big", text: pad },
+    });
+    const raw = readFileSync(log.path, "utf8");
+    expect(raw).not.toContain(pad);
+    expect(raw).toContain("[oversized update omitted]");
+    const params = (entry.event as { params: { truncated?: boolean; sessionId?: string } }).params;
+    expect(params.truncated).toBe(true);
+    expect(params.sessionId).toBe("big");
+    expect([...log.replay(0)]).toHaveLength(1);
+  });
+
+  it("skips an oversized line and keeps the sequence counter", () => {
+    const base = mkdtempSync(join(tmpdir(), "gb-log-"));
+    dirs.push(base);
+    const limits = { maxEventBytes: 1024, maxBytes: 64_000 };
+    const log = new SessionLog("gap", base, limits);
+    log.append({ jsonrpc: "2.0", method: "session/update", params: { n: 1 } });
+    appendFileSync(log.path, `${"x".repeat(8000)}\n`);
+    log.append({ jsonrpc: "2.0", method: "session/update", params: { n: 2 } });
+    const again = new SessionLog("gap", base, limits);
+    expect(again.lastSeq).toBe(2);
+    expect([...again.replay(0)].map((entry) => entry.seq)).toEqual([1, 2]);
+  });
+
+  it("drops the oldest lines once the transcript cap is reached", () => {
+    const base = mkdtempSync(join(tmpdir(), "gb-log-"));
+    dirs.push(base);
+    const limits = { maxEventBytes: 1024, maxBytes: 4096 };
+    const log = new SessionLog("cap", base, limits);
+    const pad = "y".repeat(180);
+    const count = 40;
+    for (let i = 0; i < count; i++) {
+      log.append({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { n: i, pad },
+      });
+    }
+    expect(statSync(log.path).size).toBeLessThanOrEqual(limits.maxBytes);
+    const replayed = [...log.replay(0)];
+    expect(replayed.length).toBeGreaterThan(0);
+    expect(replayed.length).toBeLessThan(count);
+    expect(replayed[replayed.length - 1]?.seq).toBe(count);
+    expect(log.lastSeq).toBe(count);
+    const next = log.append({
+      jsonrpc: "2.0",
+      method: "bridge/promptResult",
+      params: { sessionId: "cap", stopReason: "end_turn" },
+    });
+    expect(next.seq).toBe(count + 1);
+    expect(statSync(log.path).size).toBeLessThanOrEqual(limits.maxBytes);
+    expect([...log.replay(count)].map((entry) => entry.seq)).toEqual([count + 1]);
   });
 
   it("refuses a symlinked events.jsonl", () => {

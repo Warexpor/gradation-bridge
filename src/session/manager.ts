@@ -1966,9 +1966,17 @@ function sealInterruptedSession(
   sessionLog: SessionLog,
   status: "running" | "needs_approval",
 ): "prompt" | "permission" | undefined {
-  const events = [...sessionLog.replay(0)];
+  let lastMethod: string | undefined;
+  let open = false;
+  for (const entry of sessionLog.replay(0)) {
+    const method = eventMethod(entry);
+    if (!method) continue;
+    lastMethod = method;
+    if (method === "session/request_permission") open = true;
+    else if (method === "bridge/permissionResolved") open = false;
+  }
   if (status === "running") {
-    if (eventMethod(events[events.length - 1]) === "bridge/promptResult") return undefined;
+    if (lastMethod === "bridge/promptResult") return undefined;
     sessionLog.append({
       jsonrpc: "2.0",
       method: "bridge/promptResult",
@@ -1978,12 +1986,6 @@ function sealInterruptedSession(
       },
     });
     return "prompt";
-  }
-  let open = false;
-  for (const entry of events) {
-    const method = eventMethod(entry);
-    if (method === "session/request_permission") open = true;
-    else if (method === "bridge/permissionResolved") open = false;
   }
   if (!open) return undefined;
   sessionLog.append({
