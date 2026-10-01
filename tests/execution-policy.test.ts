@@ -251,6 +251,28 @@ describe("execution policy and protocol surfaces", () => {
     await allowed.client.close();
   });
 
+  it("does not spend an allow_once grant on a poisoned terminal env", async () => {
+    await boot({
+      mode: "ask",
+      env: {
+        FAKE_ACP_TERMINAL: "1",
+        FAKE_ACP_TERMINAL_POISON: "1",
+        FAKE_ACP_PERMISSION: "1",
+        FAKE_ACP_PERMISSION_KIND: "execute",
+      },
+    });
+    const { client, sessionId } = await session("ask", true);
+    await client.call("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "run" }],
+    });
+    const body = texts(client.updates).join("\n");
+    expect(body).not.toMatch(/terminal failed/);
+    expect(body).not.toMatch(/should-not-run/);
+    expect(body).toMatch(/Echo: run/);
+    await client.close();
+  });
+
   it("does not spend an allow_once grant on a missing terminal command", async () => {
     await boot({
       mode: "ask",

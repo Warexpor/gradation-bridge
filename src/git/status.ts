@@ -3,7 +3,7 @@
  * Callers must already ensure `cwd` (and any file path) lie under allowedRoots.
  */
 
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { relative, isAbsolute } from "node:path";
 
@@ -37,6 +37,9 @@ export interface GitDiffResult {
  * be passed safely as `-c` fails the whole command closed.
  * `alias.status` and `alias.diff` are blanked so a shell alias cannot replace
  * the builtin. `--no-pager` skips `pager.diff` and `core.pager`.
+ * `-c` is inherited by submodule git processes. A parent `diff.submodule=diff`
+ * otherwise runs the submodule's `diff.external` even when the parent command
+ * passed `--no-ext-diff`. Recurse and submodule summary stay off.
  */
 const GIT_GUARD = [
   "-c",
@@ -51,7 +54,26 @@ const GIT_GUARD = [
   "alias.status=",
   "-c",
   "alias.diff=",
+  "-c",
+  "submodule.recurse=false",
+  "-c",
+  "status.submoduleSummary=false",
+  "-c",
+  "diff.submodule=short",
+  "-c",
+  "diff.ignoreSubmodules=all",
+  "-c",
+  "fetch.recurseSubmodules=false",
+  "-c",
+  "maintenance.auto=false",
+  "-c",
+  "gc.auto=0",
 ];
+
+/** Phone-triggered status and diff must not wait on a stuck index or helper. */
+export const GIT_HELPER_TIMEOUT_MS = 20_000;
+const MAX_GIT_ACTIVE = 2;
+const MAX_GIT_WAITING = 4;
 
 /** `filter.<name>.(clean|smudge|process)` with a token we can pass to `-c`. */
 const SAFE_FILTER_KEY = /^filter\.[A-Za-z0-9][A-Za-z0-9.-]*\.(clean|smudge|process)$/;
@@ -109,22 +131,67 @@ export function gitChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Proce
   return env;
 }
 
-function localFilterKeys(cwd: string): { disable: string[]; unsafe: boolean } {
+export interface GitHelperOptions {
+  timeoutMs?: number;
+}
+
+let gitActive = 0;
+const gitWaiters: Array<() => void> = [];
+
+function gitResourceError(message: string, reason: string): Error {
+  return Object.assign(new Error(message), { code: -32012, data: { reason } });
+}
+
+function isGitTimeout(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { killed?: boolean; signal?: string | null; code?: unknown };
+  if (e.code === "ETIMEDOUT") return true;
+  return e.killed === true && (e.signal === "SIGKILL" || e.signal === "SIGTERM");
+}
+
+function acquireGit(): Promise<void> {
+  if (gitActive < MAX_GIT_ACTIVE) {
+    gitActive += 1;
+    return Promise.resolve();
+  }
+  if (gitWaiters.length >= MAX_GIT_WAITING) {
+    return Promise.reject(gitResourceError("git is busy", "git-busy"));
+  }
+  return new Promise((resolve) => {
+    gitWaiters.push(() => {
+      gitActive += 1;
+      resolve();
+    });
+  });
+}
+
+function releaseGit(): void {
+  gitActive = Math.max(0, gitActive - 1);
+  const next = gitWaiters.shift();
+  if (next) next();
+}
+
+async function localFilterKeys(
+  cwd: string,
+  timeoutMs: number,
+): Promise<{ disable: string[]; unsafe: boolean }> {
   let text = "";
   try {
-    text = execFileSync(
+    const { stdout } = await execFileAsync(
       "git",
       ["--no-pager", "-c", "core.fsmonitor=", "-c", "alias.config=", "config", "--local", "--name-only", "--list"],
       {
         cwd,
         encoding: "utf8",
-        timeout: 5_000,
+        timeout: timeoutMs,
+        killSignal: "SIGKILL",
         maxBuffer: 1024 * 1024,
-        stdio: ["ignore", "pipe", "pipe"],
         env: gitChildEnv(),
       },
     );
+    text = String(stdout);
   } catch (err) {
+    if (isGitTimeout(err)) throw gitResourceError("git timed out", "git-timeout");
     const code = (err as NodeJS.ErrnoException).code;
     const stderr = (err as { stderr?: unknown }).stderr;
     const message = typeof stderr === "string" ? stderr : "";
@@ -140,30 +207,41 @@ function localFilterKeys(cwd: string): { disable: string[]; unsafe: boolean } {
 async function git(
   cwd: string,
   args: string[],
+  opts?: GitHelperOptions,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
-  const filters = localFilterKeys(cwd);
-  if (filters.unsafe) {
-    return { stdout: "", stderr: "", code: 1 };
-  }
+  const timeoutMs =
+    opts?.timeoutMs != null && opts.timeoutMs > 0 ? opts.timeoutMs : GIT_HELPER_TIMEOUT_MS;
+  await acquireGit();
   try {
-    const { stdout, stderr } = await execFileAsync("git", guardedGitArgs(args, filters.disable), {
-      cwd,
-      maxBuffer: 20 * 1024 * 1024,
-      encoding: "utf8",
-      env: gitChildEnv(),
-    });
-    return { stdout: String(stdout), stderr: String(stderr), code: 0 };
-  } catch (e) {
-    const err = e as {
-      stdout?: string;
-      stderr?: string;
-      code?: number | string;
-    };
-    return {
-      stdout: String(err.stdout ?? ""),
-      stderr: String(err.stderr ?? ""),
-      code: typeof err.code === "number" ? err.code : 1,
-    };
+    const filters = await localFilterKeys(cwd, timeoutMs);
+    if (filters.unsafe) {
+      return { stdout: "", stderr: "", code: 1 };
+    }
+    try {
+      const { stdout, stderr } = await execFileAsync("git", guardedGitArgs(args, filters.disable), {
+        cwd,
+        maxBuffer: 20 * 1024 * 1024,
+        encoding: "utf8",
+        timeout: timeoutMs,
+        killSignal: "SIGKILL",
+        env: gitChildEnv(),
+      });
+      return { stdout: String(stdout), stderr: String(stderr), code: 0 };
+    } catch (e) {
+      if (isGitTimeout(e)) throw gitResourceError("git timed out", "git-timeout");
+      const err = e as {
+        stdout?: string;
+        stderr?: string;
+        code?: number | string;
+      };
+      return {
+        stdout: String(err.stdout ?? ""),
+        stderr: String(err.stderr ?? ""),
+        code: typeof err.code === "number" ? err.code : 1,
+      };
+    }
+  } finally {
+    releaseGit();
   }
 }
 
@@ -217,8 +295,8 @@ export function parsePorcelainStatus(text: string): GitStatusResult {
   return { branch, ahead, behind, files };
 }
 
-export async function getGitStatus(cwd: string): Promise<GitStatusResult> {
-  const { stdout, code } = await git(cwd, ["status", "--porcelain=v1", "-b"]);
+export async function getGitStatus(cwd: string, opts?: GitHelperOptions): Promise<GitStatusResult> {
+  const { stdout, code } = await git(cwd, ["status", "--porcelain=v1", "-b", "--ignore-submodules=all"], opts);
   if (code !== 0 && !stdout) {
     return { branch: "", ahead: 0, behind: 0, files: [] };
   }
@@ -229,7 +307,11 @@ export async function getGitStatus(cwd: string): Promise<GitStatusResult> {
  * Unified diff for one path (working tree + index vs HEAD).
  * `filePath` may be absolute or relative to `cwd`.
  */
-export async function getGitDiff(cwd: string, filePath: string): Promise<GitDiffResult> {
+export async function getGitDiff(
+  cwd: string,
+  filePath: string,
+  opts?: GitHelperOptions,
+): Promise<GitDiffResult> {
   const rel = isAbsolute(filePath) ? relative(cwd, filePath) : filePath;
   if (rel.startsWith("..") || rel === "") {
     // Outside cwd or empty — refuse by returning empty (caller should sandbox first)
@@ -237,9 +319,9 @@ export async function getGitDiff(cwd: string, filePath: string): Promise<GitDiff
   }
   const args =
     rel && !rel.startsWith("..")
-      ? ["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--", rel]
-      : ["diff", "--no-ext-diff", "--no-textconv", "HEAD"];
-  const { stdout, code } = await git(cwd, args);
+      ? ["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "HEAD", "--", rel]
+      : ["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "HEAD"];
+  const { stdout, code } = await git(cwd, args, opts);
   if (code !== 0 && !stdout) return { unified: "" };
   return { unified: stdout };
 }

@@ -14,6 +14,7 @@
  *   FAKE_ACP_FS_WRITE=1         — call fs/write_text_file during the prompt
  *   FAKE_ACP_TERMINAL=1         — call terminal/create during the prompt
  *   FAKE_ACP_TERMINAL_MISS=1    — try a missing command first; the grant must survive
+ *   FAKE_ACP_TERMINAL_POISON=1  — try LD_PRELOAD first; the grant must survive
  *   FAKE_ACP_TERMINAL_HANG=1    — wait on a command that ignores SIGTERM until cancel
  *   FAKE_ACP_AUTH=1             — advertise an agent auth method from initialize
  *   FAKE_ACP_AUTH_REQUIRED=1    — session/new fails until authenticate succeeds
@@ -82,6 +83,7 @@ const noResume = process.env.FAKE_ACP_NO_RESUME === "1";
 const dumpNewPath = process.env.FAKE_ACP_DUMP_NEW;
 const terminalTail = process.env.FAKE_ACP_TERMINAL_TAIL === "1";
 const terminalMiss = process.env.FAKE_ACP_TERMINAL_MISS === "1";
+const terminalPoison = process.env.FAKE_ACP_TERMINAL_POISON === "1";
 const terminalHang = process.env.FAKE_ACP_TERMINAL_HANG === "1";
 
 function write(obj: unknown): void {
@@ -306,7 +308,7 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     }
   }
 
-  if (wantTerminal || terminalTail || terminalMiss || terminalHang) {
+  if (wantTerminal || terminalTail || terminalMiss || terminalHang || terminalPoison) {
     try {
       if (terminalMiss) {
         try {
@@ -319,6 +321,21 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
         } catch (e) {
           const message = e instanceof Error ? e.message : String(e);
           if (!message.includes("command not found")) throw e;
+        }
+      }
+      if (terminalPoison) {
+        try {
+          await requestClient("terminal/create", {
+            sessionId,
+            command: process.execPath,
+            args: ["-e", "process.stdout.write('should-not-run')"],
+            cwd: session.cwd,
+            env: [{ name: "LD_PRELOAD", value: "/tmp/no-such.so" }],
+          });
+          throw new Error("poisoned env was accepted");
+        } catch (e) {
+          const message = e instanceof Error ? e.message : String(e);
+          if (!message.includes("cannot set")) throw e;
         }
       }
       if (terminalHang) {

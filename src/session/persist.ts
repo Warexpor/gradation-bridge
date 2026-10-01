@@ -22,6 +22,7 @@ import type { ToolGrant } from "../approval/grants.js";
 import { dataDir } from "../config/load.js";
 import { log } from "../log/diagnostics.js";
 import { compareRecentSession, isSafeSessionId } from "./ids.js";
+import { MAX_CATALOG_BYTES, MAX_CLOSED_SESSIONS } from "./limits.js";
 
 const MAX_RESTORED = 200;
 
@@ -246,6 +247,97 @@ export function deletePersistedSession(sessionId: string): boolean {
   if (!readPersistedSession(sessionId)) return false;
   rmSync(join(sessionsRoot(), sessionId), { recursive: true, force: true });
   return true;
+}
+
+function directoryBytes(dir: string): number {
+  let total = 0;
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) continue;
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      total += directoryBytes(path);
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    try {
+      total += lstatSync(path).size;
+    } catch {
+      // A file that vanished mid-walk is not worth failing the prune.
+    }
+  }
+  return total;
+}
+
+/**
+ * Delete the oldest closed session directories until both caps hold.
+ * Open sessions and ids in `protectIds` stay, including rows past the restore
+ * cap. Returns the ids removed.
+ */
+export function pruneSessionCatalog(opts: {
+  protectIds: ReadonlySet<string>;
+  maxClosed?: number;
+  maxBytes?: number;
+}): string[] {
+  const maxClosed = opts.maxClosed ?? MAX_CLOSED_SESSIONS;
+  const maxBytes = opts.maxBytes ?? MAX_CATALOG_BYTES;
+  const root = sessionsRoot();
+  if (!existsSync(root)) return [];
+  try {
+    assertRealSessionsRoot();
+  } catch {
+    return [];
+  }
+  interface Row {
+    id: string;
+    updatedAt: string;
+    bytes: number;
+  }
+  const closed: Row[] = [];
+  let total = 0;
+  for (const name of readdirSync(root)) {
+    if (!isSafeSessionId(name)) continue;
+    const dir = join(root, name);
+    let info: ReturnType<typeof lstatSync>;
+    try {
+      info = lstatSync(dir);
+    } catch {
+      continue;
+    }
+    if (info.isSymbolicLink() || !info.isDirectory()) continue;
+    const bytes = directoryBytes(dir);
+    total += bytes;
+    if (opts.protectIds.has(name)) continue;
+    const meta = readPersistedSession(name);
+    if (!meta || meta.status !== "closed") continue;
+    closed.push({ id: name, updatedAt: meta.updatedAt, bytes });
+  }
+  closed.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt) || a.id.localeCompare(b.id));
+  let closedKept = closed.length;
+  const removed: string[] = [];
+  while (closed.length > 0 && (closedKept > maxClosed || total > maxBytes)) {
+    const row = closed.shift();
+    if (!row) break;
+    try {
+      removeSessionStorage(row.id);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      log("warn", `could not prune session ${row.id}: ${message}`);
+      break;
+    }
+    total -= row.bytes;
+    closedKept -= 1;
+    removed.push(row.id);
+  }
+  if (total > maxBytes) {
+    log("warn", `session catalog is ${total} bytes, above ${maxBytes}; open sessions were kept`);
+  }
+  return removed;
 }
 
 /**

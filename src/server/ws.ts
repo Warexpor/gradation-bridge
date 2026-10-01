@@ -5,9 +5,8 @@
 
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import { createServer as createHttpServer, type Server as HttpServer, type IncomingMessage } from "node:http";
-import { readdirSync, statSync } from "node:fs";
+import { listDirectory } from "../fs/browse.js";
 import { hostname } from "node:os";
-import { join } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { parseAuthorizationHeader, verifyBearerToken } from "../auth/token.js";
 import { PERMISSION_MODES } from "../approval/policy.js";
@@ -517,16 +516,7 @@ async function dispatch(
     case "bridge/browse": {
       const path = String(p.path ?? "");
       const allowed = assertAllowedRealPath(path, opts.config.allowedRoots);
-      const entries = readdirSync(allowed).map((name) => {
-        let dir = false;
-        try {
-          dir = statSync(join(allowed, name)).isDirectory();
-        } catch {
-          dir = false;
-        }
-        return { name, dir };
-      });
-      return { entries };
+      return listDirectory(allowed);
     }
     case "bridge/listSessions": {
       const sessions = opts.sessions.list({

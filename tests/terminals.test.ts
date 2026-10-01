@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   appendTerminalOutput,
   assertTerminalCreateParams,
+  blockedTerminalEnvName,
   MAX_TERMINALS_PER_SESSION,
   resolveOutputByteLimit,
   TerminalTable,
@@ -26,6 +27,16 @@ describe("terminal output limit", () => {
 
   it("rejects a negative outputByteLimit", () => {
     expect(() => resolveOutputByteLimit(-1)).toThrow(/outputByteLimit/);
+  });
+
+  it("rejects loader and git-config env names", () => {
+    expect(blockedTerminalEnvName("LD_PRELOAD")).toBe(true);
+    expect(blockedTerminalEnvName("GIT_CONFIG_KEY_0")).toBe(true);
+    expect(blockedTerminalEnvName("GIT_CONFIG_VALUE_1")).toBe(true);
+    expect(blockedTerminalEnvName("NODE_OPTIONS")).toBe(true);
+    expect(blockedTerminalEnvName("BASH_FUNC_echo")).toBe(true);
+    expect(blockedTerminalEnvName("PATH")).toBe(false);
+    expect(blockedTerminalEnvName("TERM")).toBe(false);
   });
 
   it("rejects a create that cannot start", () => {
