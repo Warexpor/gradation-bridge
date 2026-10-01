@@ -3,7 +3,7 @@
  * meta.json is what lets a restarted bridge list the session and respawn the harness.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import type { ToolGrant } from "../approval/grants.js";
@@ -41,6 +41,8 @@ const MetaSchema = z.object({
         id: z.string(),
         name: z.string().optional(),
         description: z.string().optional(),
+        type: z.enum(["agent", "terminal"]).optional(),
+        args: z.array(z.string()).optional(),
       }),
     )
     .optional(),
@@ -81,6 +83,14 @@ export function loadPersistedMetas(): SessionMeta[] {
   let skipped = 0;
   for (const name of readdirSync(root)) {
     if (!isSafeSessionId(name)) continue;
+    let info: ReturnType<typeof lstatSync>;
+    try {
+      info = lstatSync(join(root, name));
+    } catch {
+      continue;
+    }
+    // Skip symlinks so a catalog entry cannot point outside this directory.
+    if (!info.isDirectory()) continue;
     const metaPath = join(root, name, "meta.json");
     if (!existsSync(metaPath)) continue;
     let parsed: z.SafeParseReturnType<unknown, z.infer<typeof MetaSchema>>;

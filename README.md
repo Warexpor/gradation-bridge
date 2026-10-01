@@ -4,7 +4,7 @@ ACP bridge daemon for [GradatiON](https://github.com/Warexpor/GradatiON) Code mo
 
 The phone never runs an agent. This small Node 20+ daemon on your machine launches coding agents (Claude Code, Codex, OpenCode, Grok Build, Cursor CLI, Pi, …) over stdio via the [Agent Client Protocol](https://agentclientprotocol.com/), and relays sessions to GradatiON over one authenticated WebSocket.
 
-> **Status:** Working MVP. End-to-end ACP sessions (initialize / new / prompt / cancel / load / resume / set_mode / set_config_option / list / close / delete), approval policy enforced on real file writes and terminal calls, JSONL resume that survives a bridge restart, sandboxed git status/diff, harness readiness diagnostics, and bridge extensions are implemented. Tested with a fake ACP agent. Point config at a harness below, or run `gradation-bridge doctor` to see what is actually installed.
+> **Status:** Working MVP (0.4.0). End-to-end ACP sessions (initialize / new / prompt / cancel / load / resume / set_mode / set_config_option / list / close / delete), harness `authenticate` / `logout` (and the `auth/login` / `auth/logout` names), `elicitation/create` relay, approval policy enforced on real file writes and terminal calls, JSONL resume that survives a bridge restart, sandboxed git status/diff, harness readiness diagnostics, and bridge extensions are implemented. The wire protocol stays at ACP 1. Tested with a fake ACP agent. Point config at a harness below, or run `gradation-bridge doctor` to see what is actually installed.
 
 ## Quick start (against GradatiON)
 
@@ -129,9 +129,24 @@ Changing mode clears outstanding grants. Phone-selected outcomes are applied bac
 
 WebSocket, text frames, JSON-RPC 2.0, path `/v1`, `Authorization: Bearer <token>`.
 
-ACP methods relayed: `initialize`, `session/new`, `session/prompt`, `session/cancel`, `session/load` (with `_meta.afterSeq` replay), `session/resume` (no transcript replay), `session/set_mode`, `session/set_config_option`, `session/list`, `session/close`, `session/delete`, `session/update`, `session/request_permission`. The bridge implements `fs/read_text_file`, `fs/write_text_file`, and `terminal/*` for the agent. Phone `clientCapabilities` are forwarded, with filesystem and terminal forced on because the bridge is the one performing them.
+ACP methods relayed: `initialize`, `authenticate` (`auth/login`), `logout` (`auth/logout`), `session/new`, `session/prompt`, `session/cancel`, `session/load` (with `_meta.afterSeq` replay), `session/resume` (no transcript replay), `session/set_mode`, `session/set_config_option`, `session/list`, `session/close`, `session/delete`, `session/update`, `session/request_permission`, `elicitation/create`, `elicitation/complete`. The bridge implements `fs/read_text_file`, `fs/write_text_file`, and `terminal/*` for the agent. Phone `clientCapabilities` are forwarded, with filesystem and terminal forced on because the bridge is the one performing them. `clientCapabilities.auth.terminal` is forced off: this process cannot show an interactive login TTY.
 
-`initialize` advertises `sessionCapabilities` for list, close, resume, and delete, and `loadSession: true`. Prompt image and audio stay off; a prompt that includes those blocks is rejected with `-32602`. `session/new` returns the agent's payload (including `modes` and `configOptions` when the harness sends them) plus `_meta.permissionMode`, `_meta.harness`, `_meta.agentInfo`, and `_meta.authMethods` when the agent advertised login methods. `initialize` advertises `authMethods: []` because the WebSocket bearer already authenticated the phone. Harness login stays on the machine.
+`initialize` answers `protocolVersion: 1`. A phone that asks for another version, including ACP v2, still gets `1` (v2 is a draft and removes `session/load` plus client filesystem and terminal methods). `initialize` advertises `sessionCapabilities` for list, close, resume, and delete, and `loadSession: true`. Prompt image and audio stay off; a prompt that includes those blocks is rejected with `-32602`. `session/new` returns the agent's payload (including `modes` and `configOptions` when the harness sends them) plus `_meta.permissionMode`, `_meta.harness`, `_meta.agentInfo`, `_meta.logout` when the agent supports logout, and `_meta.authMethods` when the agent advertised login methods. `initialize` advertises `authMethods: []` because the WebSocket bearer already authenticated the phone. Harness login is a separate ACP call.
+
+### Harness login
+
+`authenticate` and `auth/login` take `{ methodId, sessionId? , cwd?, _meta: { harness, cwd } }`.
+
+- With `sessionId`, the call is forwarded to that session's running process. Load or resume first if the process is down (`-32004`).
+- Without `sessionId`, the bridge starts the harness in the sandboxed `cwd`, calls `authenticate` (falling back to `auth/login` if the harness returns `-32601`), and keeps that process for the next `session/new` of the same harness and cwd (10 minutes, or until `logout`). The login therefore survives into the session instead of dying with a throwaway process.
+- `type: "terminal"` methods are not executed and are not passed to `authenticate` (`-32602`). `env` on those methods is stripped before anything is sent to the phone or written to the session catalog. Run that login in a terminal on this machine.
+- If `session/new` fails because the harness said authentication is required, the error is `-32011` and `data.authMethods` lists the public methods (still no env).
+
+`logout` and `auth/logout` are forwarded only when the agent advertised `agentCapabilities.auth.logout`. Logging out a pre-session process drops it.
+
+### Elicitation
+
+`elicitation/create` from the harness is relayed to the phone when `initialize` advertised that mode (`clientCapabilities.elicitation.form` and/or `.url` as objects). A missing capability, a form field that looks like a credential (`password`, `api_key`, `token`, …), or a URL that is not `http`/`https` or that contains userinfo is rejected with `-32602` and is not forwarded. The bridge does not open the URL. Decline and cancel responses drop `content`. Answers are not written to the session JSONL. If the phone does not answer, the agent receives `{ "action": "cancel" }`. `elicitation/complete` is broadcast to connected phones and is not stored in the log.
 
 `session/list` is the ACP list (`cwd` filter, `cursor` / `nextCursor`). `bridge/listSessions` is the same catalog with bridge fields. `session/close` matches `bridge/closeSession` and also asks the harness to close before the process is killed. `session/delete` removes the session and its on-disk log. `session/set_config_option` is forwarded when the harness process is running (`-32004` if it has exited; load or resume first). Extra workspace roots on `session/new` (`additionalDirectories`) are realpath-checked against `allowedRoots` and forwarded. A harness session id that is not a safe directory name is rejected.
 
@@ -203,7 +218,8 @@ Requires Node 20+. Depends on [`@agentclientprotocol/sdk`](https://www.npmjs.com
 - Push notifications when no phone is attached (§3.1.7 of the plan) — not implemented. A permission request is held for a reconnecting phone and cancelled if nobody answers.
 - Richer terminal UX (PTY / streaming). Output is buffered until `terminal/output`. FS browse/read/write already realpath-sandbox.
 - Multi-session sharing one long-lived agent process (today: one process per session). `session/load` and `session/resume` respawn a dead per-session process. The catalog survives a bridge restart; the harness's own memory survives only if that harness implements load or resume.
-- ACP `authenticate` / `auth/login` and `elicitation/*` are not relayed. Harness login stays on the machine; `session/new` surfaces `authMethods` so the phone can say why a start failed. `$/cancel_request` is ignored, which the protocol allows. ACP v2 (`session/load` removed, terminals agent-owned) is not negotiated; the bridge answers `protocolVersion: 1`.
+- `$/cancel_request` is ignored, which the protocol allows. ACP v2 is not negotiated: it is still a draft, and it removes `session/load`, client `fs/*`, and client `terminal/*`. The bridge keeps answering `protocolVersion: 1`. Non-breaking ACP additions (elicitation, logout, terminal auth metadata) are handled as capabilities on that version.
+- Terminal auth methods are advertised to the phone without `env`, and the bridge does not spawn them. Protocol-driven `authenticate` is relayed. One harness process per session, plus at most one warm process between `authenticate` and the following `session/new`.
 
 ## License
 

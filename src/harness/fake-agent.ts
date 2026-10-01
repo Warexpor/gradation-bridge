@@ -11,7 +11,15 @@
  *   FAKE_ACP_PERMISSION_KIND    — tool kind for that request (default edit)
  *   FAKE_ACP_FS_WRITE=1         — call fs/write_text_file during the prompt
  *   FAKE_ACP_TERMINAL=1         — call terminal/create during the prompt
- *   FAKE_ACP_AUTH=1             — advertise an auth method from initialize
+ *   FAKE_ACP_AUTH=1             — advertise an agent auth method from initialize
+ *   FAKE_ACP_AUTH_REQUIRED=1    — session/new fails until authenticate succeeds
+ *   FAKE_ACP_AUTH_ALIAS=1       — authenticate is method-not-found; auth/login works
+ *   FAKE_ACP_AUTH_TERMINAL=1    — advertise a terminal auth method (env must not leak)
+ *   FAKE_ACP_LOGOUT=1           — advertise logout
+ *   FAKE_ACP_ELICIT_FORM=1      — form elicitation during authenticate
+ *   FAKE_ACP_ELICIT_SECRET=1    — form that asks for a password (bridge should reject)
+ *   FAKE_ACP_ELICIT_URL=<url>   — url elicitation during the prompt
+ *   FAKE_ACP_TRACE=<file>       — append init/auth/new lines with this process id
  *   FAKE_ACP_DUMP=<file>        — write the initialize params JSON to a file
  *   FAKE_ACP_SLOW_MS=N          — delay between update chunks
  *   FAKE_ACP_EXIT_AFTER_PROMPT=1 — exit shortly after the prompt result is flushed
@@ -20,7 +28,7 @@
  *   FAKE_ACP_DUMP_NEW=<file>     — write session/new params JSON to a file
  *   FAKE_ACP_TERMINAL_TAIL=1     — terminal/create with a 4-byte output limit
  */
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -37,7 +45,15 @@ const wantPermission = process.env.FAKE_ACP_PERMISSION === "1";
 const permissionKind = process.env.FAKE_ACP_PERMISSION_KIND || "edit";
 const wantWrite = process.env.FAKE_ACP_FS_WRITE === "1";
 const wantTerminal = process.env.FAKE_ACP_TERMINAL === "1";
-const wantAuth = process.env.FAKE_ACP_AUTH === "1";
+const wantAuth = process.env.FAKE_ACP_AUTH === "1" || process.env.FAKE_ACP_AUTH_REQUIRED === "1";
+const authRequired = process.env.FAKE_ACP_AUTH_REQUIRED === "1";
+const authAlias = process.env.FAKE_ACP_AUTH_ALIAS === "1";
+const authTerminal = process.env.FAKE_ACP_AUTH_TERMINAL === "1";
+const wantLogout = process.env.FAKE_ACP_LOGOUT === "1";
+const elicitForm = process.env.FAKE_ACP_ELICIT_FORM === "1";
+const elicitSecret = process.env.FAKE_ACP_ELICIT_SECRET === "1";
+const elicitUrl = process.env.FAKE_ACP_ELICIT_URL;
+let authenticated = !authRequired;
 const dumpPath = process.env.FAKE_ACP_DUMP;
 const slowMs = Number(process.env.FAKE_ACP_SLOW_MS ?? "0") || 0;
 const exitAfterPrompt = process.env.FAKE_ACP_EXIT_AFTER_PROMPT === "1";
@@ -62,6 +78,12 @@ function respondError(id: number | string | null | undefined, code: number, mess
 
 function notify(method: string, params: unknown): void {
   write({ jsonrpc: "2.0", method, params });
+}
+
+function trace(event: string): void {
+  const path = process.env.FAKE_ACP_TRACE;
+  if (!path) return;
+  appendFileSync(path, `${event} ${process.pid}\n`);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -194,6 +216,21 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     return;
   }
 
+  if (elicitSecret || elicitUrl) {
+    const blocked = await runPromptElicitation(sessionId);
+    if (blocked) {
+      notify("session/update", {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "elicitation-blocked" },
+        },
+      });
+      respond(id, { stopReason: "end_turn" });
+      return;
+    }
+  }
+
   if (wantWrite) {
     try {
       await requestClient("fs/write_text_file", {
@@ -276,6 +313,65 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
   });
 }
 
+async function runPromptElicitation(sessionId: string): Promise<boolean> {
+  try {
+    if (elicitSecret) {
+      await requestClient("elicitation/create", {
+        sessionId,
+        mode: "form",
+        message: "Enter password",
+        requestedSchema: {
+          type: "object",
+          properties: { password: { type: "string" } },
+          required: ["password"],
+        },
+      });
+      return false;
+    }
+    if (elicitUrl) {
+      await requestClient("elicitation/create", {
+        sessionId,
+        mode: "url",
+        elicitationId: "url-1",
+        message: "Open this link",
+        url: elicitUrl,
+      });
+      return false;
+    }
+  } catch {
+    return true;
+  }
+  return false;
+}
+
+async function handleAuth(id: number | string | null | undefined, params: Record<string, unknown>): Promise<void> {
+  const methodId = String(params.methodId ?? "");
+  if (elicitForm) {
+    try {
+      const result = (await requestClient("elicitation/create", {
+        requestId: id,
+        mode: "form",
+        message: "What should I call you?",
+        requestedSchema: {
+          type: "object",
+          properties: { name: { type: "string", title: "Name" } },
+          required: ["name"],
+        },
+      })) as { action?: string; content?: { name?: string } };
+      if (result?.action !== "accept" || !result.content?.name) {
+        respondError(id, -32000, "auth_required");
+        return;
+      }
+    } catch (e) {
+      respondError(id, -32603, e instanceof Error ? e.message : String(e));
+      return;
+    }
+  }
+  authenticated = true;
+  trace(`auth ${methodId}`);
+  respond(id, {});
+}
+
 async function dispatch(msg: JsonRpcRequest): Promise<void> {
   // Response to our client request
   if (
@@ -301,24 +397,63 @@ async function dispatch(msg: JsonRpcRequest): Promise<void> {
   switch (method) {
     case "initialize":
       if (dumpPath) writeFileSync(dumpPath, JSON.stringify(params));
+      trace("init");
       respond(id, {
         protocolVersion: 1,
         agentCapabilities: {
           loadSession: true,
           promptCapabilities: { image: false, audio: false, embeddedContext: false },
+          ...(wantLogout ? { auth: { logout: {} } } : {}),
         },
         agentInfo: { name: "fake-acp-agent", version: "0.1.0" },
-        ...(wantAuth
+        ...((wantAuth || authTerminal)
           ? {
               authMethods: [
-                { id: "fake_login", name: "Fake login", description: "Test auth method" },
+                ...(wantAuth
+                  ? [{ id: "fake_login", name: "Fake login", description: "Test auth method" }]
+                  : []),
+                ...(authTerminal
+                  ? [
+                      {
+                        id: "term_login",
+                        name: "Terminal login",
+                        type: "terminal",
+                        args: ["--login"],
+                        env: { LEAK_TOKEN: "super-secret-token" },
+                      },
+                    ]
+                  : []),
               ],
             }
           : {}),
       });
       return;
+    case "authenticate":
+      if (authAlias) {
+        respondError(id, -32601, "Method not found: authenticate");
+        return;
+      }
+      await handleAuth(id, params);
+      return;
+    case "auth/login":
+      await handleAuth(id, params);
+      return;
+    case "logout":
+    case "auth/logout":
+      if (!wantLogout) {
+        respondError(id, -32601, "Method not found: logout");
+        return;
+      }
+      authenticated = false;
+      respond(id, {});
+      return;
     case "session/new": {
       if (dumpNewPath) writeFileSync(dumpNewPath, JSON.stringify(params));
+      if (authRequired && !authenticated) {
+        respondError(id, -32000, "auth_required");
+        return;
+      }
+      trace("new");
       const sessionId = forcedSessionId || `fake-${nextSession++}`;
       sessions.set(sessionId, { cwd: String(params.cwd ?? process.cwd()), cancelled: false });
       respond(id, {

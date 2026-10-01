@@ -19,6 +19,7 @@ import { log, recentLogs } from "../log/diagnostics.js";
 import { SessionManager, SandboxError } from "../session/manager.js";
 import { assertAllowedRealPath } from "../approval/sandbox.js";
 import { getGitDiff, getGitStatus } from "../git/status.js";
+import { ACP_PROTOCOL_VERSION, negotiateProtocolVersion } from "../acp/protocol.js";
 import { parseRpcFrame, type JsonRpcMessage } from "./frames.js";
 import { SocketOutbox } from "./outbox.js";
 
@@ -391,9 +392,12 @@ async function dispatch(
   switch (method) {
     case "initialize": {
       opts.sessions.notePhoneInitialize(p);
-      const requested = p.protocolVersion;
-      if (requested != null && requested !== 1) {
-        log("warn", `phone requested protocolVersion ${String(requested)}; bridge speaks ACP 1`);
+      const negotiated = negotiateProtocolVersion(p.protocolVersion);
+      if (negotiated.downgraded) {
+        log(
+          "warn",
+          `phone requested protocolVersion ${String(p.protocolVersion)}; bridge speaks ACP ${ACP_PROTOCOL_VERSION}`,
+        );
       }
       const harnesses = listHarnesses(opts.config).map(
         ({ id, name, available, readiness, detail, notice }) => ({
@@ -406,7 +410,7 @@ async function dispatch(
         }),
       );
       return {
-        protocolVersion: 1,
+        protocolVersion: negotiated.version,
         agentCapabilities: {
           loadSession: true,
           promptCapabilities: { image: false, audio: false, embeddedContext: true },
@@ -569,7 +573,8 @@ async function dispatch(
           permissionMode: rec.permissionMode,
           harness: rec.harness,
           ...(rec.agentInfo ? { agentInfo: rec.agentInfo } : {}),
-          ...(rec.authMethods ? { authMethods: rec.authMethods } : {}),
+          ...(rec.authMethods?.length ? { authMethods: rec.authMethods } : {}),
+          ...(rec.logoutSupported ? { logout: true } : {}),
         },
       };
     }
@@ -596,6 +601,27 @@ async function dispatch(
       });
     }
 
+    case "authenticate":
+    case "auth/login": {
+      const meta = (p._meta ?? {}) as Record<string, unknown>;
+      return opts.sessions.authenticate({
+        methodId: typeof p.methodId === "string" ? p.methodId : "",
+        sessionId: typeof p.sessionId === "string" ? p.sessionId : undefined,
+        harnessId: typeof meta.harness === "string" ? meta.harness : undefined,
+        cwd:
+          typeof p.cwd === "string" ? p.cwd : typeof meta.cwd === "string" ? meta.cwd : undefined,
+      });
+    }
+    case "logout":
+    case "auth/logout": {
+      const meta = (p._meta ?? {}) as Record<string, unknown>;
+      return opts.sessions.logout({
+        sessionId: typeof p.sessionId === "string" ? p.sessionId : undefined,
+        harnessId: typeof meta.harness === "string" ? meta.harness : undefined,
+        cwd:
+          typeof p.cwd === "string" ? p.cwd : typeof meta.cwd === "string" ? meta.cwd : undefined,
+      });
+    }
     case "session/cancel": {
       opts.sessions.cancel(String(p.sessionId ?? ""));
       return {};

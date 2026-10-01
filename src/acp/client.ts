@@ -9,6 +9,7 @@ import type { HarnessConfig } from "../config/types.js";
 import { log } from "../log/diagnostics.js";
 import { redactSecrets } from "../log/redact.js";
 import { killProcessTree } from "../proc/tree.js";
+import { ACP_PROTOCOL_VERSION } from "./protocol.js";
 
 export interface AcpJsonRpcRequest {
   jsonrpc?: string;
@@ -56,10 +57,23 @@ export class AcpStdioClient {
   private readonly outbound: string[] = [];
   private stdinPaused = false;
   private settled = false;
+  private requestHandler?: AcpInboundHandler;
+  private notificationHandler?: (msg: AcpJsonRpcNotification) => void;
+  private exitHandler?: (code: number | null, signal: NodeJS.Signals | null) => void;
+  private stderrHandler?: (line: string) => void;
 
   constructor(opts: AcpClientOptions) {
     this.opts = opts;
     this.harness = opts.harness;
+    this.setCallbacks(opts);
+  }
+
+  /** Replace agent→bridge handlers. Used when a warm auth process becomes a session. */
+  setCallbacks(next: Partial<AcpClientOptions>): void {
+    if (next.onRequest) this.requestHandler = next.onRequest;
+    if (next.onNotification) this.notificationHandler = next.onNotification;
+    if (next.onExit) this.exitHandler = next.onExit;
+    if (next.onStderr) this.stderrHandler = next.onStderr;
   }
 
   get pid(): number | undefined {
@@ -138,7 +152,7 @@ export class AcpStdioClient {
     this.outbound.length = 0;
     const base = err ?? new Error(`ACP process exited (code=${code}, signal=${signal})`);
     this.failPending(this.withStderr(base));
-    this.opts.onExit?.(code, signal);
+    this.exitHandler?.(code, signal);
   }
 
   private withStderr(err: Error): Error {
@@ -151,7 +165,7 @@ export class AcpStdioClient {
     const clean = redactSecrets(line).slice(0, 500);
     this.stderrLines.push(clean);
     if (this.stderrLines.length > 40) this.stderrLines.shift();
-    this.opts.onStderr?.(clean);
+    this.stderrHandler?.(clean);
   }
 
   private flushStderr(): void {
@@ -230,7 +244,7 @@ export class AcpStdioClient {
 
     // Notification (method, no id)
     if (obj.method) {
-      this.opts.onNotification?.({
+      this.notificationHandler?.({
         method: obj.method,
         params: obj.params,
       });
@@ -239,7 +253,7 @@ export class AcpStdioClient {
 
   private async handleAgentRequest(req: AcpJsonRpcRequest): Promise<void> {
     try {
-      const handler = this.opts.onRequest;
+      const handler = this.requestHandler;
       if (!handler) {
         this.respondError(req.id, -32601, `Method not found: ${req.method}`);
         return;
@@ -337,14 +351,31 @@ export class AcpStdioClient {
   }): Promise<unknown> {
     const phone = opts?.clientCapabilities ?? {};
     return this.request("initialize", {
-      protocolVersion: 1,
-      clientCapabilities: {
-        ...phone,
-        fs: { readTextFile: true, writeTextFile: true },
-        terminal: true,
-      },
+      protocolVersion: ACP_PROTOCOL_VERSION,
+      clientCapabilities: capabilitiesForAgent(phone),
       clientInfo: opts?.clientInfo ?? { name: "gradation-bridge", version: "0.1.0" },
     });
+  }
+
+  async authenticate(methodId: string): Promise<unknown> {
+    return this.callWithAuthAlias("authenticate", "auth/login", { methodId });
+  }
+
+  async logout(): Promise<unknown> {
+    return this.callWithAuthAlias("logout", "auth/logout", {});
+  }
+
+  private async callWithAuthAlias(
+    primary: string,
+    fallback: string,
+    params: unknown,
+  ): Promise<unknown> {
+    try {
+      return await this.request(primary, params, 300_000);
+    } catch (err) {
+      if (!isMethodNotFound(err)) throw err;
+      return this.request(fallback, params, 300_000);
+    }
   }
 
   async newSession(params: {
@@ -430,6 +461,22 @@ export class AcpStdioClient {
 }
 
 export const ACP_SDK_PACKAGE = "@agentclientprotocol/sdk";
+
+function capabilitiesForAgent(phone: Record<string, unknown>): Record<string, unknown> {
+  const auth = phone.auth;
+  const authObj =
+    auth && typeof auth === "object" && !Array.isArray(auth)
+      ? { ...(auth as Record<string, unknown>) }
+      : {};
+  // The bridge cannot present an interactive TTY, so terminal auth stays off
+  // even if the phone asked for it. fs and terminal methods are ours.
+  return {
+    ...phone,
+    fs: { readTextFile: true, writeTextFile: true },
+    terminal: true,
+    auth: { ...authObj, terminal: false },
+  };
+}
 
 function extraRoots(dirs: string[] | undefined): { additionalDirectories?: string[] } {
   if (!dirs || dirs.length === 0) return {};
