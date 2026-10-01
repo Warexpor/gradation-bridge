@@ -81,7 +81,11 @@ describe("diagnostics and pairing safety", () => {
       harnesses: [],
     });
     expect(report).toContain(`cert fp: ${tls.fingerprintSha256}`);
+    expect(report).toContain("cert san:");
+    expect(report).toMatch(/localhost/);
+    expect(report).toContain("Reconnect to a host in that SAN");
     expect(report).toContain("tls:     ready");
+    expect(report).toMatch(/npx:/);
     expect(report).not.toContain(token);
     expect(report).not.toContain(tls.keyPem);
   });

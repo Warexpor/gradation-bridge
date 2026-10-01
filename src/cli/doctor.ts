@@ -26,18 +26,27 @@ export function formatDoctorReport(config: BridgeConfig): string {
           : tls.state === "invalid"
             ? `invalid (${tls.certPath}) — ${tls.detail ?? "key and certificate do not match"}; delete server.key and server.crt to mint a new pair`
             : `missing (${tls.certPath}) — created on first start when openssl is on PATH`;
+  const npx = which("npx");
+  const npm = which("npm");
   const lines: string[] = [
     "gradation-bridge doctor",
     `config:  ${configPath()}`,
     `data:    ${dataDir()}`,
-    `sessions: ${join(dataDir(), "sessions")} (restored on startup; session/delete removes one)`,
+    `sessions: ${join(dataDir(), "sessions")} (restored on startup; session/delete removes one, including a closed session)`,
     `port:    ${config.port ?? 8787}`,
     `openssl: ${which("openssl") ? "on PATH" : "missing — needed to mint the self-signed cert"}`,
+    `npx:     ${npx ? "on PATH" : "missing — on-demand harnesses cannot start"}`,
     `tls:     ${tlsDetail}`,
   ];
   if (tls.fingerprintSha256) {
     lines.push(`cert fp: ${tls.fingerprintSha256}`);
-    lines.push("         Compare this with GradatiON before trusting the machine. The pairing token is not printed.");
+    lines.push(
+      `cert san: ${tls.subjectAltName ?? "(none — phones may reject TLS)"}`,
+    );
+    lines.push(
+      "         Reconnect to a host in that SAN with this fingerprint. A different host fails TLS; the pinned cert is not replaced.",
+    );
+    lines.push("         Compare the fingerprint with GradatiON before trusting the machine. The pairing token is not printed.");
   }
   lines.push(
     `devices: ${active} active, ${revoked} revoked (tokens are not printed)`,
@@ -63,6 +72,11 @@ export function formatDoctorReport(config: BridgeConfig): string {
     lines.push(`- ${h.id} [${h.readiness}] ${h.command}${args}`);
     lines.push(`    ${h.detail}`);
     if (h.notice) lines.push(`    notice: ${h.notice}`);
+    const launcherMissing =
+      (h.command === "npx" && !npx) || (h.command === "npm" && !npm && !npx);
+    if (h.readiness === "on-demand" && launcherMissing) {
+      lines.push("    notice: the launcher is not on PATH, so this on-demand harness cannot start");
+    }
     if (h.readiness !== "ready") lines.push(`    install: ${h.install}`);
     if (h.authHint) lines.push(`    auth: ${h.authHint}`);
   }

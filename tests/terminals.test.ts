@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   appendTerminalOutput,
+  assertTerminalCreateParams,
+  MAX_TERMINALS_PER_SESSION,
   resolveOutputByteLimit,
   TerminalTable,
   terminalOutputText,
@@ -24,6 +26,14 @@ describe("terminal output limit", () => {
 
   it("rejects a negative outputByteLimit", () => {
     expect(() => resolveOutputByteLimit(-1)).toThrow(/outputByteLimit/);
+  });
+
+  it("rejects a create that cannot start", () => {
+    expect(() => assertTerminalCreateParams({ command: "", args: [] })).toThrow(/command required/);
+    expect(() => assertTerminalCreateParams({ command: "echo", args: "nope" })).toThrow(/array/);
+    expect(() =>
+      assertTerminalCreateParams({ command: "echo", args: ["ok"], outputByteLimit: -1 }),
+    ).toThrow(/outputByteLimit/);
   });
 });
 
@@ -94,5 +104,48 @@ describe("TerminalTable", () => {
     await terminals.wait("owner", terminalId);
     expect(() => terminals.output("other", terminalId)).toThrow(/unknown terminal/);
     expect(terminals.output("owner", terminalId).output).toBe("secret");
+    expect(() => terminals.kill("owner", "missing")).toThrow(/unknown terminal/);
+    expect(() => terminals.release("other", terminalId)).toThrow(/unknown terminal/);
+  });
+
+  it("drops exited terminals only when the session is at the cap", async () => {
+    const terminals = table();
+    const exited: string[] = [];
+    for (let i = 0; i < MAX_TERMINALS_PER_SESSION - 1; i++) {
+      exited.push(
+        terminals.create({
+          sessionId: "s",
+          command: process.execPath,
+          args: ["-e", "process.exit(0)"],
+          cwd: process.cwd(),
+          env: process.env,
+        }).terminalId,
+      );
+    }
+    const live = terminals.create({
+      sessionId: "s",
+      command: process.execPath,
+      args: ["-e", "process.stdout.write('still-live'); setInterval(() => {}, 1000)"],
+      cwd: process.cwd(),
+      env: process.env,
+    }).terminalId;
+    await Promise.all(exited.map((id) => terminals.wait("s", id)));
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline && !terminals.output("s", live).output.includes("still-live")) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(terminals.output("s", live).output).toContain("still-live");
+    expect(terminals.output("s", exited[0]!).output).toBe("");
+    const extra = terminals.create({
+      sessionId: "s",
+      command: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: process.cwd(),
+      env: process.env,
+    });
+    expect(extra.terminalId).toBeTruthy();
+    expect(() => terminals.output("s", exited[0]!)).toThrow(/unknown terminal/);
+    expect(terminals.output("s", live).output).toContain("still-live");
+    await terminals.wait("s", extra.terminalId);
   });
 });

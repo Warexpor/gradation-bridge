@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -64,7 +64,7 @@ function manager(workspace: string, extraRoots: string[] = []): SessionManager {
 }
 
 describe("session catalog edges", () => {
-  it("pages 50 at a time and treats a missing cursor as the end", () => {
+  it("pages 50 at a time and rejects an unknown cursor", () => {
     const { workspace } = useDataDir();
     const dir = sessionsRoot();
     for (let i = 0; i < 51; i++) {
@@ -86,6 +86,7 @@ describe("session catalog edges", () => {
     expect(rest.sessions.map((s) => s.sessionId)).toEqual(["s000"]);
     expect(rest.nextCursor).toBeUndefined();
     expect(sessions.listForProtocol({ cursor: "s000" }).sessions).toEqual([]);
+    expect(() => sessions.listForProtocol({ cursor: "missing" })).toThrow(/invalid session cursor/);
   });
 
   it("omits nextCursor when the page is exact", () => {
@@ -136,7 +137,9 @@ describe("session catalog edges", () => {
     expect(sessions.listForProtocol({ cwd: other }).sessions.map((s) => s.sessionId)).toEqual([
       "in-other",
     ]);
-    expect(sessions.listForProtocol({ cwd: real, cursor: "in-other" }).sessions).toEqual([]);
+    expect(() => sessions.listForProtocol({ cwd: real, cursor: "in-other" })).toThrow(
+      /invalid session cursor/,
+    );
     const blob = JSON.stringify(viaLink);
     expect(blob).not.toContain("secret-name");
     expect(blob).not.toContain("grants");
@@ -315,5 +318,61 @@ describe("session catalog edges", () => {
 
     sessions.close("rooted");
     await expect(sessions.load("rooted", { send: async () => true })).rejects.toThrow(/unknown session/);
+  });
+
+  it("keeps equal timestamps in session id order", () => {
+    const { workspace } = useDataDir();
+    const dir = sessionsRoot();
+    const stamp = "2026-10-01T00:00:00.000Z";
+    writeSessionMeta(join(dir, "a-sess"), meta(workspace, { sessionId: "a-sess", updatedAt: stamp }));
+    writeSessionMeta(join(dir, "m-sess"), meta(workspace, { sessionId: "m-sess", updatedAt: stamp }));
+    const sessions = manager(workspace);
+    const page = sessions.listForProtocol({});
+    expect(page.sessions.map((s) => s.sessionId)).toEqual(["m-sess", "a-sess"]);
+    expect(sessions.listForProtocol({ cursor: "m-sess" }).sessions.map((s) => s.sessionId)).toEqual([
+      "a-sess",
+    ]);
+  });
+
+  it("closes and deletes a catalog row that was not loaded", async () => {
+    const { workspace } = useDataDir();
+    const dir = sessionsRoot();
+    writeSessionMeta(
+      join(dir, "shut"),
+      meta(workspace, { sessionId: "shut", status: "closed", updatedAt: "2026-10-04T00:00:00.000Z" }),
+    );
+    writeSessionMeta(join(dir, "kept"), meta(workspace, { sessionId: "kept" }));
+    const outside = join(dir, "linked");
+    mkdirSync(join(dir, "..", "linked-target"), { recursive: true });
+    symlinkSync(join(dir, "..", "linked-target"), outside);
+
+    const sessions = manager(workspace);
+    expect(sessions.list().map((s) => s.sessionId)).toEqual(["kept"]);
+    await expect(sessions.closeSession("shut", { missing: "error" })).resolves.toEqual({});
+    expect(existsSync(join(dir, "shut", "meta.json"))).toBe(true);
+    await sessions.deleteSession("shut");
+    expect(existsSync(join(dir, "shut"))).toBe(false);
+    await expect(sessions.deleteSession("linked")).rejects.toThrow(/unknown session/);
+    expect(existsSync(outside)).toBe(true);
+    await expect(sessions.deleteSession("nope")).rejects.toThrow(/unknown session/);
+
+    for (let i = 0; i < 201; i++) {
+      const id = `n${String(i).padStart(3, "0")}`;
+      writeSessionMeta(
+        join(dir, id),
+        meta(workspace, {
+          sessionId: id,
+          updatedAt: new Date(Date.UTC(2026, 0, 4, 0, 0, i)).toISOString(),
+        }),
+      );
+    }
+    const reloaded = manager(workspace);
+    expect(reloaded.get("n000")).toBeUndefined();
+    await reloaded.closeSession("n000", { missing: "error" });
+    const closed = JSON.parse(readFileSync(join(dir, "n000", "meta.json"), "utf8")) as { status: string };
+    expect(closed.status).toBe("closed");
+    await reloaded.deleteSession("n000");
+    expect(existsSync(join(dir, "n000"))).toBe(false);
+    expect(reloaded.list().some((s) => s.sessionId === "kept")).toBe(true);
   });
 });

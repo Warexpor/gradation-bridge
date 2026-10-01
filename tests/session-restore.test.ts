@@ -95,7 +95,7 @@ describe("persisted sessions", () => {
     expect(page.nextCursor).toBeUndefined();
     const rest = sessions.listForProtocol({ cursor: "s-new" });
     expect(rest.sessions.map((s) => s.sessionId)).toEqual(["s-mid"]);
-    expect(sessions.listForProtocol({ cursor: "missing" }).sessions).toHaveLength(0);
+    expect(() => sessions.listForProtocol({ cursor: "missing" })).toThrow(/invalid session cursor/);
   });
 
   it("seals a crashed prompt and an open permission, once", () => {

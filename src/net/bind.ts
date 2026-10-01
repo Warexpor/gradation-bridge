@@ -52,3 +52,8 @@ export function formatAdvertiseHost(host: string): string {
   if (host.includes(":") && !host.startsWith("[")) return `[${host}]`;
   return host;
 }
+
+/** WebSocket URL for a phone reconnect. IPv6 is bracketed so the port stays the port. */
+export function formatListenUrl(scheme: "ws" | "wss", host: string, port: number): string {
+  return `${scheme}://${formatAdvertiseHost(host)}:${port}/v1`;
+}

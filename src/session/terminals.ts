@@ -11,7 +11,7 @@ import { randomBytes } from "node:crypto";
 import { killProcessTree } from "../proc/tree.js";
 
 export const MAX_TERMINAL_OUTPUT_BYTES = 1024 * 1024;
-const MAX_PER_SESSION = 32;
+export const MAX_TERMINALS_PER_SESSION = 32;
 const MAX_TOTAL = 128;
 
 export interface TerminalOutputState {
@@ -82,8 +82,65 @@ export function isEnvName(name: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
 }
 
+/** Reject a terminal/create the bridge cannot start. Does not spawn anything. */
+export function assertTerminalCreateParams(opts: {
+  command: unknown;
+  args: unknown;
+  env?: unknown;
+  outputByteLimit?: unknown;
+}): { command: string; args: string[]; outputByteLimit: number } {
+  if (typeof opts.command !== "string" || !opts.command || opts.command.includes("\0")) {
+    throw Object.assign(new Error("command required"), { code: -32602 });
+  }
+  if (opts.args != null && !Array.isArray(opts.args)) {
+    throw Object.assign(new Error("terminal args must be an array"), { code: -32602 });
+  }
+  const args = (opts.args as unknown[] | undefined) ?? [];
+  if (args.some((arg) => typeof arg !== "string" || (arg as string).includes("\0"))) {
+    throw Object.assign(new Error("terminal args must be strings"), { code: -32602 });
+  }
+  if (opts.env != null && !Array.isArray(opts.env)) {
+    throw Object.assign(new Error("terminal env must be an array"), { code: -32602 });
+  }
+  return {
+    command: opts.command,
+    args: args as string[],
+    outputByteLimit: resolveOutputByteLimit(opts.outputByteLimit),
+  };
+}
+
 export class TerminalTable {
   private readonly terminals = new Map<string, TerminalRecord>();
+
+  /**
+   * True when a new command can start. Exited terminals do not count: they
+   * are dropped later, only if the retained-id cap is full.
+   */
+  hasRoom(sessionId: string): boolean {
+    let liveSession = 0;
+    let liveTotal = 0;
+    for (const term of this.terminals.values()) {
+      if (term.exited) continue;
+      liveTotal++;
+      if (term.sessionId === sessionId) liveSession++;
+    }
+    return liveSession < MAX_TERMINALS_PER_SESSION && liveTotal < MAX_TOTAL;
+  }
+
+  /**
+   * Throw when this session cannot start another command.
+   * Exited terminals are dropped only once the cap is hit, so a killed id
+   * stays readable until the session actually needs the slot.
+   */
+  assertRoom(sessionId: string): void {
+    if (!this.overCap(sessionId)) return;
+    this.dropExited(sessionId);
+    if (!this.overCap(sessionId)) return;
+    this.dropExited();
+    if (this.overCap(sessionId)) {
+      throw Object.assign(new Error("too many terminals"), { code: -32003 });
+    }
+  }
 
   create(opts: {
     sessionId: string;
@@ -93,22 +150,15 @@ export class TerminalTable {
     env: NodeJS.ProcessEnv;
     outputByteLimit?: unknown;
   }): { terminalId: string } {
-    if (!opts.command || opts.command.includes("\0")) {
-      throw Object.assign(new Error("command required"), { code: -32602 });
-    }
-    if (opts.args.some((arg) => typeof arg !== "string" || arg.includes("\0"))) {
-      throw Object.assign(new Error("terminal args must be strings"), { code: -32602 });
-    }
-    const limit = resolveOutputByteLimit(opts.outputByteLimit);
-    let forSession = 0;
-    for (const term of this.terminals.values()) {
-      if (term.sessionId === opts.sessionId) forSession++;
-    }
-    if (forSession >= MAX_PER_SESSION || this.terminals.size >= MAX_TOTAL) {
-      throw Object.assign(new Error("too many terminals"), { code: -32003 });
-    }
+    const checked = assertTerminalCreateParams({
+      command: opts.command,
+      args: opts.args,
+      outputByteLimit: opts.outputByteLimit,
+    });
+    this.assertRoom(opts.sessionId);
+    const limit = checked.outputByteLimit;
     const terminalId = randomBytes(8).toString("hex");
-    const child = spawn(opts.command, opts.args, {
+    const child = spawn(checked.command, checked.args, {
       cwd: opts.cwd,
       env: opts.env,
       stdio: ["ignore", "pipe", "pipe"],
@@ -166,15 +216,13 @@ export class TerminalTable {
 
   /** Stop the command and keep the id so a later `terminal/output` still works. */
   kill(sessionId: string, terminalId: string): void {
-    const term = this.terminals.get(terminalId);
-    if (!term || term.sessionId !== sessionId) return;
+    const term = this.require(sessionId, terminalId);
     killProcessTree(term.child, "SIGTERM");
   }
 
   /** Stop the command and invalidate the id. */
   release(sessionId: string, terminalId: string): void {
-    const term = this.terminals.get(terminalId);
-    if (!term || term.sessionId !== sessionId) return;
+    const term = this.require(sessionId, terminalId);
     this.terminals.delete(terminalId);
     killProcessTree(term.child, "SIGTERM");
   }
@@ -195,6 +243,22 @@ export class TerminalTable {
       if (sessionId && term.sessionId !== sessionId) continue;
       this.terminals.delete(id);
       killProcessTree(term.child, "SIGTERM");
+    }
+  }
+
+  private overCap(sessionId: string): boolean {
+    let forSession = 0;
+    for (const term of this.terminals.values()) {
+      if (term.sessionId === sessionId) forSession++;
+    }
+    return forSession >= MAX_TERMINALS_PER_SESSION || this.terminals.size >= MAX_TOTAL;
+  }
+
+  private dropExited(sessionId?: string): void {
+    for (const [id, term] of this.terminals) {
+      if (sessionId && term.sessionId !== sessionId) continue;
+      if (!term.exited) continue;
+      this.terminals.delete(id);
     }
   }
 

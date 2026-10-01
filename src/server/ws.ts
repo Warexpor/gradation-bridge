@@ -27,6 +27,7 @@ import {
 } from "../acp/cancel.js";
 import { ACP_PROTOCOL_VERSION, negotiateProtocolVersion } from "../acp/protocol.js";
 import { tlsDiagnostics } from "../auth/cert.js";
+import { formatListenUrl } from "../net/bind.js";
 import { parseRpcFrame, type JsonRpcMessage } from "./frames.js";
 import { SocketOutbox } from "./outbox.js";
 
@@ -281,7 +282,7 @@ export async function startBridgeServer(opts: WsServerOptions): Promise<BridgeSe
   const address = httpServer.address();
   const boundPort =
     typeof address === "object" && address ? address.port : opts.port;
-  const url = `${scheme}://${opts.host}:${boundPort}/v1`;
+  const url = formatListenUrl(scheme, opts.host, boundPort);
 
   return {
     url,
@@ -563,12 +564,7 @@ async function dispatch(
     case "bridge/diff": {
       const sessionId = String(p.sessionId ?? "");
       const filePath = String(p.path ?? "");
-      const rec = opts.sessions.get(sessionId);
-      if (!rec) {
-        const err = new Error(`unknown session: ${sessionId}`) as Error & { code?: number };
-        err.code = -32002;
-        throw err;
-      }
+      const rec = requireListedSession(opts.sessions, sessionId);
       // Ensure workspace still under allowed roots; resolve file via realpath.
       assertAllowedRealPath(rec.cwd, opts.config.allowedRoots);
       if (!filePath) {
@@ -581,12 +577,7 @@ async function dispatch(
     }
     case "bridge/gitStatus": {
       const sessionId = String(p.sessionId ?? "");
-      const rec = opts.sessions.get(sessionId);
-      if (!rec) {
-        const err = new Error(`unknown session: ${sessionId}`) as Error & { code?: number };
-        err.code = -32002;
-        throw err;
-      }
+      const rec = requireListedSession(opts.sessions, sessionId);
       const cwd = assertAllowedRealPath(rec.cwd, opts.config.allowedRoots);
       const status = await getGitStatus(cwd);
       if (status.branch) opts.sessions.noteBranch(sessionId, status.branch);
@@ -729,6 +720,17 @@ function cancelInflightPhoneCall(method: string, params: unknown, opts: WsServer
       cwd: typeof p.cwd === "string" ? p.cwd : typeof meta.cwd === "string" ? meta.cwd : undefined,
     });
   }
+}
+
+/** Sessions that `session/list` hides are unknown to the rest of the protocol. */
+function requireListedSession(sessions: SessionManager, sessionId: string) {
+  const rec = sessions.get(sessionId);
+  if (!rec || rec.status === "closed") {
+    const err = new Error(`unknown session: ${sessionId}`) as Error & { code?: number };
+    err.code = -32002;
+    throw err;
+  }
+  return rec;
 }
 
 function directoryList(raw: unknown): string[] | undefined {
