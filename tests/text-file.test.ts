@@ -23,6 +23,9 @@ describe("readTextFileWindow", () => {
     const file = join(root, "notes.txt");
     writeFileSync(file, "one\ntwo\nthree\n");
     expect(readTextFileWindow(file, { line: 2, limit: 1 })).toBe("two");
+    const link = join(root, "notes-link");
+    symlinkSync(file, link);
+    expect(() => readTextFileWindow(link)).toThrow(/symlink/);
     expect(readTextFileWindow(file)).toBe("one\ntwo\nthree\n");
     expect(() => readTextFileWindow(root)).toThrow(/not a file/);
 

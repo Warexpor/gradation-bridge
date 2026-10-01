@@ -16,6 +16,8 @@ export interface HarnessInfo {
   docs?: string;
   authHint?: string;
   notice?: string;
+  /** Absolute file that will be spawned, when it is already on PATH. */
+  commandPath?: string;
 }
 
 const ALIASES: Record<string, string> = {
@@ -36,6 +38,7 @@ export function toPublicHarness(launch: HarnessLaunch): HarnessInfo {
     ...(launch.docs ? { docs: launch.docs } : {}),
     ...(launch.authHint ? { authHint: launch.authHint } : {}),
     ...(launch.notice ? { notice: launch.notice } : {}),
+    ...(launch.commandPath ? { commandPath: launch.commandPath } : {}),
   };
 }
 

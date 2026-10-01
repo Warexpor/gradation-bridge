@@ -3,7 +3,7 @@
  * A harness must not be able to pull an unbounded file into the bridge.
  */
 
-import { closeSync, constants, existsSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, lstatSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 
 export const MAX_TEXT_FILE_BYTES = 8 * 1024 * 1024;
 /** How far a line/limit read may scan into a file that is over the full-read cap. */
@@ -19,11 +19,23 @@ export function assertWritableContent(content: string): void {
   }
 }
 
+function openReadNoFollow(path: string): number {
+  try {
+    return openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ELOOP") {
+      throw coded("refusing to read through a symlink", -32003);
+    }
+    throw e;
+  }
+}
+
 export function readTextFileWindow(
   path: string,
   opts?: { line?: number; limit?: number },
 ): string {
-  const st = statSync(path);
+  const st = lstatSync(path);
+  if (st.isSymbolicLink()) throw coded("refusing to read through a symlink", -32003);
   if (!st.isFile()) throw coded("path is not a file");
   const startLine = opts?.line != null ? Math.max(1, Math.floor(opts.line)) : undefined;
   const limit = opts?.limit != null ? Math.max(0, Math.floor(opts.limit)) : undefined;
@@ -33,10 +45,10 @@ export function readTextFileWindow(
     if (st.size > MAX_TEXT_FILE_BYTES) {
       throw coded(`file exceeds ${MAX_TEXT_FILE_BYTES} byte read limit`);
     }
-    return readFileSync(path, "utf8");
+    return readFileNoFollow(path);
   }
   if (st.size <= MAX_TEXT_FILE_BYTES) {
-    return sliceLines(readFileSync(path, "utf8"), startLine ?? 1, limit, false);
+    return sliceLines(readFileNoFollow(path), startLine ?? 1, limit, false);
   }
   const prefixOnly = st.size > MAX_TEXT_SCAN_BYTES;
   const content = readPrefix(path, Math.min(Number(st.size), MAX_TEXT_SCAN_BYTES));
@@ -53,8 +65,17 @@ function sliceLines(content: string, startLine: number, limit: number | undefine
   return lines.slice(start, end).join("\n");
 }
 
+function readFileNoFollow(path: string): string {
+  const fd = openReadNoFollow(path);
+  try {
+    return readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function readPrefix(path: string, maxBytes: number): string {
-  const fd = openSync(path, "r");
+  const fd = openReadNoFollow(path);
   try {
     const buf = Buffer.alloc(maxBytes);
     const n = readSync(fd, buf, 0, maxBytes, 0);

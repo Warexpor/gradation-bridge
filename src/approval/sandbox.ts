@@ -1,5 +1,6 @@
 import { existsSync, realpathSync } from "node:fs";
 import { resolve, normalize, sep, isAbsolute, dirname, basename, join } from "node:path";
+import { configDir, dataDir } from "../config/load.js";
 
 /**
  * Workspace sandboxing: refuse paths outside allowed roots.
@@ -106,7 +107,39 @@ export function assertAllowedRealPath(
   if (!ok) {
     throw new SandboxError(`path outside allowed workspace roots: ${target}`);
   }
+  assertNotBridgePrivate(target);
   return target;
+}
+
+/**
+ * Config and data directories hold the pairing token, TLS key, and session
+ * logs. Default `allowedRoots` is the home directory, which contains both,
+ * so a harness `fs/read_text_file` would otherwise copy them out with no prompt.
+ */
+export function bridgePrivateRoots(): string[] {
+  const found: string[] = [];
+  const add = (path: string): void => {
+    const normalized = normalize(path);
+    if (!found.includes(normalized)) found.push(normalized);
+  };
+  for (const root of [configDir(), dataDir()]) {
+    add(root);
+    if (!existsSync(root)) continue;
+    try {
+      add(realpathSync(root));
+    } catch {
+      // Keep the lexical path when the directory cannot be resolved.
+    }
+  }
+  return found;
+}
+
+function assertNotBridgePrivate(target: string): void {
+  for (const root of bridgePrivateRoots()) {
+    if (isInsideRoot(target, root)) {
+      throw new SandboxError("path is reserved for the bridge");
+    }
+  }
 }
 
 /**

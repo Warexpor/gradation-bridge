@@ -26,6 +26,7 @@ import {
 import { assertSupportedPrompt, firstPromptText } from "../acp/prompt.js";
 import { assertNotDirectory, assertWritableContent, readTextFileWindow, writeTextNoFollow } from "../acp/text-file.js";
 import {
+  commandArgvFromToolCall,
   optionKindById,
   pathFromToolCall,
   pickOptionId,
@@ -271,10 +272,12 @@ export class SessionManager {
 
   setPermissionMode(sessionId: string, mode: PermissionMode): void {
     const rec = this.requireSession(sessionId);
+    this.assertLive(rec);
     if (rec.permissionMode !== mode) {
       rec.grants = [];
       rec.permissionMode = mode;
       this.permissionEpoch.set(sessionId, (this.permissionEpoch.get(sessionId) ?? 0) + 1);
+      this.opts.cancelPhoneRequests?.({ sessionId, method: "session/request_permission" });
     }
     rec.updatedAt = new Date().toISOString();
     this.warnFullAuto(mode);
@@ -288,6 +291,7 @@ export class SessionManager {
    */
   async applyMode(sessionId: string, modeId: string): Promise<Record<string, unknown>> {
     const rec = this.requireSession(sessionId);
+    this.assertLive(rec);
     const isPermission = isPermissionMode(modeId);
     if (isPermission) this.setPermissionMode(sessionId, modeId);
     let forwarded = false;
@@ -609,6 +613,7 @@ export class SessionManager {
 
   async prompt(sessionId: string, params: unknown): Promise<unknown> {
     const rec = this.requireSession(sessionId);
+    this.assertLive(rec);
     if (rec.promptInFlight) {
       throw new BridgeError(-32005, "prompt already in progress", { sessionId });
     }
@@ -677,7 +682,7 @@ export class SessionManager {
     },
   ): Promise<Record<string, unknown>> {
     const rec = this.sessions.get(sessionId);
-    if (!rec || rec.status === "closed") {
+    if (!rec || rec.status === "closed" || rec.closing) {
       throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
     }
     const rawAfter = opts.afterSeq ?? 0;
@@ -702,7 +707,7 @@ export class SessionManager {
       const gate = this.promptGates.get(sessionId);
       if (gate) await gate;
     }
-    if ((rec.status as SessionStatus) === "closed") {
+    if ((rec.status as SessionStatus) === "closed" || rec.closing) {
       throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
     }
 
@@ -715,6 +720,7 @@ export class SessionManager {
         agentResult = await this.respawnAgent(rec, "load");
         agentAlive = Boolean(rec.client?.running);
       } catch (e) {
+        if (e instanceof BridgeError && e.code === -32002) throw e;
         agentAlive = false;
         warning = e instanceof Error ? e.message : String(e);
         log("warn", `session/load ${sessionId}: ${warning}`);
@@ -756,7 +762,7 @@ export class SessionManager {
     opts?: { cwd?: string; mcpServers?: unknown[]; additionalDirectories?: string[] },
   ): Promise<Record<string, unknown>> {
     const rec = this.sessions.get(sessionId);
-    if (!rec || rec.status === "closed") {
+    if (!rec || rec.status === "closed" || rec.closing) {
       throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
     }
     this.assertSessionWorkspace(rec);
@@ -767,7 +773,7 @@ export class SessionManager {
       const gate = this.promptGates.get(sessionId);
       if (gate) await gate;
     }
-    if ((rec.status as SessionStatus) === "closed") {
+    if ((rec.status as SessionStatus) === "closed" || rec.closing) {
       throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
     }
     if (rec.promptInFlight) {
@@ -782,6 +788,7 @@ export class SessionManager {
         agentResult = await this.attachExisting(rec, "resume");
       }
     } catch (e) {
+      if (e instanceof BridgeError && e.code === -32002) throw e;
       warning = e instanceof Error ? e.message : String(e);
       log("warn", `session/resume ${sessionId}: ${warning}`);
     }
@@ -800,6 +807,7 @@ export class SessionManager {
 
   async setConfigOption(sessionId: string, params: Record<string, unknown>): Promise<unknown> {
     const rec = this.requireSession(sessionId);
+    this.assertLive(rec);
     this.assertSessionWorkspace(rec);
     const client = rec.client;
     if (!client?.running) {
@@ -861,6 +869,7 @@ export class SessionManager {
 
   private async authenticateSession(sessionId: string, methodId: string): Promise<Record<string, unknown>> {
     const rec = this.requireSession(sessionId);
+    this.assertLive(rec);
     const client = rec.client;
     if (!client?.running) {
       throw new BridgeError(-32004, `session agent not running: ${sessionId}`, { sessionId });
@@ -1024,6 +1033,7 @@ export class SessionManager {
   }): Promise<Record<string, never>> {
     if (input.sessionId) {
       const rec = this.requireSession(input.sessionId);
+      this.assertLive(rec);
       if (!rec.client?.running) {
         throw new BridgeError(-32004, `session agent not running: ${input.sessionId}`, {
           sessionId: input.sessionId,
@@ -1063,7 +1073,12 @@ export class SessionManager {
     return undefined;
   }
 
-  private assertMutatingTool(rec: SessionRecord, family: GrantFamily, path?: string): void {
+  private assertMutatingTool(
+    rec: SessionRecord,
+    family: GrantFamily,
+    path?: string,
+    argv?: string[],
+  ): void {
     if (rec.cancelRequested || rec.closing || rec.status === "closed") {
       throw new BridgeError(-32003, "session cancelled", {
         sessionId: rec.sessionId,
@@ -1088,7 +1103,7 @@ export class SessionManager {
         kind: family,
       });
     }
-    if (decision.action === "ask" && !consumeGrant(rec.grants, family, path)) {
+    if (decision.action === "ask" && !consumeGrant(rec.grants, family, path, argv)) {
       const message =
         family === "write"
           ? "write requires approval before the agent can change files"
@@ -1184,14 +1199,29 @@ export class SessionManager {
   }
 
   private async respawnAgentOnce(rec: SessionRecord, mode: "load" | "resume"): Promise<unknown> {
+    if (this.sessionGone(rec)) {
+      throw new BridgeError(-32002, `unknown session: ${rec.sessionId}`, { sessionId: rec.sessionId });
+    }
     const previous = rec.client;
     const client = this.openClient(rec);
     previous?.kill();
     try {
       client.start();
+      if (this.sessionGone(rec)) {
+        this.dropRespawn(rec, client);
+        throw new BridgeError(-32002, `unknown session: ${rec.sessionId}`, { sessionId: rec.sessionId });
+      }
       const initialized = await client.initialize(this.agentClientInfo());
+      if (this.sessionGone(rec)) {
+        this.dropRespawn(rec, client);
+        throw new BridgeError(-32002, `unknown session: ${rec.sessionId}`, { sessionId: rec.sessionId });
+      }
       this.applyInit(rec, readAgentInitialize(initialized));
       const result = await this.attachExisting(rec, mode);
+      if (this.sessionGone(rec)) {
+        this.dropRespawn(rec, client);
+        throw new BridgeError(-32002, `unknown session: ${rec.sessionId}`, { sessionId: rec.sessionId });
+      }
       if (rec.status === "error" || rec.status === "idle") {
         this.setStatus(rec.sessionId, "idle");
       }
@@ -1353,7 +1383,7 @@ export class SessionManager {
     }
 
     const resumeAfterAsk = (): void => {
-      if (rec.status !== "needs_approval") return;
+      if (rec.closing || rec.status !== "needs_approval") return;
       this.setStatus(rec.sessionId, rec.promptInFlight ? "running" : "idle");
     };
 
@@ -1378,6 +1408,7 @@ export class SessionManager {
           optionKind,
           grantFamilyForKind(kind),
           resolveGrantPath(path, rec.cwd),
+          commandArgvFromToolCall(toolCall),
         );
         if (grant) {
           rec.grants.push(grant);
@@ -1471,7 +1502,7 @@ export class SessionManager {
     if (!this.terminals.hasRoom(rec.sessionId)) {
       throw Object.assign(new Error("too many terminals"), { code: -32003 });
     }
-    this.assertMutatingTool(rec, "exec");
+    this.assertMutatingTool(rec, "exec", undefined, [checked.command, ...checked.args]);
     return this.terminals.create({
       sessionId: rec.sessionId,
       command: executable,
@@ -1696,6 +1727,23 @@ export class SessionManager {
     const text = firstPromptText(params).slice(0, 80);
     if (!text) return;
     rec.title = text;
+  }
+
+  /** A close that has started, or already finished, must not accept new work or respawn. */
+  private assertLive(rec: SessionRecord): void {
+    if (this.sessionGone(rec)) {
+      throw new BridgeError(-32002, `unknown session: ${rec.sessionId}`, { sessionId: rec.sessionId });
+    }
+  }
+
+  private sessionGone(rec: SessionRecord): boolean {
+    return rec.closing || rec.status === "closed" || !this.sessions.has(rec.sessionId);
+  }
+
+  private dropRespawn(rec: SessionRecord, client: AcpStdioClient): void {
+    rec.clientGeneration += 1;
+    client.kill();
+    if (rec.client === client) rec.client = null;
   }
 
   private assertSessionWorkspace(rec: SessionRecord): void {

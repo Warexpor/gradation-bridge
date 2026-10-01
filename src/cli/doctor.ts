@@ -57,6 +57,7 @@ export function formatDoctorReport(config: BridgeConfig): string {
     "- In GradatiON, confirm the cert fingerprint matches this machine before trusting it.",
     "- Plan mode rejects writes and terminal commands on the bridge, not only in the agent.",
     "- Harness env PATH cannot replace the binary. The command is resolved on this process's PATH, then that file is started.",
+    "- The harness cannot read or write the config or data directory, even when an allowed root contains them. An approved terminal command can still read files this user can read.",
     "",
     `permission default: ${config.defaultPermissionMode}`,
     `allowed roots: ${config.allowedRoots.length ? config.allowedRoots.join(", ") : "(none — every path is refused)"}`,
@@ -78,6 +79,7 @@ export function formatDoctorReport(config: BridgeConfig): string {
     if (h.readiness === "on-demand" && launcherMissing) {
       lines.push("    notice: the launcher is not on PATH, so this on-demand harness cannot start");
     }
+    if (h.commandPath) lines.push(`    bin: ${h.commandPath}`);
     if (h.readiness !== "ready") lines.push(`    install: ${h.install}`);
     if (h.authHint) lines.push(`    auth: ${h.authHint}`);
   }

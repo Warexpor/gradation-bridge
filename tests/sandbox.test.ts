@@ -127,4 +127,37 @@ describe("sandbox realpath / symlink hardening", () => {
     const target = assertAllowedRealPath(join(allowed, "new-file.txt"), [allowed]);
     expect(target).toBe(join(allowed, "new-file.txt"));
   });
+
+  it("refuses the bridge config and data directories inside an allowed root", () => {
+    tmp = mkdtempSync(join(tmpdir(), "gb-sb-priv-"));
+    const prevConfig = process.env.XDG_CONFIG_HOME;
+    const prevData = process.env.XDG_DATA_HOME;
+    process.env.XDG_CONFIG_HOME = join(tmp, "config");
+    process.env.XDG_DATA_HOME = join(tmp, "data");
+    try {
+      const config = join(tmp, "config", "gradation-bridge");
+      const data = join(tmp, "data", "gradation-bridge");
+      mkdirSync(config, { recursive: true });
+      mkdirSync(join(data, "certs"), { recursive: true });
+      writeFileSync(join(config, "devices.json"), "{}\n");
+      writeFileSync(join(data, "certs", "server.key"), "key\n");
+      const project = join(tmp, "project");
+      mkdirSync(project);
+      symlinkSync(config, join(project, "bridge-config"));
+
+      expect(assertAllowedRealPath(project, [tmp])).toBe(project);
+      expect(() => assertAllowedRealPath(join(config, "devices.json"), [tmp])).toThrow(SandboxError);
+      expect(() => assertAllowedRealPath(join(data, "certs", "server.key"), [tmp])).toThrow(
+        SandboxError,
+      );
+      expect(() =>
+        assertAllowedRealPath(join(project, "bridge-config", "devices.json"), [tmp]),
+      ).toThrow(SandboxError);
+    } finally {
+      if (prevConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prevConfig;
+      if (prevData === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevData;
+    }
+  });
 });

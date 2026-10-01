@@ -9,6 +9,8 @@
  * Env:
  *   FAKE_ACP_PERMISSION=1       — request permission mid-prompt
  *   FAKE_ACP_PERMISSION_KIND    — tool kind for that request (default edit)
+ *   FAKE_ACP_PERMISSION_COMMAND — rawInput.command on that permission request
+ *   FAKE_ACP_CLOSE_HOLD_MS=N    — delay session/close so a racing prompt can be refused
  *   FAKE_ACP_FS_WRITE=1         — call fs/write_text_file during the prompt
  *   FAKE_ACP_TERMINAL=1         — call terminal/create during the prompt
  *   FAKE_ACP_TERMINAL_MISS=1    — try a missing command first; the grant must survive
@@ -52,6 +54,7 @@ const sessions = new Map<string, { cwd: string; cancelled: boolean }>();
 let nextSession = 1;
 const wantPermission = process.env.FAKE_ACP_PERMISSION === "1";
 const permissionKind = process.env.FAKE_ACP_PERMISSION_KIND || "edit";
+const permissionCommand = process.env.FAKE_ACP_PERMISSION_COMMAND;
 const wantWrite = process.env.FAKE_ACP_FS_WRITE === "1";
 const wantTerminal = process.env.FAKE_ACP_TERMINAL === "1";
 const wantAuth = process.env.FAKE_ACP_AUTH === "1" || process.env.FAKE_ACP_AUTH_REQUIRED === "1";
@@ -224,6 +227,7 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
           kind: permissionKind,
           locations:
             permissionKind === "execute" ? [] : [{ path: join(session.cwd, "README.md") }],
+          ...(permissionCommand ? { rawInput: { command: permissionCommand } } : {}),
         },
         options: [
           { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
@@ -603,6 +607,8 @@ async function dispatch(msg: JsonRpcRequest): Promise<void> {
       return;
     }
     case "session/close": {
+      const hold = Number(process.env.FAKE_ACP_CLOSE_HOLD_MS ?? "0") || 0;
+      if (hold > 0) await sleep(hold);
       sessions.delete(String(params.sessionId ?? ""));
       respond(id, {});
       return;

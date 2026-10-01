@@ -25,15 +25,43 @@ export interface GitDiffResult {
   unified: string;
 }
 
+/**
+ * Repo-local config can name a program (`core.fsmonitor`, `diff.external`).
+ * Status and diff are phone-triggered and do not go through approval, so those
+ * hooks must not run. `-c` overrides the repo config for this invocation.
+ * `diff.external` is disabled with `--no-ext-diff` on the diff command: setting
+ * the key to an empty string suppresses the built-in diff as well.
+ */
+const GIT_GUARD = [
+  "-c",
+  "core.fsmonitor=",
+  "-c",
+  "core.hooksPath=",
+  "-c",
+  "core.sshCommand=",
+  "-c",
+  "core.pager=",
+];
+
+export function guardedGitArgs(args: string[]): string[] {
+  return [...GIT_GUARD, ...args];
+}
+
 async function git(
   cwd: string,
   args: string[],
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   try {
-    const { stdout, stderr } = await execFileAsync("git", args, {
+    const { stdout, stderr } = await execFileAsync("git", guardedGitArgs(args), {
       cwd,
       maxBuffer: 20 * 1024 * 1024,
       encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
+      },
     });
     return { stdout: String(stdout), stderr: String(stderr), code: 0 };
   } catch (e) {
@@ -120,8 +148,8 @@ export async function getGitDiff(cwd: string, filePath: string): Promise<GitDiff
   }
   const args =
     rel && !rel.startsWith("..")
-      ? ["diff", "HEAD", "--", rel]
-      : ["diff", "HEAD"];
+      ? ["diff", "--no-ext-diff", "HEAD", "--", rel]
+      : ["diff", "--no-ext-diff", "HEAD"];
   const { stdout, code } = await git(cwd, args);
   if (code !== 0 && !stdout) return { unified: "" };
   return { unified: stdout };

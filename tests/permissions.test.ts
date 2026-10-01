@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  commandArgvFromToolCall,
   optionKindById,
   pathFromToolCall,
   pickOptionId,
@@ -12,6 +13,17 @@ describe("permissions helpers", () => {
     expect(policyKindFromToolCall({ kind: "move" })).toBe("write");
     expect(policyKindFromToolCall({ kind: "edit" })).toBe("edit");
     expect(policyKindFromToolCall({ kind: "execute" })).toBe("execute");
+  });
+
+  it("extracts a command argv without inventing one", () => {
+    expect(commandArgvFromToolCall({ rawInput: { command: "npm", args: ["test"] } })).toEqual([
+      "npm",
+      "test",
+    ]);
+    expect(commandArgvFromToolCall({ rawInput: { command: "npm test" } })).toEqual(["npm test"]);
+    expect(commandArgvFromToolCall({ rawInput: { command: ["npm", "test"] } })).toEqual(["npm", "test"]);
+    expect(commandArgvFromToolCall({ rawInput: { command: "npm", args: "test" } })).toBeUndefined();
+    expect(commandArgvFromToolCall({ title: "Run command" })).toBeUndefined();
   });
 
   it("extracts path from locations or rawInput", () => {
