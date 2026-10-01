@@ -3,7 +3,7 @@
  * Callers must already ensure `cwd` (and any file path) lie under allowedRoots.
  */
 
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { relative, isAbsolute } from "node:path";
 
@@ -26,11 +26,17 @@ export interface GitDiffResult {
 }
 
 /**
- * Repo-local config can name a program (`core.fsmonitor`, `diff.external`).
- * Status and diff are phone-triggered and do not go through approval, so those
- * hooks must not run. `-c` overrides the repo config for this invocation.
- * `diff.external` is disabled with `--no-ext-diff` on the diff command: setting
- * the key to an empty string suppresses the built-in diff as well.
+ * Repo-local config can name a program (`core.fsmonitor`, `diff.external`,
+ * `diff.*.textconv`, `filter.*.clean`). Status and diff are phone-triggered
+ * and do not go through approval, so those helpers must not run.
+ * `-c` overrides the repo config for this invocation.
+ * `diff.external` is disabled with `--no-ext-diff`: setting that key to an
+ * empty string suppresses the built-in diff as well. Textconv is disabled
+ * with `--no-textconv` (it still runs under `--no-ext-diff` alone).
+ * Clean/smudge/process filters are blanked per key. A filter name that cannot
+ * be passed safely as `-c` fails the whole command closed.
+ * `alias.status` and `alias.diff` are blanked so a shell alias cannot replace
+ * the builtin. `--no-pager` skips `pager.diff` and `core.pager`.
  */
 const GIT_GUARD = [
   "-c",
@@ -41,27 +47,110 @@ const GIT_GUARD = [
   "core.sshCommand=",
   "-c",
   "core.pager=",
+  "-c",
+  "alias.status=",
+  "-c",
+  "alias.diff=",
 ];
 
-export function guardedGitArgs(args: string[]): string[] {
-  return [...GIT_GUARD, ...args];
+/** `filter.<name>.(clean|smudge|process)` with a token we can pass to `-c`. */
+const SAFE_FILTER_KEY = /^filter\.[A-Za-z0-9][A-Za-z0-9.-]*\.(clean|smudge|process)$/;
+const FILTER_DRIVER = /^filter\..+\.(clean|smudge|process)$/;
+
+export function partitionFilterKeys(keys: string[]): { disable: string[]; unsafe: boolean } {
+  const disable: string[] = [];
+  const seen = new Set<string>();
+  let unsafe = false;
+  for (const raw of keys) {
+    const key = raw.trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    if (!FILTER_DRIVER.test(key)) continue;
+    if (!SAFE_FILTER_KEY.test(key)) {
+      unsafe = true;
+      continue;
+    }
+    disable.push(key);
+  }
+  return { disable, unsafe };
+}
+
+export function guardedGitArgs(args: string[], disabledKeys: string[] = []): string[] {
+  const disabled: string[] = [];
+  for (const key of disabledKeys) {
+    disabled.push("-c", `${key}=`);
+  }
+  return ["--no-pager", ...GIT_GUARD, ...disabled, ...args];
+}
+
+const STRIPPED_GIT_ENV = new Set([
+  "GIT_EXTERNAL_DIFF",
+  "GIT_PAGER",
+  "PAGER",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_COUNT",
+  "GIT_SSH",
+  "GIT_SSH_COMMAND",
+]);
+
+/** Child env for git. Drops variables that can name a program or inject config. */
+export function gitChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(base)) {
+    if (value === undefined) continue;
+    if (STRIPPED_GIT_ENV.has(key)) continue;
+    if (key.startsWith("GIT_CONFIG_KEY_") || key.startsWith("GIT_CONFIG_VALUE_")) continue;
+    env[key] = value;
+  }
+  env.GIT_TERMINAL_PROMPT = "0";
+  env.GIT_CONFIG_NOSYSTEM = "1";
+  env.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
+  env.GIT_PAGER = "";
+  return env;
+}
+
+function localFilterKeys(cwd: string): { disable: string[]; unsafe: boolean } {
+  let text = "";
+  try {
+    text = execFileSync(
+      "git",
+      ["--no-pager", "-c", "core.fsmonitor=", "-c", "alias.config=", "config", "--local", "--name-only", "--list"],
+      {
+        cwd,
+        encoding: "utf8",
+        timeout: 5_000,
+        maxBuffer: 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: gitChildEnv(),
+      },
+    );
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    const stderr = (err as { stderr?: unknown }).stderr;
+    const message = typeof stderr === "string" ? stderr : "";
+    if (code === "ENOENT" || /not a git repository/i.test(message)) {
+      return { disable: [], unsafe: false };
+    }
+    // A failed listing must not fall through to a diff that still runs filters.
+    return { disable: [], unsafe: true };
+  }
+  return partitionFilterKeys(text.split("\n"));
 }
 
 async function git(
   cwd: string,
   args: string[],
 ): Promise<{ stdout: string; stderr: string; code: number }> {
+  const filters = localFilterKeys(cwd);
+  if (filters.unsafe) {
+    return { stdout: "", stderr: "", code: 1 };
+  }
   try {
-    const { stdout, stderr } = await execFileAsync("git", guardedGitArgs(args), {
+    const { stdout, stderr } = await execFileAsync("git", guardedGitArgs(args, filters.disable), {
       cwd,
       maxBuffer: 20 * 1024 * 1024,
       encoding: "utf8",
-      env: {
-        ...process.env,
-        GIT_TERMINAL_PROMPT: "0",
-        GIT_CONFIG_NOSYSTEM: "1",
-        GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
-      },
+      env: gitChildEnv(),
     });
     return { stdout: String(stdout), stderr: String(stderr), code: 0 };
   } catch (e) {
@@ -148,8 +237,8 @@ export async function getGitDiff(cwd: string, filePath: string): Promise<GitDiff
   }
   const args =
     rel && !rel.startsWith("..")
-      ? ["diff", "--no-ext-diff", "HEAD", "--", rel]
-      : ["diff", "--no-ext-diff", "HEAD"];
+      ? ["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--", rel]
+      : ["diff", "--no-ext-diff", "--no-textconv", "HEAD"];
   const { stdout, code } = await git(cwd, args);
   if (code !== 0 && !stdout) return { unified: "" };
   return { unified: stdout };

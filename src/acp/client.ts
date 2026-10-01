@@ -357,7 +357,12 @@ export class AcpStdioClient {
     }
   }
 
-  /** Send a JSON-RPC request; returns a promise for the result. */
+  /**
+   * Send a JSON-RPC request; returns a promise for the result.
+   * On timeout the pending entry is dropped and the harness is told to stop,
+   * so a late result cannot complete this call or keep the turn running
+   * under the next prompt.
+   */
   request(method: string, params?: unknown, timeoutMs = 600_000): Promise<unknown> {
     if (!this.child?.stdin || this.settled) {
       return Promise.reject(
@@ -373,7 +378,9 @@ export class AcpStdioClient {
       const timer =
         timeoutMs > 0
           ? setTimeout(() => {
+              if (!this.pending.has(id)) return;
               this.pending.delete(id);
+              this.cancelTimedOutRequest(id, method, params);
               forget();
               reject(new Error(`ACP request timeout: ${method}`));
             }, timeoutMs)
@@ -392,6 +399,18 @@ export class AcpStdioClient {
       });
       this.write({ jsonrpc: "2.0", id, method, params });
     });
+  }
+
+  /**
+   * The harness must stop the timed-out call. `$/cancel_request` targets that
+   * JSON-RPC id. `session/prompt` also gets `session/cancel` so the turn ends
+   * before another prompt is accepted.
+   */
+  private cancelTimedOutRequest(id: number | string, method: string, params: unknown): void {
+    this.notify("$/cancel_request", { requestId: id });
+    if (method !== "session/prompt") return;
+    const sessionId = sessionIdFromParams(params);
+    if (sessionId) this.notify("session/cancel", { sessionId });
   }
 
   notify(method: string, params?: unknown): void {
@@ -544,6 +563,12 @@ function capabilitiesForAgent(phone: Record<string, unknown>): Record<string, un
 function extraRoots(dirs: string[] | undefined): { additionalDirectories?: string[] } {
   if (!dirs || dirs.length === 0) return {};
   return { additionalDirectories: dirs };
+}
+
+function sessionIdFromParams(params: unknown): string | undefined {
+  if (!params || typeof params !== "object" || Array.isArray(params)) return undefined;
+  const sessionId = (params as { sessionId?: unknown }).sessionId;
+  return typeof sessionId === "string" && sessionId ? sessionId : undefined;
 }
 
 export function isMethodNotFound(err: unknown): boolean {
