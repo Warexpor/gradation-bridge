@@ -159,6 +159,13 @@ describe("elicitation relay checks", () => {
       "https://169.254.169.254/latest",
       "https://metadata.google.internal/computeMetadata/v1/",
       "http://10.1.2.3/hook",
+      "http://[0:0:0:0:0:ffff:127.0.0.1]/login",
+      "http://[64:ff9b::7f00:1]/login",
+      "http://[64:ff9b::127.0.0.1]/login",
+      "http://[64:ff9b::a9fe:a9fe]/latest",
+      "http://[64:ff9b:1::7f00:1]/login",
+      "http://[64:ff9b:1:2::a00:1]/hook",
+      "http://[2002:7f00:1::]/login",
     ]) {
       expect(() =>
         relayElicitationParams(
@@ -184,6 +191,11 @@ describe("elicitation relay checks", () => {
       elicitationId: "e1",
       url: "https://example.com/connect",
     });
+    for (const url of ["http://[64:ff9b::808:808]/dns", "http://[2002:808:808::]/dns"]) {
+      expect(
+        relayElicitationParams({ sessionId: "s", mode: "url", elicitationId: "e1", url }, both).url,
+      ).toBe(url);
+    }
     expect(
       relayElicitationParams(
         { sessionId: "s", mode: "_vendor", message: "extension" },

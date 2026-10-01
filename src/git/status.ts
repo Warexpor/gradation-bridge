@@ -40,6 +40,9 @@ export interface GitDiffResult {
  * `-c` is inherited by submodule git processes. A parent `diff.submodule=diff`
  * otherwise runs the submodule's `diff.external` even when the parent command
  * passed `--no-ext-diff`. Recurse and submodule summary stay off.
+ * `include.path` is not visible in `git config --local --list`. Filter keys
+ * from an included file still run on status and diff, so the listing passes
+ * `--includes` and those keys are blanked the same way.
  */
 const GIT_GUARD = [
   "-c",
@@ -109,10 +112,22 @@ const STRIPPED_GIT_ENV = new Set([
   "GIT_EXTERNAL_DIFF",
   "GIT_PAGER",
   "PAGER",
+  "EDITOR",
+  "VISUAL",
+  "GIT_EDITOR",
+  "GIT_SEQUENCE_EDITOR",
   "GIT_CONFIG_PARAMETERS",
   "GIT_CONFIG_COUNT",
   "GIT_SSH",
   "GIT_SSH_COMMAND",
+  "GIT_EXEC_PATH",
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_COMMON_DIR",
+  "GIT_NAMESPACE",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
 ]);
 
 /** Child env for git. Drops variables that can name a program or inject config. */
@@ -179,7 +194,18 @@ async function localFilterKeys(
   try {
     const { stdout } = await execFileAsync(
       "git",
-      ["--no-pager", "-c", "core.fsmonitor=", "-c", "alias.config=", "config", "--local", "--name-only", "--list"],
+      [
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=",
+        "-c",
+        "alias.config=",
+        "config",
+        "--local",
+        "--includes",
+        "--name-only",
+        "--list",
+      ],
       {
         cwd,
         encoding: "utf8",

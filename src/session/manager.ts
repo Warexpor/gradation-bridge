@@ -295,15 +295,20 @@ export class SessionManager {
   setPermissionMode(sessionId: string, mode: PermissionMode): void {
     const rec = this.requireSession(sessionId);
     this.assertLive(rec);
+    let changed = false;
     if (rec.permissionMode !== mode) {
       rec.grants = [];
       rec.permissionMode = mode;
       this.permissionEpoch.set(sessionId, (this.permissionEpoch.get(sessionId) ?? 0) + 1);
       this.opts.cancelPhoneRequests?.({ sessionId, method: "session/request_permission" });
+      changed = true;
     }
     rec.updatedAt = new Date().toISOString();
     this.warnFullAuto(mode);
     log("info", `permission mode ${mode} session=${sessionId}`);
+    // Mode and the cleared grants have to reach meta.json before we return.
+    // A crash otherwise reloads the previous mode and any allow_once still on disk.
+    if (changed) this.persist(rec);
   }
 
   /**
@@ -1144,17 +1149,23 @@ export class SessionManager {
         kind: family,
       });
     }
-    if (decision.action === "ask" && !consumeGrant(rec.grants, family, path, argv)) {
-      const message =
-        family === "write"
-          ? "write requires approval before the agent can change files"
-          : "command requires approval before the agent can run a terminal";
-      log("warn", `blocked ${family} session=${rec.sessionId}: ${message}`);
-      throw new BridgeError(-32003, message, {
-        sessionId: rec.sessionId,
-        permissionMode: rec.permissionMode,
-        kind: family,
-      });
+    if (decision.action === "ask") {
+      const before = rec.grants.length;
+      if (!consumeGrant(rec.grants, family, path, argv)) {
+        const message =
+          family === "write"
+            ? "write requires approval before the agent can change files"
+            : "command requires approval before the agent can run a terminal";
+        log("warn", `blocked ${family} session=${rec.sessionId}: ${message}`);
+        throw new BridgeError(-32003, message, {
+          sessionId: rec.sessionId,
+          permissionMode: rec.permissionMode,
+          kind: family,
+        });
+      }
+      // Drop the spent allow_once before the tool runs. The grant is already
+      // in meta.json from the approval; a crash mid-prompt would reload it.
+      if (rec.grants.length !== before) this.persist(rec);
     }
   }
 
