@@ -38,4 +38,26 @@ describe("approval grants", () => {
     expect(consumeGrant(dir, "write", "/tmp/proj/src/a.ts")).toBe(true);
     expect(consumeGrant(dir, "write", "/tmp/proj")).toBe(true);
   });
+
+  it("limits an allow_once exec grant to the approved command", () => {
+    expect(grantFromOption("allow_once", "exec", undefined, ["npm", "test"])?.argv).toEqual([
+      "npm",
+      "test",
+    ]);
+    expect(grantFromOption("allow_always", "exec", undefined, ["npm", "test"])?.argv).toBeUndefined();
+    expect(grantFromOption("allow_once", "write", "/tmp/a", ["npm"])?.argv).toBeUndefined();
+
+    const once: ToolGrant[] = [{ family: "exec", argv: ["npm", "test"], always: false }];
+    expect(consumeGrant(once, "exec", undefined, ["curl", "evil.example"])).toBe(false);
+    expect(once).toHaveLength(1);
+    expect(consumeGrant(once, "exec", undefined, ["/usr/bin/npm", "test"])).toBe(true);
+    expect(once).toHaveLength(0);
+
+    const text: ToolGrant[] = [{ family: "exec", argv: ["npm test"], always: false }];
+    expect(consumeGrant(text, "exec", undefined, ["/usr/local/bin/npm", "test"])).toBe(true);
+
+    const always: ToolGrant[] = [{ family: "exec", argv: ["npm", "test"], always: true }];
+    expect(consumeGrant(always, "exec", undefined, ["curl"])).toBe(true);
+    expect(always).toHaveLength(1);
+  });
 });

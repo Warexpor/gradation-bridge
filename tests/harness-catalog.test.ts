@@ -52,7 +52,7 @@ describe("harness launch resolution", () => {
   });
 
   it("prefers cursor-agent when both agent and cursor-agent exist", () => {
-    binDir("agent", "cursor-agent");
+    const dir = binDir("agent", "cursor-agent");
     const launch = resolveHarnessLaunch({
       id: "cursor-cli",
       name: "Cursor CLI",
@@ -63,6 +63,7 @@ describe("harness launch resolution", () => {
     expect(launch.args).toEqual(["acp"]);
     expect(launch.readiness).toBe("ready");
     expect(launch.notice).toMatch(/Grok/);
+    expect(launch.commandPath).toBe(join(dir, "cursor-agent"));
   });
 
   it("does not treat a directory named cursor-agent as the CLI", () => {

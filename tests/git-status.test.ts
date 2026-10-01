@@ -1,9 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
-import { getGitDiff, getGitStatus, parsePorcelainStatus } from "../src/git/status.js";
+import { getGitDiff, getGitStatus, guardedGitArgs, parsePorcelainStatus } from "../src/git/status.js";
 
 function git(cwd: string, args: string[]): void {
   execFileSync("git", args, { cwd, stdio: "ignore" });
@@ -78,6 +78,42 @@ describe("getGitStatus / getGitDiff", () => {
     const diff = await getGitDiff(tmp, "a.txt");
     expect(diff.unified).toContain("-one");
     expect(diff.unified).toContain("+two");
+  });
+
+  it("does not run repo fsmonitor or diff.external helpers", async () => {
+    expect(guardedGitArgs(["diff", "--no-ext-diff"])).toEqual(
+      expect.arrayContaining(["-c", "core.fsmonitor=", "diff", "--no-ext-diff"]),
+    );
+    tmp = mkdtempSync(join(tmpdir(), "gb-git-hook-"));
+    const marker = join(tmp, "hook-ran");
+    const script = join(tmp, "hook.sh");
+    writeFileSync(script, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\nexit 0\n`);
+    chmodSync(script, 0o755);
+    git(tmp, ["init"]);
+    git(tmp, ["config", "user.email", "test@example.com"]);
+    git(tmp, ["config", "user.name", "Test"]);
+    writeFileSync(join(tmp, "a.txt"), "one\n");
+    git(tmp, ["add", "a.txt"]);
+    git(tmp, ["commit", "-m", "init"]);
+    git(tmp, ["config", "core.fsmonitor", script]);
+    git(tmp, ["config", "diff.external", script]);
+    writeFileSync(join(tmp, "a.txt"), "two\n");
+
+    rmSync(marker, { force: true });
+    const st = await getGitStatus(tmp);
+    expect(st.files.some((f) => f.path === "a.txt")).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+
+    const diff = await getGitDiff(tmp, "a.txt");
+    expect(diff.unified).toContain("+two");
+    expect(existsSync(marker)).toBe(false);
+
+    try {
+      execFileSync("git", ["status", "--porcelain=v1", "-b"], { cwd: tmp, stdio: "ignore" });
+    } catch {
+      // A stub fsmonitor can fail status after the script has started.
+    }
+    expect(existsSync(marker)).toBe(true);
   });
 
   it("returns empty status outside a git repo", async () => {

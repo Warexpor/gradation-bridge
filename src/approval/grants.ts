@@ -13,6 +13,11 @@ export interface ToolGrant {
   family: GrantFamily;
   /** Absolute path the approval was for, when the tool named one. */
   path?: string;
+  /**
+   * For an allow_once exec grant, the command the phone approved.
+   * A later terminal call must use that argv. allow_always is not limited.
+   */
+  argv?: string[];
   always: boolean;
 }
 
@@ -40,15 +45,24 @@ export function grantFromOption(
   optionKind: string | undefined,
   family: GrantFamily | undefined,
   path: string | undefined,
+  argv?: string[],
 ): ToolGrant | undefined {
   if (!optionKind || !family) return undefined;
   const kind = optionKind.toLowerCase();
   if (!kind.includes("allow")) return undefined;
+  const always = kind.includes("always");
+  const command = family === "exec" && !always ? capArgv(argv) : undefined;
   return {
     family,
     path,
-    always: kind.includes("always"),
+    always,
+    ...(command ? { argv: command } : {}),
   };
+}
+
+function capArgv(argv: string[] | undefined): string[] | undefined {
+  if (!argv || argv.length === 0) return undefined;
+  return argv.slice(0, 32).map((arg) => arg.slice(0, 2000));
 }
 
 /**
@@ -74,12 +88,60 @@ export function consumeGrant(
   grants: ToolGrant[],
   family: GrantFamily,
   path?: string,
+  argv?: string[],
 ): boolean {
   const matches = (g: ToolGrant, always: boolean) =>
-    g.family === family && g.always === always && samePath(g.path, path);
+    g.family === family &&
+    g.always === always &&
+    samePath(g.path, path) &&
+    sameArgv(g.argv, argv, always);
   if (grants.some((g) => matches(g, true))) return true;
   const idx = grants.findIndex((g) => matches(g, false));
   if (idx < 0) return false;
   grants.splice(idx, 1);
   return true;
+}
+
+/**
+ * An allow_once that named a command only covers that command.
+ * A grant with no argv stays a single blank check for the family.
+ * allow_always is not filtered here.
+ */
+function sameArgv(
+  grantArgv: string[] | undefined,
+  opArgv: string[] | undefined,
+  always: boolean,
+): boolean {
+  if (always || !grantArgv || grantArgv.length === 0) return true;
+  if (!opArgv || opArgv.length === 0) return false;
+  if (grantArgv.length === opArgv.length && grantArgv.every((arg, i) => arg === opArgv[i])) {
+    return true;
+  }
+  if (
+    grantArgv.length === opArgv.length &&
+    grantArgv.slice(1).every((arg, i) => arg === opArgv[i + 1]) &&
+    commandNamesMatch(grantArgv[0]!, opArgv[0]!)
+  ) {
+    return true;
+  }
+  if (grantArgv.length === 1) {
+    const text = grantArgv[0]!;
+    if (text === opArgv.join(" ")) return true;
+    const basenames = opArgv.slice();
+    basenames[0] = basenameOf(basenames[0]!);
+    if (text === basenames.join(" ")) return true;
+  }
+  return false;
+}
+
+function commandNamesMatch(grant: string, op: string): boolean {
+  if (grant === op) return true;
+  const left = basenameOf(grant);
+  const right = basenameOf(op);
+  return Boolean(left && left === right);
+}
+
+function basenameOf(command: string): string {
+  const parts = command.split(/[/\\]/);
+  return parts[parts.length - 1] ?? command;
 }

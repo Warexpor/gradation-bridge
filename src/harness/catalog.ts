@@ -28,6 +28,8 @@ export interface HarnessLaunch {
   docs?: string;
   authHint?: string;
   notice?: string;
+  /** Absolute file that will be spawned, when it is already on PATH. */
+  commandPath?: string;
 }
 
 interface Profile {
@@ -87,12 +89,14 @@ function finish(
   const profile = PROFILES[h.id];
   const notice = partial.notice ?? legacyNotice(h);
   const displayArgs = redactArgs(partial.args);
+  const commandPath = which(partial.command);
   return {
     id: h.id,
     name: h.name,
     command: partial.command,
     args: partial.args,
     displayArgs,
+    ...(commandPath ? { commandPath } : {}),
     available: partial.available,
     readiness: partial.readiness,
     detail: partial.detail,

@@ -65,6 +65,7 @@ const MetaSchema = z.object({
       z.object({
         family: z.enum(["write", "exec"]),
         path: z.string().optional(),
+        argv: z.array(z.string()).max(32).optional(),
         always: z.boolean(),
       }),
     )

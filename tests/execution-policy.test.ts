@@ -463,4 +463,42 @@ describe("execution policy and protocol surfaces", () => {
     expect(readFileSync(join(workspace, "README.md"), "utf8")).toBe("# test\n");
     await client.close();
   });
+
+  it("does not let an approved command run a different terminal argv", async () => {
+    await boot({
+      mode: "ask",
+      env: {
+        FAKE_ACP_TERMINAL: "1",
+        FAKE_ACP_PERMISSION: "1",
+        FAKE_ACP_PERMISSION_KIND: "execute",
+        FAKE_ACP_PERMISSION_COMMAND: "echo safe",
+      },
+    });
+    const { client, sessionId } = await session("ask", true);
+    await client.call("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "run" }],
+    });
+    expect(texts(client.updates).join("\n")).toMatch(/terminal failed:.*approval/);
+    await client.close();
+  });
+
+  it("refuses a new prompt once session close has started", async () => {
+    await boot({
+      mode: "auto-edit",
+      env: { FAKE_ACP_CLOSE_HOLD_MS: "800", FAKE_ACP_FS_WRITE: "1" },
+    });
+    const { client, sessionId } = await session("auto-edit");
+    const closing = client.call("session/close", { sessionId });
+    await new Promise((r) => setTimeout(r, 80));
+    await expect(
+      client.call("session/prompt", {
+        sessionId,
+        prompt: [{ type: "text", text: "edit" }],
+      }),
+    ).rejects.toMatchObject({ code: -32002 });
+    await closing;
+    expect(readFileSync(join(workspace, "README.md"), "utf8")).toBe("# test\n");
+    await client.close();
+  });
 });

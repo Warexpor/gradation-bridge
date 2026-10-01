@@ -34,6 +34,34 @@ export function policyKindFromToolCall(toolCall: ToolCallLike | undefined): stri
   return k;
 }
 
+/**
+ * Command the phone was shown, when the tool call names one.
+ * A string `command` without `args` stays one element so "npm test" can match
+ * a terminal argv that joins to the same text. Missing or malformed argv
+ * returns undefined and does not invent a constraint.
+ */
+export function commandArgvFromToolCall(toolCall: ToolCallLike | undefined): string[] | undefined {
+  const raw = toolCall?.rawInput;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const obj = raw as Record<string, unknown>;
+  const listed = stringList(obj.argv) ?? (Array.isArray(obj.command) ? stringList(obj.command) : null);
+  if (listed && listed.length > 0) return listed;
+  if (typeof obj.command === "string" && obj.command.trim()) {
+    if (obj.args == null) return [obj.command.trim()];
+    const args = stringList(obj.args);
+    if (!args) return undefined;
+    return [obj.command, ...args];
+  }
+  if (typeof obj.cmd === "string" && obj.cmd.trim()) return [obj.cmd.trim()];
+  return undefined;
+}
+
+function stringList(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  if (!value.every((item) => typeof item === "string")) return null;
+  return value as string[];
+}
+
 export function pathFromToolCall(toolCall: ToolCallLike | undefined): string | undefined {
   const loc = toolCall?.locations?.find((l) => l?.path);
   if (loc?.path) return loc.path;

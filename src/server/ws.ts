@@ -14,8 +14,9 @@ import { PERMISSION_MODES } from "../approval/policy.js";
 import type { BridgeConfig, PermissionMode } from "../config/types.js";
 import { saveConfig } from "../config/load.js";
 import { BridgeError } from "../errors.js";
+import { which } from "../harness/path.js";
 import { listHarnesses } from "../harness/registry.js";
-import { log, recentLogs } from "../log/diagnostics.js";
+import { getLogLevel, log, recentLogs } from "../log/diagnostics.js";
 import { SessionManager, SandboxError, type PhoneCancelFilter } from "../session/manager.js";
 import { assertAllowedRealPath } from "../approval/sandbox.js";
 import { getGitDiff, getGitStatus } from "../git/status.js";
@@ -444,13 +445,14 @@ async function dispatch(
         );
       }
       const harnesses = listHarnesses(opts.config).map(
-        ({ id, name, available, readiness, detail, notice }) => ({
+        ({ id, name, available, readiness, detail, notice, commandPath }) => ({
           id,
           name,
           available,
           readiness,
           detail,
           ...(notice ? { notice } : {}),
+          ...(commandPath ? { commandPath } : {}),
         }),
       );
       return {
@@ -484,11 +486,15 @@ async function dispatch(
       return {
         version: opts.version,
         permissionMode: opts.config.defaultPermissionMode,
+        logLevel: getLogLevel(),
+        npx: Boolean(which("npx")),
+        openssl: Boolean(which("openssl")),
         harnesses: listHarnesses(opts.config),
         sessions: opts.sessions.list().length,
         log: recentLogs(),
         tls: tls.tls,
         ...(tls.certFingerprint ? { certFingerprint: tls.certFingerprint } : {}),
+        ...(tls.certSan ? { certSan: tls.certSan } : {}),
       };
     }
     case "bridge/setPermissionMode": {
