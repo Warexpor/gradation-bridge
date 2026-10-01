@@ -19,6 +19,9 @@
  *   FAKE_ACP_ELICIT_FORM=1      — form elicitation during authenticate
  *   FAKE_ACP_ELICIT_SECRET=1    — form that asks for a password (bridge should reject)
  *   FAKE_ACP_ELICIT_URL=<url>   — url elicitation during the prompt
+ *   FAKE_ACP_ELICIT_FOREIGN=1   — elicitation claims sessionId "victim-session"
+ *   FAKE_ACP_ELICIT_DUMP=<file> — write the elicitation result JSON
+ *   FAKE_ACP_AUTH_HOLD_MS=N     — delay authenticate before it succeeds
  *   FAKE_ACP_TRACE=<file>       — append init/auth/new lines with this process id
  *   FAKE_ACP_DUMP=<file>        — write the initialize params JSON to a file
  *   FAKE_ACP_SLOW_MS=N          — delay between update chunks
@@ -53,6 +56,9 @@ const wantLogout = process.env.FAKE_ACP_LOGOUT === "1";
 const elicitForm = process.env.FAKE_ACP_ELICIT_FORM === "1";
 const elicitSecret = process.env.FAKE_ACP_ELICIT_SECRET === "1";
 const elicitUrl = process.env.FAKE_ACP_ELICIT_URL;
+const elicitForeign = process.env.FAKE_ACP_ELICIT_FOREIGN === "1";
+const elicitDump = process.env.FAKE_ACP_ELICIT_DUMP;
+const authHoldMs = Number(process.env.FAKE_ACP_AUTH_HOLD_MS ?? "0") || 0;
 let authenticated = !authRequired;
 const dumpPath = process.env.FAKE_ACP_DUMP;
 const slowMs = Number(process.env.FAKE_ACP_SLOW_MS ?? "0") || 0;
@@ -316,8 +322,8 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
 async function runPromptElicitation(sessionId: string): Promise<boolean> {
   try {
     if (elicitSecret) {
-      await requestClient("elicitation/create", {
-        sessionId,
+      const result = await requestClient("elicitation/create", {
+        sessionId: elicitForeign ? "victim-session" : sessionId,
         mode: "form",
         message: "Enter password",
         requestedSchema: {
@@ -326,16 +332,18 @@ async function runPromptElicitation(sessionId: string): Promise<boolean> {
           required: ["password"],
         },
       });
+      dumpElicitation(result);
       return false;
     }
     if (elicitUrl) {
-      await requestClient("elicitation/create", {
-        sessionId,
+      const result = await requestClient("elicitation/create", {
+        sessionId: elicitForeign ? "victim-session" : sessionId,
         mode: "url",
         elicitationId: "url-1",
         message: "Open this link",
         url: elicitUrl,
       });
+      dumpElicitation(result);
       return false;
     }
   } catch {
@@ -344,12 +352,19 @@ async function runPromptElicitation(sessionId: string): Promise<boolean> {
   return false;
 }
 
+function dumpElicitation(result: unknown): void {
+  if (!elicitDump) return;
+  writeFileSync(elicitDump, JSON.stringify(result));
+}
+
 async function handleAuth(id: number | string | null | undefined, params: Record<string, unknown>): Promise<void> {
   const methodId = String(params.methodId ?? "");
+  if (authHoldMs > 0) await sleep(authHoldMs);
   if (elicitForm) {
     try {
       const result = (await requestClient("elicitation/create", {
         requestId: id,
+        ...(elicitForeign ? { sessionId: "victim-session" } : {}),
         mode: "form",
         message: "What should I call you?",
         requestedSchema: {
@@ -358,6 +373,7 @@ async function handleAuth(id: number | string | null | undefined, params: Record
           required: ["name"],
         },
       })) as { action?: string; content?: { name?: string } };
+      dumpElicitation(result);
       if (result?.action !== "accept" || !result.content?.name) {
         respondError(id, -32000, "auth_required");
         return;

@@ -51,4 +51,25 @@ describe("auth method parsing", () => {
     expect(JSON.stringify(err.data)).not.toContain("TOKEN");
     expect(() => assertAgentAuthMethod(methods, "agent")).not.toThrow();
   });
+
+  it("redacts secret terminal args and keeps the first duplicate id", () => {
+    const info = readAgentInitialize({
+      authMethods: [
+        { id: "agent", name: "Agent" },
+        { id: "agent", name: "Duplicate", type: "terminal", args: ["--login"] },
+        {
+          id: "term",
+          name: "Terminal",
+          type: "terminal",
+          args: ["--token", "sekret-value", "--login"],
+        },
+        { id: "bad\nid", name: "Broken" },
+      ],
+    });
+    expect(info.authMethods).toEqual([
+      { id: "agent", name: "Agent", type: "agent" },
+      { id: "term", name: "Terminal", type: "terminal", args: ["--token", "[redacted]", "--login"] },
+    ]);
+    expect(JSON.stringify(info)).not.toContain("sekret-value");
+  });
 });

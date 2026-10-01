@@ -1,4 +1,4 @@
-import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -61,5 +61,17 @@ describe("SessionLog", () => {
     const again = new SessionLog("fake-1", join(root, "sessions", "fake-1"));
     expect(again.lastSeq).toBe(1);
     expect([...again.replay(0)]).toHaveLength(1);
+  });
+
+  it("refuses a symlinked events.jsonl", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-log-"));
+    dirs.push(root);
+    const dir = join(root, "sess");
+    mkdirSync(dir);
+    const outside = join(root, "outside.jsonl");
+    writeFileSync(outside, "LEAK\n");
+    symlinkSync(outside, join(dir, "events.jsonl"));
+    expect(() => new SessionLog("s3", dir)).toThrow(/symlink/);
+    expect(readFileSync(outside, "utf8")).toBe("LEAK\n");
   });
 });

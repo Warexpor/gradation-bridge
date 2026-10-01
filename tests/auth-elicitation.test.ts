@@ -109,6 +109,7 @@ async function openClient(
 describe("auth and elicitation relay", () => {
   let restore: (() => void) | undefined;
   let server: BridgeServer | undefined;
+  let sessions: SessionManager | undefined;
   let workspace: string;
   let token: string;
   let root: string;
@@ -147,7 +148,7 @@ describe("auth and elicitation relay", () => {
     };
     saveConfig(config);
     token = ensurePrimaryToken().token;
-    const sessions = new SessionManager({ config, version: "0.4.0-test" });
+    sessions = new SessionManager({ config, version: "0.4.0-test" });
     server = await startBridgeServer({
       host: "127.0.0.1",
       port: 0,
@@ -357,4 +358,97 @@ describe("auth and elicitation relay", () => {
     expect(JSON.stringify(okClient.inbound)).toContain("Echo: go");
     await okClient.close();
   }, 20_000);
+
+  it("refuses a second pre-session login and drops a warm process whose env changed", async () => {
+    await boot(() => ({
+      FAKE_ACP_AUTH_REQUIRED: "1",
+      FAKE_ACP_AUTH_HOLD_MS: "400",
+      FAKE_ACP_TRACE: join(root, "trace.txt"),
+      TOKEN_A: "one",
+    }));
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", { protocolVersion: 1 });
+    const first = client.call("authenticate", {
+      methodId: "fake_login",
+      _meta: { harness: "fake", cwd: workspace },
+    });
+    const second = client.call("authenticate", {
+      methodId: "fake_login",
+      _meta: { harness: "fake", cwd: workspace },
+    });
+    await expect(second).rejects.toMatchObject({ code: -32005 });
+    await first;
+    sessions!.updateConfig({
+      ...sessions!.config,
+      harnesses: sessions!.config.harnesses.map((harness) => ({
+        ...harness,
+        env: { ...(harness.env ?? {}), TOKEN_A: "two" },
+      })),
+    });
+    await expect(
+      client.call("session/new", {
+        cwd: workspace,
+        mcpServers: [],
+        _meta: { harness: "fake", permissionMode: "ask" },
+      }),
+    ).rejects.toThrow(/auth_required/);
+    await client.close();
+  }, 20_000);
+
+  it("rewrites a foreign elicitation session id and cancels with action cancel", async () => {
+    const dump = join(tmpdir(), `gb-elicit-dump-${Date.now()}.json`);
+    await boot(() => ({
+      FAKE_ACP_ELICIT_URL: "https://example.com/connect",
+      FAKE_ACP_ELICIT_FOREIGN: "1",
+      FAKE_ACP_ELICIT_DUMP: dump,
+      FAKE_ACP_AUTH: "1",
+      FAKE_ACP_LOGOUT: "1",
+    }));
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", {
+      protocolVersion: 1,
+      clientCapabilities: { elicitation: { url: {} } },
+    });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "ask" },
+    })) as { sessionId: string; _meta: { logout?: boolean; authMethods?: Array<{ id: string }> } };
+    expect(created._meta.logout).toBe(true);
+    expect(created._meta.authMethods?.[0]?.id).toBe("fake_login");
+    const prompt = client.call("session/prompt", {
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "go" }],
+    });
+    const seen = await waitFor(
+      () => client.inbound.find((msg) => msg.method === "elicitation/create")?.params,
+    );
+    const body = seen as { sessionId?: string; url?: string };
+    expect(body.sessionId).toBe(created.sessionId);
+    expect(body.sessionId).not.toBe("victim-session");
+    expect(body.url).toBe("https://example.com/connect");
+    await client.call("session/cancel", { sessionId: created.sessionId });
+    await prompt;
+    const dumped = JSON.parse(readFileSync(dump, "utf8")) as { action?: string };
+    expect(dumped).toEqual({ action: "cancel" });
+    const listed = (await client.call("session/list", {})) as {
+      sessions: Array<{ sessionId: string; _meta?: { logout?: boolean; authMethods?: Array<{ id: string }> } }>;
+    };
+    expect(listed.sessions.find((s) => s.sessionId === created.sessionId)?._meta).toMatchObject({
+      logout: true,
+      authMethods: [expect.objectContaining({ id: "fake_login", type: "agent" })],
+    });
+    await client.close();
+    rmSync(dump, { force: true });
+  }, 20_000);
 });
+
+async function waitFor<T>(read: () => T | undefined): Promise<T> {
+  const start = Date.now();
+  while (Date.now() - start < 10_000) {
+    const value = read();
+    if (value !== undefined) return value;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("timed out waiting");
+}

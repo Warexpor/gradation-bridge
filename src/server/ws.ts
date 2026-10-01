@@ -43,6 +43,7 @@ interface PendingPhone {
   timer: NodeJS.Timeout;
   frame: unknown;
   params: unknown;
+  method: string;
 }
 
 const outboxes = new WeakMap<WebSocket, SocketOutbox>();
@@ -120,10 +121,11 @@ export async function startBridgeServer(opts: WsServerOptions): Promise<BridgeSe
       if (!params || typeof params !== "object" || params.sessionId !== sessionId) continue;
       clearTimeout(pending.timer);
       pendingPhone.delete(id);
-      pending.resolve({
-        result: { outcome: { outcome: "cancelled" } },
-        requestId: id,
-      });
+      const result =
+        pending.method === "elicitation/create"
+          ? { action: "cancel" }
+          : { outcome: { outcome: "cancelled" } };
+      pending.resolve({ result, requestId: id });
     }
   };
 
@@ -138,7 +140,7 @@ export async function startBridgeServer(opts: WsServerOptions): Promise<BridgeSe
         pendingPhone.delete(requestId);
         reject(new Error(`phone did not answer ${method}`));
       }, 300_000);
-      pendingPhone.set(requestId, { resolve, reject, timer, frame, params });
+      pendingPhone.set(requestId, { resolve, reject, timer, frame, params, method });
       // Keep the request if every phone is briefly gone so a reconnect can answer.
       if (clients.size > 0) fanout(frame, false);
     });

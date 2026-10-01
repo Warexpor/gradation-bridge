@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -48,6 +48,8 @@ function meta(cwd: string, patch: Partial<SessionMeta> & { sessionId: string }):
     mcpServers: [],
     grants: patch.grants ?? [],
     additionalDirectories: patch.additionalDirectories ?? [],
+    ...(patch.authMethods ? { authMethods: patch.authMethods } : {}),
+    ...(patch.logoutSupported ? { logoutSupported: true } : {}),
   };
 }
 
@@ -161,12 +163,13 @@ describe("session catalog edges", () => {
       join(dir, "bad id", "meta.json"),
       JSON.stringify(meta(workspace, { sessionId: "bad id" })),
     );
-    const outside = join(root, "outside");
-    writeSessionMeta(
-      join(outside, "link-sess"),
-      meta(workspace, { sessionId: "link-sess", title: "should-not-load" }),
+    const outside = join(root, "outside", "link-sess");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(
+      join(outside, "meta.json"),
+      JSON.stringify(meta(workspace, { sessionId: "link-sess", title: "should-not-load" })) + "\n",
     );
-    symlinkSync(join(outside, "link-sess"), join(dir, "link-sess"));
+    symlinkSync(outside, join(dir, "link-sess"));
     writeSessionMeta(
       join(dir, "shut"),
       meta(workspace, { sessionId: "shut", status: "closed", updatedAt: "2026-10-03T00:00:00.000Z" }),
@@ -210,5 +213,59 @@ describe("session catalog edges", () => {
     expect(ids).toContain("n200");
     expect(ids).not.toContain("n000");
     expect(ids).toHaveLength(200);
+  });
+
+  it("restores logout and public auth methods, and skips symlinked catalog files", () => {
+    const { root, workspace } = useDataDir();
+    const dir = sessionsRoot();
+    writeSessionMeta(
+      join(dir, "authed"),
+      meta(workspace, {
+        sessionId: "authed",
+        updatedAt: "2026-10-01T00:00:05.000Z",
+        authMethods: [
+          { id: "agent", name: "Agent", type: "agent" },
+          { id: "term", name: "Terminal", type: "terminal", args: ["--token", "sekret-value"] },
+        ],
+        logoutSupported: true,
+      }),
+    );
+    mkdirSync(join(dir, "linked-meta"));
+    const evilMeta = join(root, "evil-meta.json");
+    writeFileSync(
+      evilMeta,
+      JSON.stringify(meta(workspace, { sessionId: "linked-meta", title: "should-not-load" })),
+    );
+    symlinkSync(evilMeta, join(dir, "linked-meta", "meta.json"));
+
+    writeSessionMeta(
+      join(dir, "linked-log"),
+      meta(workspace, { sessionId: "linked-log", title: "log-should-not-load" }),
+    );
+    const leak = join(root, "leak.jsonl");
+    writeFileSync(leak, "LEAK-OUTSIDE\n");
+    symlinkSync(leak, join(dir, "linked-log", "events.jsonl"));
+
+    const sessions = manager(workspace);
+    const page = sessions.listForProtocol({});
+    const ids = page.sessions.map((s) => s.sessionId);
+    expect(ids).toContain("authed");
+    expect(ids).not.toContain("linked-meta");
+    expect(ids).not.toContain("linked-log");
+    const authed = page.sessions.find((s) => s.sessionId === "authed");
+    expect(authed?._meta).toMatchObject({
+      logout: true,
+      authMethods: [
+        { id: "agent", name: "Agent", type: "agent" },
+        { id: "term", name: "Terminal", type: "terminal", args: ["--token", "[redacted]"] },
+      ],
+    });
+    const blob = JSON.stringify(page);
+    expect(blob).not.toContain("sekret-value");
+    expect(blob).not.toContain("should-not-load");
+    expect(blob).not.toContain("LEAK-OUTSIDE");
+    expect(sessions.list().find((s) => s.sessionId === "authed")?.logout).toBe(true);
+    expect(readFileSync(join(dir, "authed", "meta.json"), "utf8")).not.toContain("sekret-value");
+    expect(readFileSync(leak, "utf8")).toBe("LEAK-OUTSIDE\n");
   });
 });

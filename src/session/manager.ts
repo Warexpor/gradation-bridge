@@ -5,12 +5,19 @@ import type { BridgeConfig, PermissionMode } from "../config/types.js";
 import { BridgeError } from "../errors.js";
 import { findHarness } from "../harness/registry.js";
 import { launchErrorData, resolveHarnessLaunch, type HarnessLaunch } from "../harness/catalog.js";
-import { assertAgentAuthMethod, readAgentInitialize, type PublicAuthMethod } from "../acp/auth-method.js";
+import {
+  assertAgentAuthMethod,
+  publicAuthMethods,
+  readAgentInitialize,
+  type PublicAuthMethod,
+} from "../acp/auth-method.js";
 import { AcpStdioClient, isMethodNotFound, type AcpJsonRpcRequest } from "../acp/client.js";
 import {
+  bindElicitationSession,
   elicitationLogLabel,
   elicitationSupportFromInitialize,
   ElicitationRejected,
+  mergeInitializeElicitation,
   relayElicitationParams,
   sanitizeElicitationResponse,
 } from "../acp/elicitation.js";
@@ -35,6 +42,7 @@ import {
 } from "../approval/grants.js";
 import { assertAllowedRealPath, assertAllowedWorkspace, SandboxError } from "../approval/sandbox.js";
 import { log } from "../log/diagnostics.js";
+import { redactSecrets } from "../log/redact.js";
 import { isSafeSessionId } from "./ids.js";
 import { SessionLog } from "./log.js";
 import {
@@ -99,7 +107,12 @@ export type SessionSummary = Omit<
   | "promptInFlight"
   | "cancelRequested"
   | "closing"
->;
+> & {
+  /** Public harness login methods. Terminal env is already stripped. */
+  authMethods?: PublicAuthMethod[];
+  /** Present when the harness advertised logout. */
+  logout?: boolean;
+};
 
 export type BridgeEmitter = (
   msg: unknown,
@@ -133,6 +146,10 @@ export class SessionManager {
   private terminals = new TerminalTable();
   /** Authenticated harness kept until the next session/new for the same cwd. */
   private warm = new Map<string, WarmAuth>();
+  /** Pre-session authenticate calls. A second call for the same key is refused. */
+  private warmInflight = new Map<string, Promise<unknown>>();
+  /** Bumped when a warm login is cancelled so a late success cannot install itself. */
+  private warmEpoch = new Map<string, number>();
 
   constructor(opts?: SessionManagerOptions) {
     this.opts = opts ?? {
@@ -156,7 +173,7 @@ export class SessionManager {
   /** Remember the phone's initialize params so the next agent sees its capabilities. */
   notePhoneInitialize(params: unknown): void {
     if (params && typeof params === "object" && !Array.isArray(params)) {
-      this.phoneInitialize = params as Record<string, unknown>;
+      this.phoneInitialize = mergeInitializeElicitation(this.phoneInitialize, params);
     }
   }
 
@@ -193,6 +210,8 @@ export class SessionManager {
       permissionMode: s.permissionMode,
       lastSeq: s.log.lastSeq,
       additionalDirectories: s.additionalDirectories,
+      ...(s.authMethods?.length ? { authMethods: s.authMethods } : {}),
+      ...(s.logoutSupported ? { logout: true } : {}),
     };
   }
 
@@ -295,7 +314,8 @@ export class SessionManager {
    */
   async closeAll(): Promise<void> {
     this.stopping = true;
-    for (const key of [...this.warm.keys()]) this.dropWarm(key);
+    const keys = new Set([...this.warm.keys(), ...this.warmInflight.keys()]);
+    for (const key of keys) this.bumpWarm(key);
     for (const id of [...this.sessions.keys()]) this.detachForShutdown(id);
     this.terminals.closeSession();
   }
@@ -379,6 +399,8 @@ export class SessionManager {
           preview: s.preview,
           lastSeq: s.lastSeq,
           ...(s.branch ? { branch: s.branch } : {}),
+          ...(s.authMethods?.length ? { authMethods: s.authMethods } : {}),
+          ...(s.logout ? { logout: true } : {}),
         },
       })),
       ...(next ? { nextCursor: next } : {}),
@@ -464,7 +486,7 @@ export class SessionManager {
 
     let client: AcpStdioClient | undefined;
     try {
-      const warm = this.takeMatchingWarm(harness.id, cwd, launch);
+      const warm = this.takeMatchingWarm(harness.id, cwd, launch, overlayEnv(config.env, harness.env));
       if (warm) {
         client = warm.client;
         this.wireClient(rec, client, harness.id);
@@ -506,7 +528,7 @@ export class SessionManager {
         // The directory may already be gone.
       }
       if (e instanceof BridgeError) throw e;
-      const message = e instanceof Error ? e.message : String(e);
+      const message = publicErrorMessage(e);
       const agentCode =
         e && typeof e === "object" && typeof (e as { code?: unknown }).code === "number"
           ? (e as { code: number }).code
@@ -732,19 +754,49 @@ export class SessionManager {
     cwd?: string;
   }): Promise<Record<string, unknown>> {
     const methodId = input.methodId.trim();
-    if (!methodId) throw new BridgeError(-32602, "methodId required");
-    if (input.sessionId) {
-      const rec = this.requireSession(input.sessionId);
-      const client = rec.client;
-      if (!client?.running) {
-        throw new BridgeError(-32004, `session agent not running: ${input.sessionId}`, {
-          sessionId: input.sessionId,
-        });
-      }
-      if (rec.authMethods) assertAgentAuthMethod(rec.authMethods, methodId);
-      await client.authenticate(methodId);
-      return this.authResult(rec.harness, rec.cwd, rec.authMethods ?? [], rec.logoutSupported, rec.sessionId);
+    if (!methodId || methodId.length > 120 || /[\u0000-\u001f]/.test(methodId)) {
+      throw new BridgeError(-32602, "methodId required");
     }
+    if (input.sessionId) return this.authenticateSession(input.sessionId, methodId);
+    const prepared = this.prepareWarm(input);
+    if (this.warmInflight.has(prepared.key)) {
+      throw new BridgeError(-32005, "authentication already in progress", {
+        harnessId: prepared.harness.id,
+      });
+    }
+    const run = this.finishWarm(prepared, methodId);
+    this.warmInflight.set(prepared.key, run);
+    try {
+      return await run;
+    } finally {
+      if (this.warmInflight.get(prepared.key) === run) this.warmInflight.delete(prepared.key);
+    }
+  }
+
+  private async authenticateSession(sessionId: string, methodId: string): Promise<Record<string, unknown>> {
+    const rec = this.requireSession(sessionId);
+    const client = rec.client;
+    if (!client?.running) {
+      throw new BridgeError(-32004, `session agent not running: ${sessionId}`, { sessionId });
+    }
+    if (rec.authMethods) assertAgentAuthMethod(rec.authMethods, methodId);
+    try {
+      await client.authenticate(methodId);
+    } catch (e) {
+      if (e instanceof BridgeError) throw e;
+      const failure = agentFailure(e);
+      throw new BridgeError(failure.code, failure.message, { sessionId });
+    }
+    return this.authResult(rec.harness, rec.cwd, rec.authMethods ?? [], rec.logoutSupported, rec.sessionId);
+  }
+
+  private prepareWarm(input: { harnessId?: string; cwd?: string }): {
+    key: string;
+    cwd: string;
+    harness: NonNullable<ReturnType<typeof findHarness>>;
+    launch: HarnessLaunch;
+    env: Record<string, string>;
+  } {
     if (!input.harnessId) throw new BridgeError(-32602, "harness required");
     if (!input.cwd) throw new BridgeError(-32602, "cwd required");
     const cwd = assertAllowedWorkspace(input.cwd, this.opts.config.allowedRoots);
@@ -760,8 +812,21 @@ export class SessionManager {
         launchErrorData(launch),
       );
     }
-    const key = warmKey(harness.id, cwd);
-    this.dropWarm(key);
+    return {
+      key: warmKey(harness.id, cwd),
+      cwd,
+      harness,
+      launch,
+      env: overlayEnv(this.opts.config.env, harness.env),
+    };
+  }
+
+  private async finishWarm(
+    prepared: ReturnType<SessionManager["prepareWarm"]>,
+    methodId: string,
+  ): Promise<Record<string, unknown>> {
+    const { key, cwd, harness, launch, env } = prepared;
+    const epoch = this.bumpWarm(key);
     const client = new AcpStdioClient({
       harness: { ...harness, command: launch.command, args: launch.args },
       cwd,
@@ -790,7 +855,14 @@ export class SessionManager {
       const info = readAgentInitialize(initialized);
       assertAgentAuthMethod(info.authMethods, methodId);
       await client.authenticate(methodId);
-      const timer = setTimeout(() => this.dropWarm(key), 10 * 60 * 1000);
+      if (this.stopping || this.warmEpoch.get(key) !== epoch) {
+        client.kill();
+        throw new BridgeError(-32010, "authentication was cancelled", { harnessId: harness.id });
+      }
+      const timer = setTimeout(() => {
+        const current = this.warm.get(key);
+        if (current?.client === client) this.dropWarm(key);
+      }, 10 * 60 * 1000);
       timer.unref?.();
       this.warm.set(key, {
         key,
@@ -798,6 +870,7 @@ export class SessionManager {
         cwd,
         command: launch.command,
         args: launch.args ?? [],
+        env,
         client,
         authMethods: info.authMethods,
         logoutSupported: info.logoutSupported,
@@ -808,12 +881,8 @@ export class SessionManager {
     } catch (e) {
       client.kill();
       if (e instanceof BridgeError) throw e;
-      const message = e instanceof Error ? e.message : String(e);
-      const code =
-        e && typeof e === "object" && typeof (e as { code?: unknown }).code === "number"
-          ? (e as { code: number }).code
-          : -32010;
-      throw new BridgeError(code, message, { harnessId: harness.id });
+      const failure = agentFailure(e);
+      throw new BridgeError(failure.code, failure.message, { harnessId: harness.id });
     }
   }
 
@@ -1041,7 +1110,7 @@ export class SessionManager {
       case "session/request_permission":
         return this.handlePermission(rec, (req.params ?? {}) as RequestPermissionParams);
       case "elicitation/create":
-        return this.relayElicitation(req.params);
+        return this.relayElicitation(req.params, rec.sessionId);
       case "fs/read_text_file":
         return this.handleReadTextFile(rec, req.params);
       case "fs/write_text_file":
@@ -1330,7 +1399,16 @@ export class SessionManager {
     }
     for (const meta of metas) {
       if (this.sessions.has(meta.sessionId)) continue;
-      const sessionLog = new SessionLog(meta.sessionId);
+      let sessionLog: SessionLog;
+      try {
+        sessionLog = new SessionLog(meta.sessionId);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        log("warn", `skipping session ${meta.sessionId}: ${message}`);
+        continue;
+      }
+      const authMethods = storedAuthMethods(meta.authMethods);
+      const authDirty = JSON.stringify(meta.authMethods ?? []) !== JSON.stringify(authMethods ?? []);
       const stale = meta.status === "running" || meta.status === "needs_approval";
       let workspaceOk = true;
       try {
@@ -1359,18 +1437,18 @@ export class SessionManager {
         grants: meta.grants.map((g) => ({ ...g })),
         sessionModes: meta.sessionModes,
         agentInfo: meta.agentInfo,
-        authMethods: normalizeStoredAuth(meta.authMethods),
+        authMethods,
         mcpServers: meta.mcpServers ?? [],
         additionalDirectories: meta.additionalDirectories ?? [],
         configOptions: meta.configOptions,
         clientGeneration: 0,
         promptInFlight: false,
         cancelRequested: false,
-        logoutSupported: false,
+        logoutSupported: meta.logoutSupported === true,
         closing: false,
       };
       this.sessions.set(rec.sessionId, rec);
-      if (!workspaceOk || stale) this.persist(rec);
+      if (!workspaceOk || stale || authDirty) this.persist(rec);
     }
   }
 
@@ -1403,6 +1481,7 @@ export class SessionManager {
       ...(rec.configOptions !== undefined ? { configOptions: rec.configOptions } : {}),
       ...(rec.agentInfo ? { agentInfo: rec.agentInfo } : {}),
       ...(rec.authMethods?.length ? { authMethods: rec.authMethods } : {}),
+      ...(rec.logoutSupported ? { logoutSupported: true } : {}),
       grants: rec.grants.map((g) => ({ ...g })),
       additionalDirectories: rec.additionalDirectories,
     };
@@ -1465,13 +1544,21 @@ export class SessionManager {
     };
   }
 
-  private takeMatchingWarm(harnessId: string, cwd: string, launch: HarnessLaunch): WarmAuth | undefined {
+  private takeMatchingWarm(
+    harnessId: string,
+    cwd: string,
+    launch: HarnessLaunch,
+    env: Record<string, string>,
+  ): WarmAuth | undefined {
     const key = warmKey(harnessId, cwd);
     const warm = this.warm.get(key);
     if (!warm) return undefined;
     this.warm.delete(key);
     clearTimeout(warm.timer);
-    const sameLaunch = warm.command === launch.command && sameArgs(warm.args, launch.args ?? []);
+    const sameLaunch =
+      warm.command === launch.command &&
+      sameArgs(warm.args, launch.args ?? []) &&
+      sameEnv(warm.env, env);
     if (!warm.client.running || !sameLaunch) {
       warm.client.kill();
       return undefined;
@@ -1487,8 +1574,17 @@ export class SessionManager {
     warm.client.kill();
   }
 
-  private async relayElicitation(params: unknown): Promise<unknown> {
+  /** Invalidate an in-flight login and drop any process already stored for `key`. */
+  private bumpWarm(key: string): number {
+    const next = (this.warmEpoch.get(key) ?? 0) + 1;
+    this.warmEpoch.set(key, next);
+    this.dropWarm(key);
+    return next;
+  }
+
+  private async relayElicitation(params: unknown, sessionId?: string): Promise<unknown> {
     const support = elicitationSupportFromInitialize(this.phoneInitialize);
+    params = bindElicitationSession(params, sessionId);
     let relay: Record<string, unknown>;
     try {
       relay = relayElicitationParams(params, support);
@@ -1572,6 +1668,8 @@ interface WarmAuth {
   cwd: string;
   command: string;
   args: string[];
+  /** Harness and config env overlay captured at login. Not the process environment. */
+  env: Record<string, string>;
   client: AcpStdioClient;
   authMethods: PublicAuthMethod[];
   logoutSupported: boolean;
@@ -1587,15 +1685,34 @@ function sameArgs(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((arg, i) => arg === right[i]);
 }
 
-function normalizeStoredAuth(
-  methods: SessionMeta["authMethods"],
-): PublicAuthMethod[] | undefined {
-  if (!methods) return undefined;
-  return methods.map((method) => ({
-    id: method.id,
-    name: method.name ?? method.id,
-    ...(method.description ? { description: method.description } : {}),
-    type: method.type === "terminal" ? "terminal" : "agent",
-    ...(method.args?.length ? { args: method.args } : {}),
-  }));
+function overlayEnv(
+  config: Record<string, string> | undefined,
+  harness: Record<string, string> | undefined,
+): Record<string, string> {
+  return { ...(config ?? {}), ...(harness ?? {}) };
+}
+
+function sameEnv(left: Record<string, string>, right: Record<string, string>): boolean {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) return false;
+  return leftKeys.every((key) => right[key] === left[key]);
+}
+
+function storedAuthMethods(methods: SessionMeta["authMethods"]): PublicAuthMethod[] | undefined {
+  const clean = publicAuthMethods(methods);
+  return clean.length ? clean : undefined;
+}
+
+function publicErrorMessage(e: unknown): string {
+  return agentFailure(e).message;
+}
+
+function agentFailure(e: unknown, fallback = -32010): { code: number; message: string } {
+  const message = redactSecrets(e instanceof Error ? e.message : String(e)).slice(0, 2000);
+  const code =
+    e && typeof e === "object" && typeof (e as { code?: unknown }).code === "number"
+      ? (e as { code: number }).code
+      : fallback;
+  return { code, message };
 }
