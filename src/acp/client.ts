@@ -6,6 +6,8 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { HarnessConfig } from "../config/types.js";
+import { log } from "../log/diagnostics.js";
+import { redactSecrets } from "../log/redact.js";
 
 export interface AcpJsonRpcRequest {
   jsonrpc?: string;
@@ -46,6 +48,8 @@ export class AcpStdioClient {
   >();
   private readonly opts: AcpClientOptions;
   private stderrBuf = "";
+  private readonly stderrLines: string[] = [];
+  private lastLaunchError: Error | null = null;
 
   constructor(opts: AcpClientOptions) {
     this.opts = opts;
@@ -58,6 +62,11 @@ export class AcpStdioClient {
 
   get running(): boolean {
     return this.child != null && this.child.exitCode === null && !this.child.killed;
+  }
+
+  /** Last stderr lines, already redacted. */
+  stderrTail(): string {
+    return this.stderrLines.join("\n");
   }
 
   start(): void {
@@ -82,25 +91,56 @@ export class AcpStdioClient {
       while ((idx = this.stderrBuf.indexOf("\n")) >= 0) {
         const line = this.stderrBuf.slice(0, idx);
         this.stderrBuf = this.stderrBuf.slice(idx + 1);
-        this.opts.onStderr?.(line);
+        this.pushStderr(line);
       }
     });
 
     this.child.on("exit", (code, signal) => {
+      this.flushStderr();
       this.child = null;
-      for (const [, p] of this.pending) {
-        p.reject(new Error(`ACP process exited (code=${code}, signal=${signal})`));
-      }
-      this.pending.clear();
+      const err = new Error(
+        `ACP process exited (code=${code}, signal=${signal})${this.stderrSuffix()}`,
+      );
+      this.failPending(err);
       this.opts.onExit?.(code, signal);
     });
 
     this.child.on("error", (err) => {
-      for (const [, p] of this.pending) {
-        p.reject(err instanceof Error ? err : new Error(String(err)));
-      }
-      this.pending.clear();
+      this.flushStderr();
+      const nodeErr = err as NodeJS.ErrnoException;
+      const message =
+        nodeErr.code === "ENOENT"
+          ? `command not found: ${this.harness.command}`
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      this.failPending(new Error(`ACP process error: ${message}${this.stderrSuffix()}`));
     });
+  }
+
+  private pushStderr(line: string): void {
+    const clean = redactSecrets(line).slice(0, 500);
+    this.stderrLines.push(clean);
+    if (this.stderrLines.length > 40) this.stderrLines.shift();
+    this.opts.onStderr?.(clean);
+  }
+
+  private flushStderr(): void {
+    if (!this.stderrBuf) return;
+    this.pushStderr(this.stderrBuf);
+    this.stderrBuf = "";
+  }
+
+  private stderrSuffix(): string {
+    const tail = this.stderrTail();
+    if (!tail) return "";
+    return `\nstderr: ${tail.slice(-1500)}`;
+  }
+
+  private failPending(err: Error): void {
+    this.lastLaunchError = err;
+    for (const [, p] of this.pending) p.reject(err);
+    this.pending.clear();
   }
 
   private onLine(line: string): void {
@@ -108,6 +148,9 @@ export class AcpStdioClient {
     try {
       msg = JSON.parse(line);
     } catch {
+      if (line.trim()) {
+        log("debug", `harness stdout was not JSON: ${line.slice(0, 200)}`);
+      }
       return;
     }
     if (!msg || typeof msg !== "object") return;
@@ -194,7 +237,11 @@ export class AcpStdioClient {
 
   /** Send a JSON-RPC request; returns a promise for the result. */
   request(method: string, params?: unknown, timeoutMs = 600_000): Promise<unknown> {
-    if (!this.child?.stdin) return Promise.reject(new Error("ACP client not running"));
+    if (!this.child?.stdin) {
+      return Promise.reject(
+        this.lastLaunchError ?? new Error(`ACP client not running${this.stderrSuffix()}`),
+      );
+    }
     const id = this.nextId++;
     const payload = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
     return new Promise((resolve, reject) => {
@@ -229,14 +276,20 @@ export class AcpStdioClient {
     this.write({ jsonrpc: "2.0", method, params });
   }
 
-  async initialize(clientInfo?: { name: string; version: string }): Promise<unknown> {
+  async initialize(opts?: {
+    clientInfo?: { name: string; version: string };
+    /** Phone capabilities. fs and terminal stay enabled because the bridge implements them. */
+    clientCapabilities?: Record<string, unknown>;
+  }): Promise<unknown> {
+    const phone = opts?.clientCapabilities ?? {};
     return this.request("initialize", {
       protocolVersion: 1,
       clientCapabilities: {
+        ...phone,
         fs: { readTextFile: true, writeTextFile: true },
         terminal: true,
       },
-      clientInfo: clientInfo ?? { name: "gradation-bridge", version: "0.1.0" },
+      clientInfo: opts?.clientInfo ?? { name: "gradation-bridge", version: "0.1.0" },
     });
   }
 
@@ -244,18 +297,24 @@ export class AcpStdioClient {
     cwd: string;
     mcpServers?: unknown[];
     _meta?: Record<string, unknown>;
-  }): Promise<{ sessionId: string; [k: string]: unknown }> {
+  }): Promise<Record<string, unknown> & { sessionId: string }> {
     const result = (await this.request("session/new", {
       cwd: params.cwd,
       mcpServers: params.mcpServers ?? [],
       ...(params._meta ? { _meta: params._meta } : {}),
-    })) as { sessionId?: string };
-    if (!result?.sessionId) throw new Error("session/new did not return sessionId");
-    return result as { sessionId: string };
+    })) as { sessionId?: unknown };
+    if (!result || typeof result.sessionId !== "string" || !result.sessionId) {
+      throw new Error("session/new did not return sessionId");
+    }
+    return result as Record<string, unknown> & { sessionId: string };
   }
 
-  async prompt(sessionId: string, prompt: unknown): Promise<unknown> {
-    return this.request("session/prompt", { sessionId, prompt });
+  async prompt(params: Record<string, unknown>): Promise<unknown> {
+    return this.request("session/prompt", params);
+  }
+
+  async setMode(sessionId: string, modeId: string): Promise<unknown> {
+    return this.request("session/set_mode", { sessionId, modeId }, 30_000);
   }
 
   cancel(sessionId: string): void {

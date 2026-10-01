@@ -7,9 +7,16 @@
  * Emits session/update chunks and optionally session/request_permission.
  *
  * Env:
- *   FAKE_ACP_PERMISSION=1  — request permission mid-prompt (edit kind)
- *   FAKE_ACP_SLOW_MS=N     — delay between update chunks
+ *   FAKE_ACP_PERMISSION=1       — request permission mid-prompt
+ *   FAKE_ACP_PERMISSION_KIND    — tool kind for that request (default edit)
+ *   FAKE_ACP_FS_WRITE=1         — call fs/write_text_file during the prompt
+ *   FAKE_ACP_TERMINAL=1         — call terminal/create during the prompt
+ *   FAKE_ACP_AUTH=1             — advertise an auth method from initialize
+ *   FAKE_ACP_DUMP=<file>        — write the initialize params JSON to a file
+ *   FAKE_ACP_SLOW_MS=N          — delay between update chunks
  */
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 
 interface JsonRpcRequest {
@@ -22,6 +29,11 @@ interface JsonRpcRequest {
 const sessions = new Map<string, { cwd: string; cancelled: boolean }>();
 let nextSession = 1;
 const wantPermission = process.env.FAKE_ACP_PERMISSION === "1";
+const permissionKind = process.env.FAKE_ACP_PERMISSION_KIND || "edit";
+const wantWrite = process.env.FAKE_ACP_FS_WRITE === "1";
+const wantTerminal = process.env.FAKE_ACP_TERMINAL === "1";
+const wantAuth = process.env.FAKE_ACP_AUTH === "1";
+const dumpPath = process.env.FAKE_ACP_DUMP;
 const slowMs = Number(process.env.FAKE_ACP_SLOW_MS ?? "0") || 0;
 
 function write(obj: unknown): void {
@@ -118,11 +130,12 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     try {
       const permResult = (await requestClient("session/request_permission", {
         sessionId,
-        toolCall: {
+          toolCall: {
           toolCallId,
-          title: "Edit README.md",
-          kind: "edit",
-          locations: [{ path: `${session.cwd}/README.md` }],
+          title: permissionKind === "execute" ? "Run command" : "Edit README.md",
+          kind: permissionKind,
+          locations:
+            permissionKind === "execute" ? [] : [{ path: join(session.cwd, "README.md") }],
         },
         options: [
           { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
@@ -160,6 +173,54 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
   if (session.cancelled) {
     respond(id, { stopReason: "cancelled" });
     return;
+  }
+
+  if (wantWrite) {
+    try {
+      await requestClient("fs/write_text_file", {
+        sessionId,
+        path: join(session.cwd, "README.md"),
+        content: "agent write\n",
+      });
+    } catch (e) {
+      notify("session/update", {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `write failed: ${e instanceof Error ? e.message : String(e)}` },
+        },
+      });
+      respond(id, { stopReason: "end_turn" });
+      return;
+    }
+  }
+
+  if (wantTerminal) {
+    try {
+      const created = (await requestClient("terminal/create", {
+        sessionId,
+        command: process.execPath,
+        args: ["-e", "process.stdout.write('term-ok')"],
+        cwd: session.cwd,
+      })) as { terminalId?: string };
+      const terminalId = String(created?.terminalId ?? "");
+      await requestClient("terminal/wait_for_exit", { sessionId, terminalId });
+      await requestClient("terminal/output", { sessionId, terminalId });
+      await requestClient("terminal/release", { sessionId, terminalId });
+    } catch (e) {
+      notify("session/update", {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: `terminal failed: ${e instanceof Error ? e.message : String(e)}`,
+          },
+        },
+      });
+      respond(id, { stopReason: "end_turn" });
+      return;
+    }
   }
 
   notify("session/update", {
@@ -207,6 +268,7 @@ async function dispatch(msg: JsonRpcRequest): Promise<void> {
 
   switch (method) {
     case "initialize":
+      if (dumpPath) writeFileSync(dumpPath, JSON.stringify(params));
       respond(id, {
         protocolVersion: 1,
         agentCapabilities: {
@@ -214,12 +276,25 @@ async function dispatch(msg: JsonRpcRequest): Promise<void> {
           promptCapabilities: { image: false, audio: false, embeddedContext: false },
         },
         agentInfo: { name: "fake-acp-agent", version: "0.1.0" },
+        ...(wantAuth
+          ? {
+              authMethods: [
+                { id: "fake_login", name: "Fake login", description: "Test auth method" },
+              ],
+            }
+          : {}),
       });
       return;
     case "session/new": {
       const sessionId = `fake-${nextSession++}`;
       sessions.set(sessionId, { cwd: String(params.cwd ?? process.cwd()), cancelled: false });
-      respond(id, { sessionId });
+      respond(id, {
+        sessionId,
+        modes: {
+          currentModeId: "agent",
+          availableModes: [{ id: "agent", name: "Agent", description: "Fake agent mode" }],
+        },
+      });
       return;
     }
     case "session/load": {

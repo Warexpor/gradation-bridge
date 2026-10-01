@@ -1,7 +1,32 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import { type BridgeConfig, defaultConfig } from "./types.js";
+
+const HarnessSchema = z
+  .object({
+    id: z.string().min(1),
+    name: z.string().min(1),
+    command: z.string().min(1),
+    args: z.array(z.string()).optional(),
+    env: z.record(z.string()).optional(),
+    enabled: z.boolean().optional(),
+  })
+  .strict();
+
+const ConfigSchema = z
+  .object({
+    allowedRoots: z.array(z.string()).optional(),
+    workspaces: z.array(z.string()).optional(),
+    defaultPermissionMode: z.enum(["ask", "auto-edit", "plan", "full-auto"]).optional(),
+    harnesses: z.array(HarnessSchema).optional(),
+    env: z.record(z.string()).optional(),
+    port: z.number().int().positive().max(65535).optional(),
+    hostName: z.string().min(1).optional(),
+    logLevel: z.enum(["debug", "info", "warn", "error", "silent"]).optional(),
+  })
+  .strict();
 
 export function configDir(): string {
   const xdg = process.env.XDG_CONFIG_HOME;
@@ -34,7 +59,21 @@ export function loadConfig(): BridgeConfig {
     writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
     return cfg;
   }
-  const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<BridgeConfig>;
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(readFileSync(path, "utf8"));
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    throw new Error(`Invalid JSON in ${path}: ${detail}`);
+  }
+  const parsed = ConfigSchema.safeParse(parsedJson);
+  if (!parsed.success) {
+    const detail = parsed.error.issues
+      .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+      .join("; ");
+    throw new Error(`Invalid config ${path}: ${detail}`);
+  }
+  const raw = parsed.data;
   const base = defaultConfig();
   return {
     ...base,

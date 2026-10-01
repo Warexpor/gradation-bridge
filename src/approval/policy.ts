@@ -13,6 +13,30 @@ import { isPathAllowed } from "./sandbox.js";
 
 export type PermissionMode = "ask" | "auto-edit" | "plan" | "full-auto";
 
+/** Descriptions returned by initialize so the phone can label bridge policy. */
+export const PERMISSION_MODES: Array<{ id: PermissionMode; name: string; description: string }> = [
+  {
+    id: "ask",
+    name: "Ask",
+    description: "Forward each tool approval to the phone. Writes and commands need that approval.",
+  },
+  {
+    id: "auto-edit",
+    name: "Auto-edit",
+    description: "Allow edits inside the workspace. Commands still need approval.",
+  },
+  {
+    id: "plan",
+    name: "Plan",
+    description: "Reject writes and commands on the bridge. Reads stay allowed.",
+  },
+  {
+    id: "full-auto",
+    name: "Full auto",
+    description: "Allow every tool. The machine logs a warning the first time.",
+  },
+];
+
 /** ACP tool-call / permission kinds we care about for policy. */
 export type PermissionKind =
   | "edit"

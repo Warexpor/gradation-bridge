@@ -19,6 +19,8 @@ export interface HarnessConfig {
   enabled?: boolean;
 }
 
+export type LogLevelName = "debug" | "info" | "warn" | "error" | "silent";
+
 export interface BridgeConfig {
   /** Allowed workspace roots; paths outside these are refused. */
   allowedRoots: string[];
@@ -31,6 +33,8 @@ export interface BridgeConfig {
   /** TCP port; default 8787. */
   port?: number;
   hostName?: string;
+  /** Stderr threshold. Overridden by GRADATION_LOG. */
+  logLevel?: LogLevelName;
 }
 
 export const DEFAULT_HARNESSES: HarnessConfig[] = [
@@ -38,13 +42,13 @@ export const DEFAULT_HARNESSES: HarnessConfig[] = [
     id: "claude-code",
     name: "Claude Code",
     command: "npx",
-    args: ["-y", "@zed-industries/claude-code-acp"],
+    args: ["-y", "@agentclientprotocol/claude-agent-acp"],
   },
   {
     id: "codex",
     name: "Codex CLI",
     command: "npx",
-    args: ["-y", "@zed-industries/codex-acp"],
+    args: ["-y", "@agentclientprotocol/codex-acp"],
   },
   {
     id: "opencode",
@@ -55,20 +59,19 @@ export const DEFAULT_HARNESSES: HarnessConfig[] = [
   {
     id: "grok-build",
     name: "Grok Build",
-    command: "npx",
-    args: ["-y", "@xai-official/grok", "agent", "stdio"],
+    command: "grok",
+    args: ["agent", "stdio"],
   },
   {
     id: "cursor-cli",
     name: "Cursor CLI",
-    command: "agent",
+    command: "cursor-agent",
     args: ["acp"],
   },
   {
     id: "pi",
     name: "Pi",
-    command: "npx",
-    args: ["-y", "pi-acp"],
+    command: "pi-acp",
   },
 ];
 

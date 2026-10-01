@@ -3,7 +3,9 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { spawn as spawnProc } from "node:child_process";
 import type { BridgeConfig, PermissionMode } from "../config/types.js";
+import { BridgeError } from "../errors.js";
 import { findHarness } from "../harness/registry.js";
+import { launchErrorData, resolveHarnessLaunch } from "../harness/catalog.js";
 import { AcpStdioClient, type AcpJsonRpcRequest } from "../acp/client.js";
 import {
   optionKindById,
@@ -14,7 +16,16 @@ import {
   type RequestPermissionParams,
 } from "../acp/permissions.js";
 import { decidePermission, requiresMachineWarning } from "../approval/policy.js";
+import {
+  consumeGrant,
+  grantFamilyForKind,
+  grantFromOption,
+  resolveGrantPath,
+  type GrantFamily,
+  type ToolGrant,
+} from "../approval/grants.js";
 import { assertAllowedRealPath, assertAllowedWorkspace, SandboxError } from "../approval/sandbox.js";
+import { log } from "../log/diagnostics.js";
 import { SessionLog } from "./log.js";
 
 export type SessionStatus = "idle" | "running" | "needs_approval" | "error" | "closed";
@@ -34,9 +45,18 @@ export interface SessionRecord {
   log: SessionLog;
   client: AcpStdioClient | null;
   agentSessionId: string;
+  /** Approvals the phone already gave. Not sent to the phone. */
+  grants: ToolGrant[];
+  /** ACP session/new `modes`, when the agent returned them. */
+  sessionModes?: unknown;
+  agentInfo?: { name: string; version?: string };
+  authMethods?: Array<{ id: string; name?: string; description?: string }>;
 }
 
-export type SessionSummary = Omit<SessionRecord, "log" | "client" | "agentSessionId">;
+export type SessionSummary = Omit<
+  SessionRecord,
+  "log" | "client" | "agentSessionId" | "grants" | "sessionModes" | "agentInfo" | "authMethods"
+>;
 
 export type BridgeEmitter = (msg: unknown) => void;
 
@@ -60,6 +80,7 @@ export class SessionManager {
   private sessions = new Map<string, SessionRecord>();
   private opts: SessionManagerOptions;
   private fullAutoWarned = false;
+  private phoneInitialize: Record<string, unknown> | undefined;
   private terminals = new Map<
     string,
     { child: ReturnType<typeof spawnProc>; sessionId: string; chunks: Buffer[] }
@@ -78,6 +99,13 @@ export class SessionManager {
 
   updateConfig(config: BridgeConfig): void {
     this.opts.config = config;
+  }
+
+  /** Remember the phone's initialize params so the next agent sees its capabilities. */
+  notePhoneInitialize(params: unknown): void {
+    if (params && typeof params === "object" && !Array.isArray(params)) {
+      this.phoneInitialize = params as Record<string, unknown>;
+    }
   }
 
   get config(): BridgeConfig {
@@ -139,10 +167,46 @@ export class SessionManager {
 
   setPermissionMode(sessionId: string, mode: PermissionMode): void {
     const rec = this.sessions.get(sessionId);
-    if (!rec) throw new Error(`unknown session: ${sessionId}`);
-    rec.permissionMode = mode;
+    if (!rec) throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
+    if (rec.permissionMode !== mode) {
+      rec.grants = [];
+      rec.permissionMode = mode;
+    }
     rec.updatedAt = new Date().toISOString();
     this.warnFullAuto(mode);
+    log("info", `permission mode ${mode} session=${sessionId}`);
+  }
+
+  /**
+   * ACP session/set_mode. Bridge permission ids also update local policy so
+   * existing GradatiON clients keep working. Other ids (Cursor's `agent`, …)
+   * are forwarded to the harness only.
+   */
+  async applyMode(sessionId: string, modeId: string): Promise<Record<string, unknown>> {
+    const rec = this.requireSession(sessionId);
+    const isPermission = isPermissionMode(modeId);
+    if (isPermission) this.setPermissionMode(sessionId, modeId);
+    let forwarded = false;
+    let warning: string | undefined;
+    if (rec.client?.running) {
+      try {
+        await rec.client.setMode(rec.agentSessionId, modeId);
+        forwarded = true;
+      } catch (e) {
+        warning = e instanceof Error ? e.message : String(e);
+        log("info", `session/set_mode ${modeId} rejected by agent: ${warning}`);
+        if (!isPermission) {
+          throw new BridgeError(-32602, warning, { modeId, sessionId });
+        }
+      }
+    } else if (!isPermission) {
+      throw new BridgeError(-32002, `session agent not running: ${sessionId}`, { sessionId });
+    }
+    return {
+      ...(isPermission ? { permissionMode: rec.permissionMode } : {}),
+      forwarded,
+      ...(warning ? { warning } : {}),
+    };
   }
 
   private warnFullAuto(mode: PermissionMode): void {
@@ -193,16 +257,29 @@ export class SessionManager {
     const cwd = assertAllowedWorkspace(params.cwd, config.allowedRoots);
     const harness = findHarness(config, params.harnessId);
     if (!harness) {
-      const err = new Error(`unknown harness: ${params.harnessId}`) as Error & { code?: number };
-      err.code = -32602;
-      throw err;
+      throw new BridgeError(-32602, `unknown harness: ${params.harnessId}`, {
+        harnessId: params.harnessId,
+      });
+    }
+    const launch = resolveHarnessLaunch(harness);
+    if (!launch.available) {
+      log("error", `harness ${harness.id} missing: ${launch.detail}`);
+      throw new BridgeError(
+        -32010,
+        `harness ${harness.id} is not available: ${launch.detail}`,
+        launchErrorData(launch),
+      );
     }
     const permissionMode = params.permissionMode ?? config.defaultPermissionMode ?? "ask";
     this.warnFullAuto(permissionMode);
+    log(
+      "info",
+      `starting harness ${harness.id} (${launch.readiness}) ${launch.command} ${launch.displayArgs.join(" ")}`.trim(),
+    );
 
     const tempId = randomBytes(12).toString("hex");
     const now = new Date().toISOString();
-    const log = new SessionLog(tempId);
+    const sessionLog = new SessionLog(tempId);
     const rec: SessionRecord = {
       sessionId: tempId,
       harness: harness.id,
@@ -214,16 +291,17 @@ export class SessionManager {
       status: "idle",
       permissionMode,
       lastSeq: 0,
-      log,
+      log: sessionLog,
       client: null,
       agentSessionId: tempId,
+      grants: [],
     };
     this.sessions.set(tempId, rec);
 
     // Capture session id by reference so handlers see re-keying.
     const self = this;
     const client = new AcpStdioClient({
-      harness,
+      harness: { ...harness, command: launch.command, args: launch.args },
       cwd,
       env: config.env,
       onNotification: (msg) => {
@@ -234,11 +312,21 @@ export class SessionManager {
         const current = self.sessions.get(rec.sessionId) ?? rec;
         return self.onAgentRequest(current, req);
       },
+      onStderr: (line) => {
+        log("debug", `harness ${harness.id} stderr: ${line}`);
+      },
       onExit: (code, signal) => {
         if (rec.status !== "closed") {
           rec.status = "error";
-          rec.preview = `agent exited (code=${code}, signal=${signal})`;
+          const tail = client.stderrTail().split("\n").filter(Boolean).slice(-1)[0];
+          rec.preview = tail
+            ? `agent exited (code=${code}, signal=${signal}): ${tail}`
+            : `agent exited (code=${code}, signal=${signal})`;
           rec.updatedAt = new Date().toISOString();
+          log(
+            "warn",
+            `harness ${harness.id} exited code=${code} signal=${signal} session=${rec.sessionId}`,
+          );
           self.emitSessionStatus(rec);
         }
       },
@@ -247,10 +335,17 @@ export class SessionManager {
 
     try {
       client.start();
-      await client.initialize({
-        name: "gradation-bridge",
-        version: this.opts.version ?? "0.1.0",
+      const phoneCaps = this.phoneCapabilities();
+      const initialized = await client.initialize({
+        clientInfo: {
+          name: "gradation-bridge",
+          version: this.opts.version ?? "0.1.0",
+        },
+        clientCapabilities: phoneCaps,
       });
+      const agentInit = readAgentInitialize(initialized);
+      rec.agentInfo = agentInit.agentInfo;
+      rec.authMethods = agentInit.authMethods;
       const created = await client.newSession({
         cwd,
         mcpServers: params.mcpServers ?? [],
@@ -261,6 +356,9 @@ export class SessionManager {
         },
       });
       const agentSessionId = created.sessionId;
+      if (created.modes && typeof created.modes === "object") {
+        rec.sessionModes = created.modes;
+      }
       if (agentSessionId !== tempId) {
         this.sessions.delete(tempId);
         rec.sessionId = agentSessionId;
@@ -270,20 +368,32 @@ export class SessionManager {
       this.setStatus(rec.sessionId, "idle");
       return rec;
     } catch (e) {
+      const stderr = client.stderrTail().slice(-2000);
       rec.status = "error";
       client.kill();
       rec.client = null;
       this.sessions.delete(rec.sessionId);
-      throw e;
+      if (e instanceof BridgeError) throw e;
+      const message = e instanceof Error ? e.message : String(e);
+      log("error", `harness ${harness.id} failed to start: ${message}`);
+      throw new BridgeError(
+        -32010,
+        `harness ${harness.id} failed to start: ${message}`,
+        launchErrorData(launch, stderr ? { stderr } : {}),
+      );
     }
   }
 
-  async prompt(sessionId: string, prompt: unknown): Promise<unknown> {
+  async prompt(sessionId: string, params: unknown): Promise<unknown> {
     const rec = this.requireSession(sessionId);
     if (!rec.client?.running) throw new Error(`session agent not running: ${sessionId}`);
     this.setStatus(sessionId, "running");
+    const body =
+      params && typeof params === "object" && !Array.isArray(params)
+        ? (params as Record<string, unknown>)
+        : {};
     try {
-      const result = await rec.client.prompt(sessionId, prompt);
+      const result = await rec.client.prompt({ ...body, sessionId: rec.agentSessionId });
       if (rec.status === "running" || rec.status === "needs_approval") {
         this.setStatus(sessionId, "idle");
       }
@@ -324,9 +434,10 @@ export class SessionManager {
     for (const entry of rec.log.replay(afterSeq)) {
       opts.send(entry.event);
     }
+    let agentResult: unknown = {};
     if (rec.client?.running) {
       try {
-        await rec.client.loadSession({
+        agentResult = await rec.client.loadSession({
           sessionId,
           cwd: opts.cwd ?? rec.cwd,
           mcpServers: opts.mcpServers ?? [],
@@ -335,12 +446,55 @@ export class SessionManager {
         /* replay alone is enough */
       }
     }
+    if (agentResult && typeof agentResult === "object") {
+      return agentResult as Record<string, unknown>;
+    }
     return {};
+  }
+
+  private phoneCapabilities(): Record<string, unknown> | undefined {
+    const caps = this.phoneInitialize?.clientCapabilities;
+    if (caps && typeof caps === "object" && !Array.isArray(caps)) {
+      return caps as Record<string, unknown>;
+    }
+    return undefined;
+  }
+
+  private assertMutatingTool(rec: SessionRecord, family: GrantFamily, path?: string): void {
+    const decision = decidePermission(rec.permissionMode, {
+      kind: family === "write" ? "write" : "execute",
+      path,
+      workspaceRoot: rec.cwd,
+      allowedRoots: this.opts.config.allowedRoots,
+    });
+    if (decision.action === "deny") {
+      log(
+        "warn",
+        `blocked ${family} session=${rec.sessionId} mode=${rec.permissionMode}: ${decision.reason}`,
+      );
+      throw new BridgeError(-32003, decision.reason, {
+        sessionId: rec.sessionId,
+        permissionMode: rec.permissionMode,
+        kind: family,
+      });
+    }
+    if (decision.action === "ask" && !consumeGrant(rec.grants, family, path)) {
+      const message =
+        family === "write"
+          ? "write requires approval before the agent can change files"
+          : "command requires approval before the agent can run a terminal";
+      log("warn", `blocked ${family} session=${rec.sessionId}: ${message}`);
+      throw new BridgeError(-32003, message, {
+        sessionId: rec.sessionId,
+        permissionMode: rec.permissionMode,
+        kind: family,
+      });
+    }
   }
 
   private requireSession(sessionId: string): SessionRecord {
     const rec = this.sessions.get(sessionId);
-    if (!rec) throw new Error(`unknown session: ${sessionId}`);
+    if (!rec) throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
     return rec;
   }
 
@@ -405,6 +559,11 @@ export class SessionManager {
     });
     const options = (params.options ?? []) as PermissionOption[];
 
+    log(
+      "info",
+      `permission ${decision.action} session=${rec.sessionId} mode=${rec.permissionMode} kind=${kind}: ${decision.reason}`,
+    );
+
     if (decision.action === "allow") {
       const optionId = pickOptionId(options, "allow");
       if (!optionId) return { outcome: { outcome: "cancelled" } };
@@ -443,6 +602,14 @@ export class SessionManager {
       const outcome = (result as { outcome?: { outcome?: string; optionId?: string } })?.outcome;
       const optionId = outcome?.optionId;
       const optionKind = optionKindById(options, optionId);
+      if (outcome?.outcome === "selected") {
+        const grant = grantFromOption(
+          optionKind,
+          grantFamilyForKind(kind),
+          resolveGrantPath(path, rec.cwd),
+        );
+        if (grant) rec.grants.push(grant);
+      }
       this.opts.broadcast?.({
         jsonrpc: "2.0",
         method: "bridge/permissionResolved",
@@ -479,6 +646,7 @@ export class SessionManager {
     const p = (params ?? {}) as { path?: string; content?: string };
     if (!p.path) throw Object.assign(new Error("path required"), { code: -32602 });
     const path = assertAllowedRealPath(p.path, this.opts.config.allowedRoots, rec.cwd);
+    this.assertMutatingTool(rec, "write", path);
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, p.content ?? "", "utf8");
     return {};
@@ -498,6 +666,7 @@ export class SessionManager {
     const cwd = p.cwd
       ? assertAllowedRealPath(p.cwd, this.opts.config.allowedRoots, rec.cwd)
       : rec.cwd;
+    this.assertMutatingTool(rec, "exec");
     const env: NodeJS.ProcessEnv = { ...process.env };
     for (const e of p.env ?? []) env[e.name] = e.value;
     const terminalId = randomBytes(8).toString("hex");
@@ -595,3 +764,45 @@ export class SessionManager {
 }
 
 export { SandboxError };
+
+const PERMISSION_MODE_IDS = new Set<PermissionMode>(["ask", "auto-edit", "plan", "full-auto"]);
+
+function isPermissionMode(modeId: string): modeId is PermissionMode {
+  return PERMISSION_MODE_IDS.has(modeId as PermissionMode);
+}
+
+function readAgentInitialize(result: unknown): {
+  agentInfo?: { name: string; version?: string };
+  authMethods?: Array<{ id: string; name?: string; description?: string }>;
+} {
+  if (!result || typeof result !== "object") return {};
+  const obj = result as Record<string, unknown>;
+  let agentInfo: { name: string; version?: string } | undefined;
+  const info = obj.agentInfo;
+  if (info && typeof info === "object") {
+    const rec = info as Record<string, unknown>;
+    if (typeof rec.name === "string") {
+      agentInfo = {
+        name: rec.name,
+        ...(typeof rec.version === "string" ? { version: rec.version } : {}),
+      };
+    }
+  }
+  const methods = Array.isArray(obj.authMethods) ? obj.authMethods : [];
+  const authMethods = methods.flatMap((m) => {
+    if (!m || typeof m !== "object") return [];
+    const rec = m as Record<string, unknown>;
+    if (typeof rec.id !== "string") return [];
+    return [
+      {
+        id: rec.id,
+        ...(typeof rec.name === "string" ? { name: rec.name } : {}),
+        ...(typeof rec.description === "string" ? { description: rec.description.slice(0, 240) } : {}),
+      },
+    ];
+  });
+  return {
+    agentInfo,
+    ...(authMethods.length ? { authMethods } : {}),
+  };
+}
