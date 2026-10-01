@@ -1,10 +1,11 @@
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { formatDoctorReport } from "../src/cli/doctor.js";
 import { ensurePrimaryToken } from "../src/auth/token.js";
 import { log, recentLogs, resetLogsForTests, setLogLevel } from "../src/log/diagnostics.js";
+import { fingerprintOfPem } from "../src/auth/cert.js";
 import { buildPairingPayload, pairingSafetyLines } from "../src/auth/pairing.js";
 
 const dirs: string[] = [];
@@ -60,6 +61,31 @@ describe("diagnostics and pairing safety", () => {
     expect(report).not.toContain(token);
     expect(report).not.toContain("sk-supersecretvalue");
     expect(report).toMatch(/prefer Tailscale/);
+    expect(report).toContain("tls:     missing");
+    expect(report).not.toMatch(/cert fp:/);
+  });
+
+  it("prints the cert fingerprint and not the pairing token", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-doc-fp-"));
+    dirs.push(root);
+    process.env.XDG_CONFIG_HOME = join(root, "config");
+    process.env.XDG_DATA_HOME = join(root, "data");
+    mkdirSync(join(process.env.XDG_DATA_HOME, "gradation-bridge", "certs"), { recursive: true });
+    const body = Buffer.from("pairing-cert").toString("base64");
+    const pem = `-----BEGIN CERTIFICATE-----\n${body}\n-----END CERTIFICATE-----\n`;
+    writeFileSync(join(process.env.XDG_DATA_HOME, "gradation-bridge", "certs", "server.crt"), pem);
+    const token = ensurePrimaryToken().token;
+    const report = formatDoctorReport({
+      allowedRoots: ["/tmp/project"],
+      defaultPermissionMode: "ask",
+      port: 8787,
+      harnesses: [],
+    });
+    const fingerprint = fingerprintOfPem(pem);
+    expect(report).toContain(`cert fp: ${fingerprint}`);
+    expect(report).toContain("tls:     ready");
+    expect(report).not.toContain(token);
+    expect(report).not.toContain("pairing-cert");
   });
 
   it("pairing payload labels the machine and warns on non-loopback binds", () => {

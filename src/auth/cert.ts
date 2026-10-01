@@ -22,6 +22,32 @@ function certPaths(): { keyPath: string; certPath: string } {
   };
 }
 
+/** What `doctor` and `bridge/diagnostics` may say about TLS. Never includes a token. */
+export function tlsDiagnostics(certPem: string | undefined): {
+  tls: boolean;
+  certFingerprint?: string;
+} {
+  if (!certPem || !certPem.includes("BEGIN CERTIFICATE")) return { tls: false };
+  return { tls: true, certFingerprint: fingerprintOfPem(certPem) };
+}
+
+/**
+ * Read the on-disk cert without minting a new one.
+ * `stub` means the openssl fallback marker, which must not be pinned.
+ */
+export function inspectTlsFiles(): {
+  certPath: string;
+  state: "missing" | "stub" | "ready";
+  fingerprintSha256?: string;
+} {
+  const { certPath } = certPaths();
+  if (!existsSync(certPath)) return { certPath, state: "missing" };
+  const certPem = readFileSync(certPath, "utf8");
+  const diag = tlsDiagnostics(certPem);
+  if (!diag.tls || !diag.certFingerprint) return { certPath, state: "stub" };
+  return { certPath, state: "ready", fingerprintSha256: diag.certFingerprint };
+}
+
 export function fingerprintOfPem(certPem: string): string {
   const b64 = certPem
     .replace(/-----BEGIN CERTIFICATE-----/g, "")

@@ -11,6 +11,7 @@ import {
   readAgentInitialize,
   type PublicAuthMethod,
 } from "../acp/auth-method.js";
+import { REQUEST_CANCELLED } from "../acp/cancel.js";
 import { AcpStdioClient, isMethodNotFound, type AcpJsonRpcRequest } from "../acp/client.js";
 import {
   bindElicitationSession,
@@ -119,6 +120,19 @@ export type BridgeEmitter = (
   opts?: { droppable?: boolean },
 ) => void | boolean | Promise<void | boolean>;
 
+/** Which in-flight phone prompts to abort. */
+export interface PhoneCancelFilter {
+  sessionId?: string;
+  /** Pre-session login owner (`warm:<harness>\\0<cwd>`). */
+  owner?: string;
+  method?: string;
+}
+
+export interface PhoneRequestContext {
+  signal?: AbortSignal;
+  owner?: string;
+}
+
 export interface SessionManagerOptions {
   config: BridgeConfig;
   /** Broadcast a JSON-RPC message to all connected phones. */
@@ -127,9 +141,10 @@ export interface SessionManagerOptions {
   requestPhone?: (
     method: string,
     params: unknown,
+    ctx?: PhoneRequestContext,
   ) => Promise<{ result?: unknown; error?: unknown; requestId: string | number }>;
-  /** Abort in-flight phone requests for a session (cancel / disconnect policy). */
-  cancelPhoneRequests?: (sessionId: string) => void;
+  /** Abort in-flight phone requests (session cancel, or one warm login). */
+  cancelPhoneRequests?: (filter: PhoneCancelFilter) => void;
   version?: string;
 }
 
@@ -148,8 +163,14 @@ export class SessionManager {
   private warm = new Map<string, WarmAuth>();
   /** Pre-session authenticate calls. A second call for the same key is refused. */
   private warmInflight = new Map<string, Promise<unknown>>();
+  /** Process started for a login that has not been stored in `warm` yet. */
+  private warmLive = new Map<string, AcpStdioClient>();
   /** Bumped when a warm login is cancelled so a late success cannot install itself. */
   private warmEpoch = new Map<string, number>();
+  /** Set when the phone cancels the in-flight authenticate (`$/cancel_request`). */
+  private warmAbort = new Set<string>();
+  /** Bumped when a session authenticate is cancelled. Captured at the start of the call. */
+  private sessionAuthEpoch = new Map<string, number>();
 
   constructor(opts?: SessionManagerOptions) {
     this.opts = opts ?? {
@@ -272,8 +293,8 @@ export class SessionManager {
           throw new BridgeError(-32602, warning, { modeId, sessionId });
         }
       }
-    } else if (!isPermission) {
-      throw new BridgeError(-32002, `session agent not running: ${sessionId}`, { sessionId });
+      } else if (!isPermission) {
+      throw new BridgeError(-32004, `session agent not running: ${sessionId}`, { sessionId });
     }
     return {
       ...(isPermission ? { permissionMode: rec.permissionMode } : {}),
@@ -299,7 +320,7 @@ export class SessionManager {
     rec.status = "closed";
     rec.promptInFlight = false;
     rec.cancelRequested = true;
-    this.opts.cancelPhoneRequests?.(sessionId);
+    this.opts.cancelPhoneRequests?.({ sessionId });
     rec.client?.kill();
     rec.client = null;
     this.terminals.closeSession(sessionId);
@@ -338,7 +359,7 @@ export class SessionManager {
     if (rec.status === "closed") return {};
     rec.closing = true;
     rec.cancelRequested = true;
-    this.opts.cancelPhoneRequests?.(sessionId);
+    this.opts.cancelPhoneRequests?.({ sessionId });
     if (rec.client?.running) {
       try {
         await rec.client.closeSession(rec.agentSessionId);
@@ -486,7 +507,16 @@ export class SessionManager {
 
     let client: AcpStdioClient | undefined;
     try {
-      const warm = this.takeMatchingWarm(harness.id, cwd, launch, overlayEnv(config.env, harness.env));
+      const warmKeyForLaunch = warmKey(harness.id, cwd);
+    const pendingAuth = this.warmInflight.get(warmKeyForLaunch);
+    if (pendingAuth) {
+      try {
+        await pendingAuth;
+      } catch {
+        // A failed or cancelled login does not block a fresh session process.
+      }
+    }
+    const warm = this.takeMatchingWarm(harness.id, cwd, launch, overlayEnv(config.env, harness.env));
       if (warm) {
         client = warm.client;
         this.wireClient(rec, client, harness.id);
@@ -597,8 +627,8 @@ export class SessionManager {
     const rec = this.sessions.get(sessionId);
     if (!rec || rec.status === "closed") return;
     rec.cancelRequested = true;
-    // Unblock an agent waiting on session/request_permission.
-    this.opts.cancelPhoneRequests?.(sessionId);
+    // Unblock an agent waiting on session/request_permission or elicitation/create.
+    this.opts.cancelPhoneRequests?.({ sessionId });
     if (rec.client?.running) rec.client.cancel(rec.agentSessionId);
   }
 
@@ -620,6 +650,7 @@ export class SessionManager {
     }
     const rawAfter = opts.afterSeq ?? 0;
     const afterSeq = Number.isFinite(rawAfter) ? Math.max(0, Math.floor(rawAfter)) : 0;
+    if (opts.cwd) this.assertSameSessionCwd(rec, opts.cwd);
     if (opts.mcpServers && opts.mcpServers.length > 0) {
       rec.mcpServers = opts.mcpServers;
     }
@@ -636,24 +667,28 @@ export class SessionManager {
 
     let agentAlive = Boolean(rec.client?.running);
     let agentResult: unknown = {};
+    let warning: string | undefined;
     if (!agentAlive && rec.status !== "closed" && !rec.promptInFlight) {
       this.assertSessionWorkspace(rec);
       try {
         agentResult = await this.respawnAgent(rec, "load");
         agentAlive = Boolean(rec.client?.running);
-      } catch {
+      } catch (e) {
         agentAlive = false;
+        warning = e instanceof Error ? e.message : String(e);
+        log("warn", `session/load ${sessionId}: ${warning}`);
       }
     } else if (agentAlive && rec.client && !rec.promptInFlight) {
       try {
         agentResult = await rec.client.loadSession({
           sessionId: rec.agentSessionId,
-          cwd: opts.cwd ?? rec.cwd,
+          cwd: rec.cwd,
           mcpServers: rec.mcpServers,
           additionalDirectories: rec.additionalDirectories,
         });
-      } catch {
-        /* replay alone is enough when the agent has no load support */
+      } catch (e) {
+        warning = e instanceof Error ? e.message : String(e);
+        log("info", `session/load ${sessionId} agent load failed: ${warning}`);
       }
     }
     this.captureSessionPayload(rec, agentResult);
@@ -663,6 +698,7 @@ export class SessionManager {
       agentAlive,
       lastSeq: rec.log.lastSeq,
       status: rec.status,
+      ...(warning ? { warning } : {}),
     };
     if (agentResult && typeof agentResult === "object") {
       return { ...(agentResult as Record<string, unknown>), ...replayMeta };
@@ -759,6 +795,15 @@ export class SessionManager {
     }
     if (input.sessionId) return this.authenticateSession(input.sessionId, methodId);
     const prepared = this.prepareWarm(input);
+    const replay = this.peekWarm(prepared, methodId);
+    if (replay) {
+      return this.authResult(
+        replay.harnessId,
+        replay.cwd,
+        replay.authMethods,
+        replay.logoutSupported,
+      );
+    }
     if (this.warmInflight.has(prepared.key)) {
       throw new BridgeError(-32005, "authentication already in progress", {
         harnessId: prepared.harness.id,
@@ -780,14 +825,48 @@ export class SessionManager {
       throw new BridgeError(-32004, `session agent not running: ${sessionId}`, { sessionId });
     }
     if (rec.authMethods) assertAgentAuthMethod(rec.authMethods, methodId);
+    const epoch = this.sessionAuthEpoch.get(sessionId) ?? 0;
     try {
       await client.authenticate(methodId);
     } catch (e) {
+      if ((this.sessionAuthEpoch.get(sessionId) ?? 0) !== epoch) {
+        throw new BridgeError(REQUEST_CANCELLED, "request cancelled", { sessionId });
+      }
       if (e instanceof BridgeError) throw e;
       const failure = agentFailure(e);
       throw new BridgeError(failure.code, failure.message, { sessionId });
     }
+    if ((this.sessionAuthEpoch.get(sessionId) ?? 0) !== epoch) {
+      throw new BridgeError(REQUEST_CANCELLED, "request cancelled", { sessionId });
+    }
     return this.authResult(rec.harness, rec.cwd, rec.authMethods ?? [], rec.logoutSupported, rec.sessionId);
+  }
+
+  /**
+   * Phone `$/cancel_request` for an in-flight `authenticate` / `logout`.
+   * Session login cancels that call and any elicitation it opened.
+   * A pre-session login drops the process so a retry does not keep a half-finished agent.
+   */
+  cancelAuth(input: { sessionId?: string; harnessId?: string; cwd?: string }): void {
+    if (input.sessionId) {
+      const rec = this.sessions.get(input.sessionId);
+      if (!rec || rec.status === "closed") return;
+      this.sessionAuthEpoch.set(input.sessionId, (this.sessionAuthEpoch.get(input.sessionId) ?? 0) + 1);
+      this.opts.cancelPhoneRequests?.({ sessionId: input.sessionId, method: "elicitation/create" });
+      rec.client?.cancelOutbound(["authenticate", "auth/login", "logout", "auth/logout"]);
+      return;
+    }
+    if (!input.harnessId || !input.cwd) return;
+    let cwd = input.cwd;
+    try {
+      cwd = assertAllowedWorkspace(input.cwd, this.opts.config.allowedRoots);
+    } catch {
+      return;
+    }
+    const key = warmKey(input.harnessId, cwd);
+    this.warmAbort.add(key);
+    this.bumpWarm(key);
+    this.opts.cancelPhoneRequests?.({ owner: `warm:${key}` });
   }
 
   private prepareWarm(input: { harnessId?: string; cwd?: string }): {
@@ -832,7 +911,12 @@ export class SessionManager {
       cwd,
       env: this.opts.config.env,
       onRequest: (req) => {
-        if (req.method === "elicitation/create") return this.relayElicitation(req.params);
+        if (req.method === "elicitation/create") {
+          return this.relayElicitation(req.params, undefined, {
+            signal: req.signal,
+            owner: `warm:${key}`,
+          });
+        }
         const err = new Error(`Method not found: ${req.method}`) as Error & { code?: number };
         err.code = -32601;
         throw err;
@@ -850,14 +934,15 @@ export class SessionManager {
       },
     });
     client.start();
+    this.warmLive.set(key, client);
     try {
       const initialized = await client.initialize(this.agentClientInfo());
       const info = readAgentInitialize(initialized);
       assertAgentAuthMethod(info.authMethods, methodId);
       await client.authenticate(methodId);
-      if (this.stopping || this.warmEpoch.get(key) !== epoch) {
+      if (this.authSuperseded(key, epoch)) {
         client.kill();
-        throw new BridgeError(-32010, "authentication was cancelled", { harnessId: harness.id });
+        throw this.authSupersededError(key, harness.id);
       }
       const timer = setTimeout(() => {
         const current = this.warm.get(key);
@@ -875,14 +960,18 @@ export class SessionManager {
         authMethods: info.authMethods,
         logoutSupported: info.logoutSupported,
         agentInfo: info.agentInfo,
+        methodId,
         timer,
       });
       return this.authResult(harness.id, cwd, info.authMethods, info.logoutSupported);
     } catch (e) {
       client.kill();
       if (e instanceof BridgeError) throw e;
+      if (this.authSuperseded(key, epoch)) throw this.authSupersededError(key, harness.id);
       const failure = agentFailure(e);
       throw new BridgeError(failure.code, failure.message, { harnessId: harness.id });
+    } finally {
+      if (this.warmLive.get(key) === client) this.warmLive.delete(key);
     }
   }
 
@@ -1000,10 +1089,16 @@ export class SessionManager {
     const self = this;
     client.setCallbacks({
       onNotification: (msg) => {
+        if (rec.clientGeneration !== gen || rec.client !== client) return;
         const current = self.sessions.get(rec.sessionId) ?? rec;
         self.onAgentNotification(current, msg.method, msg.params);
       },
       onRequest: (req) => {
+        if (rec.clientGeneration !== gen || rec.client !== client) {
+          const err = new Error("session agent replaced") as Error & { code?: number };
+          err.code = -32603;
+          throw err;
+        }
         const current = self.sessions.get(rec.sessionId) ?? rec;
         return self.onAgentRequest(current, req);
       },
@@ -1071,6 +1166,7 @@ export class SessionManager {
   }
 
   private onAgentNotification(rec: SessionRecord, method: string, params: unknown): void {
+    if (method.startsWith("$/")) return;
     if (method === "elicitation/complete") {
       this.forwardElicitationComplete(params);
       return;
@@ -1108,9 +1204,12 @@ export class SessionManager {
   private async onAgentRequest(rec: SessionRecord, req: AcpJsonRpcRequest): Promise<unknown> {
     switch (req.method) {
       case "session/request_permission":
-        return this.handlePermission(rec, (req.params ?? {}) as RequestPermissionParams);
+        return this.handlePermission(rec, (req.params ?? {}) as RequestPermissionParams, req.signal);
       case "elicitation/create":
-        return this.relayElicitation(req.params, rec.sessionId);
+        return this.relayElicitation(req.params, rec.sessionId, {
+          signal: req.signal,
+          owner: `session:${rec.sessionId}`,
+        });
       case "fs/read_text_file":
         return this.handleReadTextFile(rec, req.params);
       case "fs/write_text_file":
@@ -1136,6 +1235,7 @@ export class SessionManager {
   private async handlePermission(
     rec: SessionRecord,
     params: RequestPermissionParams,
+    reqSignal?: AbortSignal,
   ): Promise<unknown> {
     const toolCall = params.toolCall;
     const kind = policyKindFromToolCall(toolCall);
@@ -1178,6 +1278,12 @@ export class SessionManager {
     rec.lastSeq = entry.seq;
     const phoneParams = (entry.event as { params: Record<string, unknown> }).params;
 
+    if (reqSignal?.aborted || rec.cancelRequested || rec.closing) {
+      this.notePermissionResolved(rec, undefined, "cancelled");
+      if (rec.status === "needs_approval") this.setStatus(rec.sessionId, "idle");
+      return { outcome: { outcome: "cancelled" } };
+    }
+
     if (!this.opts.requestPhone) {
       if (rec.status === "needs_approval") this.setStatus(rec.sessionId, "idle");
       return { outcome: { outcome: "cancelled" } };
@@ -1192,11 +1298,13 @@ export class SessionManager {
       const { result, requestId } = await this.opts.requestPhone(
         "session/request_permission",
         phoneParams,
+        { signal: reqSignal, owner: `session:${rec.sessionId}` },
       );
       const outcome = (result as { outcome?: { outcome?: string; optionId?: string } })?.outcome;
       const optionId = outcome?.optionId;
       const optionKind = optionKindById(options, optionId);
-      if (!rec.cancelRequested && outcome?.outcome === "selected") {
+      const aborted = Boolean(reqSignal?.aborted || rec.cancelRequested);
+      if (!aborted && outcome?.outcome === "selected") {
         const grant = grantFromOption(
           optionKind,
           grantFamilyForKind(kind),
@@ -1207,12 +1315,12 @@ export class SessionManager {
           this.persist(rec);
         }
       }
-      const resolvedKind = rec.cancelRequested
+      const resolvedKind = aborted
         ? "cancelled"
         : (optionKind ?? outcome?.outcome ?? "cancelled");
       this.notePermissionResolved(rec, requestId, resolvedKind);
       resumeAfterAsk();
-      if (rec.cancelRequested) return { outcome: { outcome: "cancelled" } };
+      if (aborted) return { outcome: { outcome: "cancelled" } };
       return result ?? { outcome: { outcome: "cancelled" } };
     } catch {
       this.notePermissionResolved(rec, undefined, "cancelled");
@@ -1377,7 +1485,7 @@ export class SessionManager {
     if (!rec || rec.status === "closed") return;
     rec.closing = true;
     rec.cancelRequested = true;
-    this.opts.cancelPhoneRequests?.(sessionId);
+    this.opts.cancelPhoneRequests?.({ sessionId });
     rec.clientGeneration += 1;
     rec.promptInFlight = false;
     rec.client?.kill();
@@ -1544,6 +1652,47 @@ export class SessionManager {
     };
   }
 
+  private peekWarm(
+    prepared: ReturnType<SessionManager["prepareWarm"]>,
+    methodId: string,
+  ): WarmAuth | undefined {
+    const warm = this.warm.get(prepared.key);
+    if (!warm?.client.running || warm.methodId !== methodId) return undefined;
+    if (!this.launchMatches(warm, prepared.launch, prepared.env)) return undefined;
+    return warm;
+  }
+
+  private launchMatches(warm: WarmAuth, launch: HarnessLaunch, env: Record<string, string>): boolean {
+    return (
+      warm.command === launch.command &&
+      sameArgs(warm.args, launch.args ?? []) &&
+      sameEnv(warm.env, env)
+    );
+  }
+
+  private authSuperseded(key: string, epoch: number): boolean {
+    return this.stopping || this.warmEpoch.get(key) !== epoch || this.warmAbort.has(key);
+  }
+
+  private authSupersededError(key: string, harnessId: string): BridgeError {
+    const aborted = this.warmAbort.delete(key);
+    return new BridgeError(
+      aborted ? REQUEST_CANCELLED : -32010,
+      aborted ? "request cancelled" : "authentication was cancelled",
+      { harnessId },
+    );
+  }
+
+  private assertSameSessionCwd(rec: SessionRecord, cwd: string): void {
+    const resolved = assertAllowedRealPath(cwd, this.opts.config.allowedRoots, rec.cwd);
+    if (resolved !== rec.cwd) {
+      throw new BridgeError(-32602, "cwd does not match the session", {
+        sessionId: rec.sessionId,
+        cwd: resolved,
+      });
+    }
+  }
+
   private takeMatchingWarm(
     harnessId: string,
     cwd: string,
@@ -1555,10 +1704,7 @@ export class SessionManager {
     if (!warm) return undefined;
     this.warm.delete(key);
     clearTimeout(warm.timer);
-    const sameLaunch =
-      warm.command === launch.command &&
-      sameArgs(warm.args, launch.args ?? []) &&
-      sameEnv(warm.env, env);
+    const sameLaunch = this.launchMatches(warm, launch, env);
     if (!warm.client.running || !sameLaunch) {
       warm.client.kill();
       return undefined;
@@ -1578,11 +1724,17 @@ export class SessionManager {
   private bumpWarm(key: string): number {
     const next = (this.warmEpoch.get(key) ?? 0) + 1;
     this.warmEpoch.set(key, next);
+    this.warmLive.get(key)?.kill();
     this.dropWarm(key);
     return next;
   }
 
-  private async relayElicitation(params: unknown, sessionId?: string): Promise<unknown> {
+  private async relayElicitation(
+    params: unknown,
+    sessionId?: string,
+    ctx?: PhoneRequestContext,
+  ): Promise<unknown> {
+    if (ctx?.signal?.aborted || this.elicitationSuppressed(sessionId)) return { action: "cancel" };
     const support = elicitationSupportFromInitialize(this.phoneInitialize);
     params = bindElicitationSession(params, sessionId);
     let relay: Record<string, unknown>;
@@ -1597,14 +1749,27 @@ export class SessionManager {
     log("info", `elicitation ${elicitationLogLabel(relay)}`);
     if (!this.opts.requestPhone) return { action: "cancel" };
     try {
-      const answered = await this.opts.requestPhone("elicitation/create", relay);
-      if (answered.error) return { action: "cancel" };
+      const answered = await this.opts.requestPhone("elicitation/create", relay, {
+        signal: ctx?.signal,
+        owner: ctx?.owner ?? (sessionId ? `session:${sessionId}` : undefined),
+      });
+      if (ctx?.signal?.aborted || this.elicitationSuppressed(sessionId) || answered.error) {
+        return { action: "cancel" };
+      }
       return sanitizeElicitationResponse(answered.result);
     } catch (e) {
       const message = e instanceof Error ? e.message : "no answer";
       log("info", `elicitation cancelled: ${message}`);
       return { action: "cancel" };
     }
+  }
+
+  /** A cancelled or closing session must not accept a late elicitation answer. */
+  private elicitationSuppressed(sessionId?: string): boolean {
+    if (!sessionId) return false;
+    const rec = this.sessions.get(sessionId);
+    if (!rec) return true;
+    return rec.cancelRequested || rec.closing || rec.status === "closed";
   }
 
   private forwardElicitationComplete(params: unknown): void {
@@ -1674,6 +1839,7 @@ interface WarmAuth {
   authMethods: PublicAuthMethod[];
   logoutSupported: boolean;
   agentInfo?: { name: string; version?: string };
+  methodId: string;
   timer: NodeJS.Timeout;
 }
 

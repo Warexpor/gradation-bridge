@@ -82,4 +82,15 @@ describe("SocketOutbox", () => {
     expect(sock.sent.some((line) => line.includes('"n":2'))).toBe(true);
     box.dispose();
   });
+
+  it("drops frames after dispose so a closed socket cannot keep a login result", () => {
+    const sock = fakeSocket();
+    const box = new SocketOutbox(sock, { highWaterBytes: 10 });
+    sock.setBuffered(50);
+    expect(box.trySend({ token: "queued" }, false)).toBe(true);
+    box.dispose();
+    expect(box.queued).toBe(0);
+    expect(box.trySend({ token: "late" })).toBe(false);
+    expect(sock.sent).toEqual([]);
+  });
 });

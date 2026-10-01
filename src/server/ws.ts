@@ -16,10 +16,17 @@ import { saveConfig } from "../config/load.js";
 import { BridgeError } from "../errors.js";
 import { listHarnesses } from "../harness/registry.js";
 import { log, recentLogs } from "../log/diagnostics.js";
-import { SessionManager, SandboxError } from "../session/manager.js";
+import { SessionManager, SandboxError, type PhoneCancelFilter } from "../session/manager.js";
 import { assertAllowedRealPath } from "../approval/sandbox.js";
 import { getGitDiff, getGitStatus } from "../git/status.js";
+import {
+  cancelRequestFrame,
+  cancelledPhoneResult,
+  isCancelRequest,
+  readCancelRequestId,
+} from "../acp/cancel.js";
 import { ACP_PROTOCOL_VERSION, negotiateProtocolVersion } from "../acp/protocol.js";
+import { tlsDiagnostics } from "../auth/cert.js";
 import { parseRpcFrame, type JsonRpcMessage } from "./frames.js";
 import { SocketOutbox } from "./outbox.js";
 
@@ -44,6 +51,8 @@ interface PendingPhone {
   frame: unknown;
   params: unknown;
   method: string;
+  /** Warm-login owner, so cancelling one authenticate does not cancel another. */
+  owner?: string;
 }
 
 const outboxes = new WeakMap<WebSocket, SocketOutbox>();
@@ -115,36 +124,55 @@ export async function startBridgeServer(opts: WsServerOptions): Promise<BridgeSe
     }
   };
 
-  const cancelPhoneRequests = (sessionId: string): void => {
+  const cancelPhoneRequests = (filter: PhoneCancelFilter): void => {
     for (const [id, pending] of pendingPhone) {
-      const params = pending.params as { sessionId?: string } | null;
-      if (!params || typeof params !== "object" || params.sessionId !== sessionId) continue;
+      if (!pendingMatches(pending, filter)) continue;
       clearTimeout(pending.timer);
       pendingPhone.delete(id);
-      const result =
-        pending.method === "elicitation/create"
-          ? { action: "cancel" }
-          : { outcome: { outcome: "cancelled" } };
-      pending.resolve({ result, requestId: id });
+      fanout(cancelRequestFrame(id), false);
+      pending.resolve({ result: cancelledPhoneResult(pending.method), requestId: id });
     }
   };
 
   const requestPhone = (
     method: string,
     params: unknown,
+    ctx?: { signal?: AbortSignal; owner?: string },
   ): Promise<{ result?: unknown; error?: unknown; requestId: string | number }> => {
     const requestId = phoneReqId++;
     const frame = { jsonrpc: "2.0", id: requestId, method, params };
+    if (ctx?.signal?.aborted) {
+      return Promise.resolve({ result: cancelledPhoneResult(method), requestId });
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pendingPhone.delete(requestId);
+        ctx?.signal?.removeEventListener("abort", onAbort);
         reject(new Error(`phone did not answer ${method}`));
       }, 300_000);
-      pendingPhone.set(requestId, { resolve, reject, timer, frame, params, method });
+      const onAbort = (): void => {
+        if (!pendingPhone.has(requestId)) return;
+        clearTimeout(timer);
+        pendingPhone.delete(requestId);
+        fanout(cancelRequestFrame(requestId), false);
+        resolve({ result: cancelledPhoneResult(method), requestId });
+      };
+      pendingPhone.set(requestId, {
+        resolve,
+        reject,
+        timer,
+        frame,
+        params,
+        method,
+        owner: ctx?.owner,
+      });
+      if (ctx?.signal) ctx.signal.addEventListener("abort", onAbort, { once: true });
       // Keep the request if every phone is briefly gone so a reconnect can answer.
       if (clients.size > 0) fanout(frame, false);
     });
   };
+
+  const phoneCalls = new Map<string | number, () => void>();
 
   opts.sessions.setHooks({ broadcast, requestPhone, cancelPhoneRequests });
 
@@ -201,7 +229,7 @@ export async function startBridgeServer(opts: WsServerOptions): Promise<BridgeSe
         });
         return;
       }
-      void handleMessage(sock, raw.toString(), opts, pendingPhone);
+      void handleMessage(sock, raw.toString(), opts, pendingPhone, phoneCalls);
     });
     sock.on("error", () => {
       clients.delete(sock);
@@ -291,6 +319,7 @@ async function handleMessage(
   text: string,
   opts: WsServerOptions,
   pendingPhone: Map<string | number, PendingPhone>,
+  phoneCalls: Map<string | number, () => void>,
 ): Promise<void> {
   const parsed = parseRpcFrame(text);
   if (!parsed.ok) {
@@ -303,7 +332,7 @@ async function handleMessage(
   }
   const msg: JsonRpcMessage = parsed.msg;
   try {
-    await routeMessage(ws, msg, opts, pendingPhone);
+    await routeMessage(ws, msg, opts, pendingPhone, phoneCalls);
   } catch {
     send(ws, {
       jsonrpc: "2.0",
@@ -318,6 +347,7 @@ async function routeMessage(
   msg: JsonRpcMessage,
   opts: WsServerOptions,
   pendingPhone: Map<string | number, PendingPhone>,
+  phoneCalls: Map<string | number, () => void>,
 ): Promise<void> {
 
   // Phone answering a bridge→phone request (permission)
@@ -347,13 +377,16 @@ async function routeMessage(
   // Notifications from phone (no response)
   if (msg.id === undefined || msg.id === null) {
     try {
-      await dispatchNotification(msg.method, msg.params, opts);
+      await dispatchNotification(msg.method, msg.params, opts, phoneCalls);
     } catch {
       /* notifications don't get errors */
     }
     return;
   }
 
+  const release = trackPhoneCall(phoneCalls, msg.id, () => {
+    cancelInflightPhoneCall(msg.method!, msg.params, opts);
+  });
   try {
     const result = await dispatch(msg.method, msg.params, opts, ws);
     send(ws, { jsonrpc: "2.0", id: msg.id, result });
@@ -370,6 +403,8 @@ async function routeMessage(
         ...(data !== undefined ? { data } : {}),
       },
     });
+  } finally {
+    release();
   }
 }
 
@@ -377,10 +412,16 @@ async function dispatchNotification(
   method: string,
   params: unknown,
   opts: WsServerOptions,
+  phoneCalls: Map<string | number, () => void>,
 ): Promise<void> {
   const p = (params ?? {}) as Record<string, unknown>;
   if (method === "session/cancel") {
     opts.sessions.cancel(String(p.sessionId ?? ""));
+    return;
+  }
+  if (isCancelRequest(method)) {
+    const requestId = readCancelRequestId(p);
+    if (requestId != null) phoneCalls.get(requestId)?.();
   }
 }
 
@@ -437,12 +478,15 @@ async function dispatch(
       };
     }
     case "bridge/diagnostics": {
+      const tls = tlsDiagnostics(opts.tls?.certPem);
       return {
         version: opts.version,
         permissionMode: opts.config.defaultPermissionMode,
         harnesses: listHarnesses(opts.config),
         sessions: opts.sessions.list().length,
         log: recentLogs(),
+        tls: tls.tls,
+        ...(tls.certFingerprint ? { certFingerprint: tls.certFingerprint } : {}),
       };
     }
     case "bridge/setPermissionMode": {
@@ -641,6 +685,46 @@ async function dispatch(
     default: {
       throw new BridgeError(-32601, `Method not found: ${method}`);
     }
+  }
+}
+
+function pendingMatches(pending: PendingPhone, filter: PhoneCancelFilter): boolean {
+  if (filter.method && pending.method !== filter.method) return false;
+  if (filter.owner) return pending.owner === filter.owner;
+  if (!filter.sessionId) return false;
+  const params = pending.params as { sessionId?: string } | null;
+  return Boolean(params && typeof params === "object" && params.sessionId === filter.sessionId);
+}
+
+function trackPhoneCall(
+  phoneCalls: Map<string | number, () => void>,
+  id: string | number,
+  cancel: () => void,
+): () => void {
+  phoneCalls.set(id, cancel);
+  return () => {
+    if (phoneCalls.get(id) === cancel) phoneCalls.delete(id);
+  };
+}
+
+function cancelInflightPhoneCall(method: string, params: unknown, opts: WsServerOptions): void {
+  const p = (params ?? {}) as Record<string, unknown>;
+  const meta = (p._meta ?? {}) as Record<string, unknown>;
+  if (method === "session/prompt" || method === "session/load" || method === "session/resume") {
+    opts.sessions.cancel(String(p.sessionId ?? ""));
+    return;
+  }
+  if (
+    method === "authenticate" ||
+    method === "auth/login" ||
+    method === "logout" ||
+    method === "auth/logout"
+  ) {
+    opts.sessions.cancelAuth({
+      sessionId: typeof p.sessionId === "string" ? p.sessionId : undefined,
+      harnessId: typeof meta.harness === "string" ? meta.harness : undefined,
+      cwd: typeof p.cwd === "string" ? p.cwd : typeof meta.cwd === "string" ? meta.cwd : undefined,
+    });
   }
 }
 

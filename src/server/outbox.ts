@@ -37,6 +37,7 @@ export class SocketOutbox {
   private readonly onDrop?: (dropped: number) => void;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private flushing = false;
+  private disposed = false;
   private waiters: Array<() => void> = [];
 
   constructor(
@@ -57,7 +58,7 @@ export class SocketOutbox {
    * queue is at capacity; non-droppable frames are kept until the hard cap.
    */
   trySend(obj: unknown, droppable = false): boolean {
-    if (this.ws.readyState !== this.ws.OPEN) return false;
+    if (this.disposed || this.ws.readyState !== this.ws.OPEN) return false;
     const json = JSON.stringify(obj);
     if (this.queue.length === 0 && this.ws.bufferedAmount <= this.highWaterBytes) {
       return this.writeNow(json);
@@ -89,7 +90,7 @@ export class SocketOutbox {
   async send(obj: unknown, timeoutMs = 10_000): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (this.queue.length >= this.maxQueued) {
-      if (this.ws.readyState !== this.ws.OPEN) return false;
+      if (this.disposed || this.ws.readyState !== this.ws.OPEN) return false;
       if (Date.now() >= deadline) {
         try {
           this.ws.close?.(1013, "backpressure");
@@ -107,7 +108,7 @@ export class SocketOutbox {
   }
 
   flush(): void {
-    if (this.flushing) return;
+    if (this.disposed || this.flushing) return;
     this.flushing = true;
     try {
       while (
@@ -128,6 +129,7 @@ export class SocketOutbox {
   }
 
   dispose(): void {
+    this.disposed = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     this.queue.length = 0;

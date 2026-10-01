@@ -8,7 +8,8 @@ import { createInterface } from "node:readline";
 import type { HarnessConfig } from "../config/types.js";
 import { log } from "../log/diagnostics.js";
 import { redactSecrets } from "../log/redact.js";
-import { killProcessTree } from "../proc/tree.js";
+import { killProcessTree, signalProcessGroup } from "../proc/tree.js";
+import { isCancelRequest, readCancelRequestId, REQUEST_CANCELLED } from "./cancel.js";
 import { ACP_PROTOCOL_VERSION } from "./protocol.js";
 
 export interface AcpJsonRpcRequest {
@@ -16,6 +17,8 @@ export interface AcpJsonRpcRequest {
   id: number | string;
   method: string;
   params?: unknown;
+  /** Aborted when the harness sends `$/cancel_request` for this id. */
+  signal?: AbortSignal;
 }
 
 export interface AcpJsonRpcNotification {
@@ -57,6 +60,11 @@ export class AcpStdioClient {
   private readonly outbound: string[] = [];
   private stdinPaused = false;
   private settled = false;
+  /** Process-group leader. Survives `child` being cleared so a crash can still reap grandchildren. */
+  private groupPid: number | undefined;
+  private groupReaped = false;
+  private readonly outboundMethods = new Map<number | string, string>();
+  private readonly inboundCancels = new Map<number | string, () => void>();
   private requestHandler?: AcpInboundHandler;
   private notificationHandler?: (msg: AcpJsonRpcNotification) => void;
   private exitHandler?: (code: number | null, signal: NodeJS.Signals | null) => void;
@@ -104,6 +112,7 @@ export class AcpStdioClient {
       // Own process group so kill() reaps npx/node grandchildren.
       detached: process.platform !== "win32",
     });
+    this.groupPid = this.child.pid;
 
     const rl = createInterface({ input: this.child.stdout });
     rl.on("line", (line) => this.onLine(line));
@@ -147,6 +156,7 @@ export class AcpStdioClient {
   ): void {
     if (this.settled) return;
     this.settled = true;
+    this.reapGroup();
     this.flushStderr();
     this.child = null;
     this.outbound.length = 0;
@@ -242,7 +252,14 @@ export class AcpStdioClient {
       return;
     }
 
-    // Notification (method, no id)
+    // Notification (method, no id). `$/cancel_request` stays on this process:
+    // the harness id is not a phone request id, so it must not be forwarded.
+    if (obj.method && isCancelRequest(obj.method)) {
+      const requestId = readCancelRequestId(obj.params);
+      if (requestId != null) this.cancelInbound(requestId);
+      return;
+    }
+    if (obj.method?.startsWith("$/")) return;
     if (obj.method) {
       this.notificationHandler?.({
         method: obj.method,
@@ -252,17 +269,42 @@ export class AcpStdioClient {
   }
 
   private async handleAgentRequest(req: AcpJsonRpcRequest): Promise<void> {
+    const ac = new AbortController();
+    this.inboundCancels.set(req.id, () => ac.abort());
     try {
       const handler = this.requestHandler;
       if (!handler) {
         this.respondError(req.id, -32601, `Method not found: ${req.method}`);
         return;
       }
-      const result = await handler(req);
+      const result = await handler({ ...req, signal: ac.signal });
+      if (ac.signal.aborted && (result == null || result === undefined)) {
+        this.respondError(req.id, REQUEST_CANCELLED, "request cancelled");
+        return;
+      }
       this.respondResult(req.id, result ?? {});
     } catch (e) {
+      if (ac.signal.aborted) {
+        this.respondError(req.id, REQUEST_CANCELLED, "request cancelled");
+        return;
+      }
       const err = e as Error & { code?: number };
       this.respondError(req.id, err.code ?? -32603, err.message || "Internal error");
+    } finally {
+      this.inboundCancels.delete(req.id);
+    }
+  }
+
+  /** Stop an in-flight harness→bridge request. The handler returns a cancellation result. */
+  cancelInbound(requestId: number | string): void {
+    this.inboundCancels.get(requestId)?.();
+  }
+
+  /** Ask the harness to stop outbound calls such as `authenticate`. */
+  cancelOutbound(methods: string[]): void {
+    for (const [id, method] of this.outboundMethods) {
+      if (!methods.includes(method)) continue;
+      this.notify("$/cancel_request", { requestId: id });
     }
   }
 
@@ -318,21 +360,28 @@ export class AcpStdioClient {
       );
     }
     const id = this.nextId++;
+    this.outboundMethods.set(id, method);
+    const forget = (): void => {
+      this.outboundMethods.delete(id);
+    };
     return new Promise((resolve, reject) => {
       const timer =
         timeoutMs > 0
           ? setTimeout(() => {
               this.pending.delete(id);
+              forget();
               reject(new Error(`ACP request timeout: ${method}`));
             }, timeoutMs)
           : null;
       this.pending.set(id, {
         resolve: (v) => {
           if (timer) clearTimeout(timer);
+          forget();
           resolve(v);
         },
         reject: (e) => {
           if (timer) clearTimeout(timer);
+          forget();
           reject(e);
         },
       });
@@ -446,16 +495,25 @@ export class AcpStdioClient {
 
   kill(signal: NodeJS.Signals = "SIGTERM"): void {
     const child = this.child;
-    if (!child) return;
-    this.child = null;
-    killProcessTree(child, signal);
-    const timer = setTimeout(() => {
-      try {
-        if (child.exitCode === null) killProcessTree(child, "SIGKILL");
-      } catch {
-        // ignore
-      }
-    }, 2000);
+    if (child) {
+      this.child = null;
+      this.groupPid = child.pid ?? this.groupPid;
+      killProcessTree(child, signal);
+    }
+    this.reapGroup();
+  }
+
+  /**
+   * SIGTERM the process group now and SIGKILL it shortly after.
+   * Safe to call twice. A crashed leader does not take grandchildren with it;
+   * this does, including when `kill` runs after `child` was already cleared.
+   */
+  private reapGroup(): void {
+    const pid = this.groupPid;
+    if (!pid || this.groupReaped) return;
+    this.groupReaped = true;
+    signalProcessGroup(pid, "SIGTERM");
+    const timer = setTimeout(() => signalProcessGroup(pid, "SIGKILL"), 2000);
     timer.unref?.();
   }
 }
