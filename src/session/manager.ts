@@ -5,7 +5,15 @@ import type { BridgeConfig, PermissionMode } from "../config/types.js";
 import { BridgeError } from "../errors.js";
 import { findHarness } from "../harness/registry.js";
 import { launchErrorData, resolveHarnessLaunch, type HarnessLaunch } from "../harness/catalog.js";
+import { assertAgentAuthMethod, readAgentInitialize, type PublicAuthMethod } from "../acp/auth-method.js";
 import { AcpStdioClient, isMethodNotFound, type AcpJsonRpcRequest } from "../acp/client.js";
+import {
+  elicitationLogLabel,
+  elicitationSupportFromInitialize,
+  ElicitationRejected,
+  relayElicitationParams,
+  sanitizeElicitationResponse,
+} from "../acp/elicitation.js";
 import { assertSupportedPrompt, firstPromptText } from "../acp/prompt.js";
 import { assertNotDirectory, assertWritableContent, readTextFileWindow } from "../acp/text-file.js";
 import {
@@ -59,7 +67,9 @@ export interface SessionRecord {
   /** ACP session/new `modes`, when the agent returned them. */
   sessionModes?: unknown;
   agentInfo?: { name: string; version?: string };
-  authMethods?: Array<{ id: string; name?: string; description?: string }>;
+  authMethods?: PublicAuthMethod[];
+  /** Agent advertised `agentCapabilities.auth.logout`. */
+  logoutSupported: boolean;
   mcpServers: unknown[];
   /** Extra workspace roots, already realpath-checked against allowedRoots. */
   additionalDirectories: string[];
@@ -82,6 +92,7 @@ export type SessionSummary = Omit<
   | "sessionModes"
   | "agentInfo"
   | "authMethods"
+  | "logoutSupported"
   | "mcpServers"
   | "configOptions"
   | "clientGeneration"
@@ -120,6 +131,8 @@ export class SessionManager {
   private stopping = false;
   private phoneInitialize: Record<string, unknown> | undefined;
   private terminals = new TerminalTable();
+  /** Authenticated harness kept until the next session/new for the same cwd. */
+  private warm = new Map<string, WarmAuth>();
 
   constructor(opts?: SessionManagerOptions) {
     this.opts = opts ?? {
@@ -282,6 +295,7 @@ export class SessionManager {
    */
   async closeAll(): Promise<void> {
     this.stopping = true;
+    for (const key of [...this.warm.keys()]) this.dropWarm(key);
     for (const id of [...this.sessions.keys()]) this.detachForShutdown(id);
     this.terminals.closeSession();
   }
@@ -443,25 +457,26 @@ export class SessionManager {
       clientGeneration: 0,
       promptInFlight: false,
       cancelRequested: false,
+      logoutSupported: false,
       closing: false,
     };
     this.sessions.set(tempId, rec);
 
     let client: AcpStdioClient | undefined;
     try {
-      client = this.openClient(rec, launch);
-      client.start();
-      const phoneCaps = this.phoneCapabilities();
-      const initialized = await client.initialize({
-        clientInfo: {
-          name: "gradation-bridge",
-          version: this.opts.version ?? "0.1.0",
-        },
-        clientCapabilities: phoneCaps,
-      });
-      const agentInit = readAgentInitialize(initialized);
-      rec.agentInfo = agentInit.agentInfo;
-      rec.authMethods = agentInit.authMethods;
+      const warm = this.takeMatchingWarm(harness.id, cwd, launch);
+      if (warm) {
+        client = warm.client;
+        this.wireClient(rec, client, harness.id);
+        rec.agentInfo = warm.agentInfo;
+        rec.authMethods = warm.authMethods;
+        rec.logoutSupported = warm.logoutSupported;
+      } else {
+        client = this.openClient(rec, launch);
+        client.start();
+        const initialized = await client.initialize(this.agentClientInfo());
+        this.applyInit(rec, readAgentInitialize(initialized));
+      }
       const created = await client.newSession({
         cwd,
         mcpServers: rec.mcpServers,
@@ -492,11 +507,28 @@ export class SessionManager {
       }
       if (e instanceof BridgeError) throw e;
       const message = e instanceof Error ? e.message : String(e);
+      const agentCode =
+        e && typeof e === "object" && typeof (e as { code?: unknown }).code === "number"
+          ? (e as { code: number }).code
+          : undefined;
+      const extra: Record<string, unknown> = {
+        ...(stderr ? { stderr } : {}),
+        ...(rec.authMethods?.length ? { authMethods: rec.authMethods } : {}),
+        ...(agentCode !== undefined ? { agentCode } : {}),
+      };
+      const authish = /auth_required|authentication required|not authenticated/i.test(message);
       log("error", `harness ${harness.id} failed to start: ${message}`);
+      if (authish && rec.authMethods?.length) {
+        throw new BridgeError(
+          -32011,
+          `harness ${harness.id} requires authentication: ${message}`,
+          launchErrorData(launch, extra),
+        );
+      }
       throw new BridgeError(
         -32010,
         `harness ${harness.id} failed to start: ${message}`,
-        launchErrorData(launch, stderr ? { stderr } : {}),
+        launchErrorData(launch, extra),
       );
     }
   }
@@ -688,6 +720,142 @@ export class SessionManager {
     return result;
   }
 
+  /**
+   * Relay ACP `authenticate` / `auth/login` to a harness.
+   * A successful login with no sessionId keeps that process warm for the next
+   * `session/new` of the same harness and cwd. Terminal methods are refused.
+   */
+  async authenticate(input: {
+    methodId: string;
+    sessionId?: string;
+    harnessId?: string;
+    cwd?: string;
+  }): Promise<Record<string, unknown>> {
+    const methodId = input.methodId.trim();
+    if (!methodId) throw new BridgeError(-32602, "methodId required");
+    if (input.sessionId) {
+      const rec = this.requireSession(input.sessionId);
+      const client = rec.client;
+      if (!client?.running) {
+        throw new BridgeError(-32004, `session agent not running: ${input.sessionId}`, {
+          sessionId: input.sessionId,
+        });
+      }
+      if (rec.authMethods) assertAgentAuthMethod(rec.authMethods, methodId);
+      await client.authenticate(methodId);
+      return this.authResult(rec.harness, rec.cwd, rec.authMethods ?? [], rec.logoutSupported, rec.sessionId);
+    }
+    if (!input.harnessId) throw new BridgeError(-32602, "harness required");
+    if (!input.cwd) throw new BridgeError(-32602, "cwd required");
+    const cwd = assertAllowedWorkspace(input.cwd, this.opts.config.allowedRoots);
+    const harness = findHarness(this.opts.config, input.harnessId);
+    if (!harness) {
+      throw new BridgeError(-32602, `unknown harness: ${input.harnessId}`, { harnessId: input.harnessId });
+    }
+    const launch = resolveHarnessLaunch(harness);
+    if (!launch.available) {
+      throw new BridgeError(
+        -32010,
+        `harness ${harness.id} is not available: ${launch.detail}`,
+        launchErrorData(launch),
+      );
+    }
+    const key = warmKey(harness.id, cwd);
+    this.dropWarm(key);
+    const client = new AcpStdioClient({
+      harness: { ...harness, command: launch.command, args: launch.args },
+      cwd,
+      env: this.opts.config.env,
+      onRequest: (req) => {
+        if (req.method === "elicitation/create") return this.relayElicitation(req.params);
+        const err = new Error(`Method not found: ${req.method}`) as Error & { code?: number };
+        err.code = -32601;
+        throw err;
+      },
+      onNotification: (msg) => {
+        if (msg.method === "elicitation/complete") this.forwardElicitationComplete(msg.params);
+      },
+      onStderr: (line) => log("debug", `harness ${harness.id} stderr: ${line}`),
+      onExit: () => {
+        const current = this.warm.get(key);
+        if (current?.client === client) {
+          clearTimeout(current.timer);
+          this.warm.delete(key);
+        }
+      },
+    });
+    client.start();
+    try {
+      const initialized = await client.initialize(this.agentClientInfo());
+      const info = readAgentInitialize(initialized);
+      assertAgentAuthMethod(info.authMethods, methodId);
+      await client.authenticate(methodId);
+      const timer = setTimeout(() => this.dropWarm(key), 10 * 60 * 1000);
+      timer.unref?.();
+      this.warm.set(key, {
+        key,
+        harnessId: harness.id,
+        cwd,
+        command: launch.command,
+        args: launch.args ?? [],
+        client,
+        authMethods: info.authMethods,
+        logoutSupported: info.logoutSupported,
+        agentInfo: info.agentInfo,
+        timer,
+      });
+      return this.authResult(harness.id, cwd, info.authMethods, info.logoutSupported);
+    } catch (e) {
+      client.kill();
+      if (e instanceof BridgeError) throw e;
+      const message = e instanceof Error ? e.message : String(e);
+      const code =
+        e && typeof e === "object" && typeof (e as { code?: unknown }).code === "number"
+          ? (e as { code: number }).code
+          : -32010;
+      throw new BridgeError(code, message, { harnessId: harness.id });
+    }
+  }
+
+  /** Relay ACP `logout` / `auth/logout`. A warm pre-session process is dropped. */
+  async logout(input: {
+    sessionId?: string;
+    harnessId?: string;
+    cwd?: string;
+  }): Promise<Record<string, never>> {
+    if (input.sessionId) {
+      const rec = this.requireSession(input.sessionId);
+      if (!rec.client?.running) {
+        throw new BridgeError(-32004, `session agent not running: ${input.sessionId}`, {
+          sessionId: input.sessionId,
+        });
+      }
+      if (!rec.logoutSupported) {
+        throw new BridgeError(-32601, "agent does not support logout", { sessionId: rec.sessionId });
+      }
+      await rec.client.logout();
+      return {};
+    }
+    if (!input.harnessId || !input.cwd) {
+      throw new BridgeError(-32602, "sessionId or harness and cwd required");
+    }
+    const cwd = assertAllowedWorkspace(input.cwd, this.opts.config.allowedRoots);
+    const key = warmKey(input.harnessId, cwd);
+    const warm = this.warm.get(key);
+    if (!warm?.client.running) {
+      throw new BridgeError(-32004, "no authenticated harness connection", { harnessId: input.harnessId });
+    }
+    if (!warm.logoutSupported) {
+      throw new BridgeError(-32601, "agent does not support logout", { harnessId: input.harnessId });
+    }
+    try {
+      await warm.client.logout();
+    } finally {
+      this.dropWarm(key);
+    }
+    return {};
+  }
+
   private phoneCapabilities(): Record<string, unknown> | undefined {
     const caps = this.phoneInitialize?.clientCapabilities;
     if (caps && typeof caps === "object" && !Array.isArray(caps)) {
@@ -749,12 +917,19 @@ export class SessionManager {
         launchErrorData(resolved),
       );
     }
-    const gen = ++rec.clientGeneration;
-    const self = this;
     const client = new AcpStdioClient({
       harness: { ...harness, command: resolved.command, args: resolved.args },
       cwd: rec.cwd,
       env: this.opts.config.env,
+    });
+    this.wireClient(rec, client, harness.id);
+    return client;
+  }
+
+  private wireClient(rec: SessionRecord, client: AcpStdioClient, harnessId: string): void {
+    const gen = ++rec.clientGeneration;
+    const self = this;
+    client.setCallbacks({
       onNotification: (msg) => {
         const current = self.sessions.get(rec.sessionId) ?? rec;
         self.onAgentNotification(current, msg.method, msg.params);
@@ -764,7 +939,7 @@ export class SessionManager {
         return self.onAgentRequest(current, req);
       },
       onStderr: (line) => {
-        log("debug", `harness ${harness.id} stderr: ${line}`);
+        log("debug", `harness ${harnessId} stderr: ${line}`);
       },
       onExit: (code, signal) => {
         if (rec.clientGeneration !== gen) return;
@@ -777,13 +952,12 @@ export class SessionManager {
         rec.updatedAt = new Date().toISOString();
         log(
           "warn",
-          `harness ${harness.id} exited code=${code} signal=${signal} session=${rec.sessionId}`,
+          `harness ${harnessId} exited code=${code} signal=${signal} session=${rec.sessionId}`,
         );
         self.emitSessionStatus(rec);
       },
     });
     rec.client = client;
-    return client;
   }
 
   /** Start a fresh harness and ask it to load or resume `rec.sessionId`. */
@@ -793,13 +967,8 @@ export class SessionManager {
     previous?.kill();
     try {
       client.start();
-      await client.initialize({
-        clientInfo: {
-          name: "gradation-bridge",
-          version: this.opts.version ?? "0.1.0",
-        },
-        clientCapabilities: this.phoneCapabilities(),
-      });
+      const initialized = await client.initialize(this.agentClientInfo());
+      this.applyInit(rec, readAgentInitialize(initialized));
       const result = await this.attachExisting(rec, mode);
       if (rec.status === "error" || rec.status === "idle") {
         this.setStatus(rec.sessionId, "idle");
@@ -833,6 +1002,10 @@ export class SessionManager {
   }
 
   private onAgentNotification(rec: SessionRecord, method: string, params: unknown): void {
+    if (method === "elicitation/complete") {
+      this.forwardElicitationComplete(params);
+      return;
+    }
     if (method === "session/update") {
       const p = (params ?? {}) as Record<string, unknown>;
       const updateParams: Record<string, unknown> = { ...p, sessionId: rec.sessionId };
@@ -867,6 +1040,8 @@ export class SessionManager {
     switch (req.method) {
       case "session/request_permission":
         return this.handlePermission(rec, (req.params ?? {}) as RequestPermissionParams);
+      case "elicitation/create":
+        return this.relayElicitation(req.params);
       case "fs/read_text_file":
         return this.handleReadTextFile(rec, req.params);
       case "fs/write_text_file":
@@ -1184,13 +1359,14 @@ export class SessionManager {
         grants: meta.grants.map((g) => ({ ...g })),
         sessionModes: meta.sessionModes,
         agentInfo: meta.agentInfo,
-        authMethods: meta.authMethods,
+        authMethods: normalizeStoredAuth(meta.authMethods),
         mcpServers: meta.mcpServers ?? [],
         additionalDirectories: meta.additionalDirectories ?? [],
         configOptions: meta.configOptions,
         clientGeneration: 0,
         promptInFlight: false,
         cancelRequested: false,
+        logoutSupported: false,
         closing: false,
       };
       this.sessions.set(rec.sessionId, rec);
@@ -1226,7 +1402,7 @@ export class SessionManager {
       ...(rec.sessionModes !== undefined ? { sessionModes: rec.sessionModes } : {}),
       ...(rec.configOptions !== undefined ? { configOptions: rec.configOptions } : {}),
       ...(rec.agentInfo ? { agentInfo: rec.agentInfo } : {}),
-      ...(rec.authMethods ? { authMethods: rec.authMethods } : {}),
+      ...(rec.authMethods?.length ? { authMethods: rec.authMethods } : {}),
       grants: rec.grants.map((g) => ({ ...g })),
       additionalDirectories: rec.additionalDirectories,
     };
@@ -1272,6 +1448,98 @@ export class SessionManager {
     if (obj.modes && typeof obj.modes === "object") rec.sessionModes = obj.modes;
     if ("configOptions" in obj && obj.configOptions != null) rec.configOptions = obj.configOptions;
   }
+
+  private applyInit(rec: SessionRecord, info: ReturnType<typeof readAgentInitialize>): void {
+    rec.agentInfo = info.agentInfo;
+    rec.authMethods = info.authMethods;
+    rec.logoutSupported = info.logoutSupported;
+  }
+
+  private agentClientInfo(): { clientInfo: { name: string; version: string }; clientCapabilities?: Record<string, unknown> } {
+    return {
+      clientInfo: {
+        name: "gradation-bridge",
+        version: this.opts.version ?? "0.1.0",
+      },
+      clientCapabilities: this.phoneCapabilities(),
+    };
+  }
+
+  private takeMatchingWarm(harnessId: string, cwd: string, launch: HarnessLaunch): WarmAuth | undefined {
+    const key = warmKey(harnessId, cwd);
+    const warm = this.warm.get(key);
+    if (!warm) return undefined;
+    this.warm.delete(key);
+    clearTimeout(warm.timer);
+    const sameLaunch = warm.command === launch.command && sameArgs(warm.args, launch.args ?? []);
+    if (!warm.client.running || !sameLaunch) {
+      warm.client.kill();
+      return undefined;
+    }
+    return warm;
+  }
+
+  private dropWarm(key: string): void {
+    const warm = this.warm.get(key);
+    if (!warm) return;
+    this.warm.delete(key);
+    clearTimeout(warm.timer);
+    warm.client.kill();
+  }
+
+  private async relayElicitation(params: unknown): Promise<unknown> {
+    const support = elicitationSupportFromInitialize(this.phoneInitialize);
+    let relay: Record<string, unknown>;
+    try {
+      relay = relayElicitationParams(params, support);
+    } catch (e) {
+      if (e instanceof ElicitationRejected) {
+        log("info", `elicitation rejected: ${e.message}`);
+      }
+      throw e;
+    }
+    log("info", `elicitation ${elicitationLogLabel(relay)}`);
+    if (!this.opts.requestPhone) return { action: "cancel" };
+    try {
+      const answered = await this.opts.requestPhone("elicitation/create", relay);
+      if (answered.error) return { action: "cancel" };
+      return sanitizeElicitationResponse(answered.result);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "no answer";
+      log("info", `elicitation cancelled: ${message}`);
+      return { action: "cancel" };
+    }
+  }
+
+  private forwardElicitationComplete(params: unknown): void {
+    if (!params || typeof params !== "object") return;
+    const id = (params as { elicitationId?: unknown }).elicitationId;
+    if (typeof id !== "string" || !id || id.length > 200) return;
+    this.opts.broadcast?.({
+      jsonrpc: "2.0",
+      method: "elicitation/complete",
+      params: { elicitationId: id },
+    });
+  }
+
+  private authResult(
+    harness: string,
+    cwd: string,
+    authMethods: PublicAuthMethod[],
+    logoutSupported: boolean,
+    sessionId?: string,
+  ): Record<string, unknown> {
+    return {
+      _meta: {
+        harness,
+        cwd,
+        authenticated: true,
+        authMethods,
+        logout: logoutSupported,
+        ...(sessionId ? { sessionId } : {}),
+      },
+    };
+  }
 }
 
 export { SandboxError };
@@ -1298,38 +1566,36 @@ function sandboxAdditionalDirectories(raw: string[] | undefined, allowedRoots: s
   return out;
 }
 
-function readAgentInitialize(result: unknown): {
+interface WarmAuth {
+  key: string;
+  harnessId: string;
+  cwd: string;
+  command: string;
+  args: string[];
+  client: AcpStdioClient;
+  authMethods: PublicAuthMethod[];
+  logoutSupported: boolean;
   agentInfo?: { name: string; version?: string };
-  authMethods?: Array<{ id: string; name?: string; description?: string }>;
-} {
-  if (!result || typeof result !== "object") return {};
-  const obj = result as Record<string, unknown>;
-  let agentInfo: { name: string; version?: string } | undefined;
-  const info = obj.agentInfo;
-  if (info && typeof info === "object") {
-    const rec = info as Record<string, unknown>;
-    if (typeof rec.name === "string") {
-      agentInfo = {
-        name: rec.name,
-        ...(typeof rec.version === "string" ? { version: rec.version } : {}),
-      };
-    }
-  }
-  const methods = Array.isArray(obj.authMethods) ? obj.authMethods : [];
-  const authMethods = methods.flatMap((m) => {
-    if (!m || typeof m !== "object") return [];
-    const rec = m as Record<string, unknown>;
-    if (typeof rec.id !== "string") return [];
-    return [
-      {
-        id: rec.id,
-        ...(typeof rec.name === "string" ? { name: rec.name } : {}),
-        ...(typeof rec.description === "string" ? { description: rec.description.slice(0, 240) } : {}),
-      },
-    ];
-  });
-  return {
-    agentInfo,
-    ...(authMethods.length ? { authMethods } : {}),
-  };
+  timer: NodeJS.Timeout;
+}
+
+function warmKey(harnessId: string, cwd: string): string {
+  return `${harnessId}\0${cwd}`;
+}
+
+function sameArgs(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((arg, i) => arg === right[i]);
+}
+
+function normalizeStoredAuth(
+  methods: SessionMeta["authMethods"],
+): PublicAuthMethod[] | undefined {
+  if (!methods) return undefined;
+  return methods.map((method) => ({
+    id: method.id,
+    name: method.name ?? method.id,
+    ...(method.description ? { description: method.description } : {}),
+    type: method.type === "terminal" ? "terminal" : "agent",
+    ...(method.args?.length ? { args: method.args } : {}),
+  }));
 }
