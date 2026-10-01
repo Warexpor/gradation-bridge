@@ -2,7 +2,7 @@ import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { AcpStdioClient } from "../src/acp/client.js";
+import { AcpStdioClient, MAX_HARNESS_STDOUT_LINE } from "../src/acp/client.js";
 
 const dirs: string[] = [];
 
@@ -56,11 +56,16 @@ describe("ACP stdio client errors", () => {
       client.start();
       const deadline = Date.now() + 4_000;
       while (Date.now() < deadline) {
+        let text = "";
         try {
-          expect(readFileSync(out, "utf8")).toBe(real);
-          return;
+          text = readFileSync(out, "utf8");
         } catch (err) {
           if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        }
+        // The shell truncates the file before printf writes it.
+        if (text === real) return;
+        if (text.length > 0 && text !== real) {
+          throw new Error(`probe wrote ${text}`);
         }
         await new Promise((r) => setTimeout(r, 20));
       }
@@ -139,6 +144,39 @@ describe("ACP stdio client errors", () => {
       await new Promise((r) => setTimeout(r, 40));
     }
     throw new Error(`grandchild ${grandPid} still alive after harness exit`);
+  });
+
+  it("keeps the session after the harness writes an oversized stdout line", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gb-acp-stdout-"));
+    dirs.push(dir);
+    const script = join(dir, "agent.mjs");
+    writeFileSync(
+      script,
+      [
+        "import { createInterface } from 'node:readline';",
+        "const rl = createInterface({ input: process.stdin });",
+        "rl.on('line', (line) => {",
+        "  let msg;",
+        "  try { msg = JSON.parse(line); } catch { return; }",
+        "  if (msg.id == null) return;",
+        `  process.stdout.write('x'.repeat(${MAX_HARNESS_STDOUT_LINE + 64}) + '\\n');`,
+        "  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { ok: true } }) + '\\n');",
+        "});",
+        "",
+      ].join("\n"),
+    );
+    const client = new AcpStdioClient({
+      harness: { id: "loud", name: "loud", command: process.execPath, args: [script] },
+      cwd: dir,
+    });
+    client.start();
+    try {
+      await expect(client.initialize({ clientInfo: { name: "t", version: "0" } })).resolves.toEqual({
+        ok: true,
+      });
+    } finally {
+      client.kill();
+    }
   });
 
   it("cancels a timed-out request and ignores the late result", async () => {

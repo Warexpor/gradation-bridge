@@ -4,8 +4,8 @@
  */
 
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { createInterface } from "node:readline";
 import type { HarnessConfig } from "../config/types.js";
+import { ByteLineSplitter, PendingText } from "../io/lines.js";
 import { log } from "../log/diagnostics.js";
 import { redactSecrets } from "../log/redact.js";
 import { resolveExecutable } from "../harness/path.js";
@@ -45,6 +45,10 @@ export interface AcpClientOptions {
 }
 
 const STDIN_BACKLOG_LIMIT = 1024;
+/** One ACP frame. A longer stdout line is discarded instead of buffered. */
+export const MAX_HARNESS_STDOUT_LINE = 8 * 1024 * 1024;
+/** Bytes of stderr held while waiting for a newline. */
+export const MAX_HARNESS_STDERR_PENDING = 64 * 1024;
 
 export class AcpStdioClient {
   readonly harness: HarnessConfig;
@@ -55,7 +59,10 @@ export class AcpStdioClient {
     { resolve: (v: unknown) => void; reject: (e: Error) => void }
   >();
   private readonly opts: AcpClientOptions;
-  private stderrBuf = "";
+  private readonly stdoutLines = new ByteLineSplitter(MAX_HARNESS_STDOUT_LINE);
+  private stdoutSkipsLogged = false;
+  private readonly stderrCapture = new PendingText(MAX_HARNESS_STDERR_PENDING);
+  private stderrDropLogged = false;
   private readonly stderrLines: string[] = [];
   private lastLaunchError: Error | null = null;
   private readonly outbound: string[] = [];
@@ -119,17 +126,25 @@ export class AcpStdioClient {
     });
     this.groupPid = this.child.pid;
 
-    const rl = createInterface({ input: this.child.stdout });
-    rl.on("line", (line) => this.onLine(line));
+    this.child.stdout.on("data", (buf: Buffer) => {
+      for (const line of this.stdoutLines.push(buf)) this.onLine(line);
+      this.noteStdoutSkip();
+    });
+    this.child.stdout.on("end", () => {
+      const tail = this.stdoutLines.end();
+      this.noteStdoutSkip();
+      if (tail !== undefined) this.onLine(tail);
+    });
+    this.child.stdout.on("error", () => {
+      // The process error and exit handlers report the failure.
+    });
 
     this.child.stderr.on("data", (buf: Buffer) => {
-      this.stderrBuf += buf.toString("utf8");
-      let idx: number;
-      while ((idx = this.stderrBuf.indexOf("\n")) >= 0) {
-        const line = this.stderrBuf.slice(0, idx);
-        this.stderrBuf = this.stderrBuf.slice(idx + 1);
-        this.pushStderr(line);
-      }
+      for (const line of this.stderrCapture.pushBuffer(buf)) this.pushStderr(line);
+      this.noteStderrDrop();
+    });
+    this.child.stderr.on("error", () => {
+      // Stderr is diagnostic. A broken pipe must not crash the bridge.
     });
 
     this.child.stdin.on("error", (err) => {
@@ -183,10 +198,25 @@ export class AcpStdioClient {
     this.stderrHandler?.(clean);
   }
 
+  private noteStdoutSkip(): void {
+    if (this.stdoutSkipsLogged || this.stdoutLines.skipped === 0) return;
+    this.stdoutSkipsLogged = true;
+    log(
+      "warn",
+      `discarded harness stdout over ${MAX_HARNESS_STDOUT_LINE} bytes (session stays up)`,
+    );
+  }
+
+  private noteStderrDrop(): void {
+    if (this.stderrDropLogged || this.stderrCapture.drops === 0) return;
+    this.stderrDropLogged = true;
+    log("warn", `discarded harness stderr over ${MAX_HARNESS_STDERR_PENDING} bytes`);
+  }
+
   private flushStderr(): void {
-    if (!this.stderrBuf) return;
-    this.pushStderr(this.stderrBuf);
-    this.stderrBuf = "";
+    this.noteStderrDrop();
+    const tail = this.stderrCapture.flush();
+    if (tail) this.pushStderr(tail);
   }
 
   private stderrSuffix(): string {
