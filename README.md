@@ -2,9 +2,9 @@
 
 ACP bridge daemon for [GradatiON](https://github.com/Warexpor/GradatiON) Code mode.
 
-The phone never runs an agent. This small Node 20+ daemon on your machine launches coding agents (Claude Code, Codex, OpenCode, Grok Build, Cursor CLI, Pi, …) over stdio via the [Agent Client Protocol](https://agentclientprotocol.com/), and relays sessions to GradatiON over one authenticated WebSocket.
+The phone never runs an agent. This small Node 20+ daemon on your machine launches coding agents (Claude Code, Codex, OpenCode, Grok Build, Cursor Agent, Pi, …) over stdio via the [Agent Client Protocol](https://agentclientprotocol.com/), and relays sessions to GradatiON over one authenticated WebSocket.
 
-> **Status:** Working MVP (0.4.8). End-to-end ACP sessions (initialize / new / prompt / cancel / load / resume / set_mode / set_config_option / list / close / delete), harness `authenticate` / `logout` (and the `auth/login` / `auth/logout` names), `$/cancel_request`, `elicitation/create` relay, approval policy enforced on real file writes and terminal calls, JSONL resume that survives a bridge restart, sandboxed git status/diff, harness readiness diagnostics, and bridge extensions are implemented. The wire protocol stays at ACP 1. Tested with a fake ACP agent. Point config at a harness below, or run `gradation-bridge doctor` to see what is actually installed.
+> **Status:** Working MVP (0.4.9). End-to-end ACP sessions (initialize / new / prompt / cancel / load / resume / set_mode / set_config_option / list / close / delete), harness `authenticate` / `logout` (and the `auth/login` / `auth/logout` names), `$/cancel_request`, `elicitation/create` relay, approval policy enforced on real file writes and terminal calls, JSONL resume that survives a bridge restart, sandboxed git status/diff, harness readiness diagnostics, and bridge extensions are implemented. The wire protocol stays at ACP 1. Tested with a fake ACP agent. Point config at a harness below, or run `gradation-bridge doctor` to see what is actually installed.
 
 ## Quick start (against GradatiON)
 
@@ -89,18 +89,20 @@ Paths outside `allowedRoots` are refused (folder picker, edits, terminal, sessio
 
 Default harness registry (ids match GradatiON). New configs use these commands. A config you already have is left as written; `doctor` notes when a package moved.
 
-| id | Command | If the binary is missing |
-|----|---------|--------------------------|
-| `claude-code` | `npx -y @agentclientprotocol/claude-agent-acp` | first session downloads it (`on-demand`) |
-| `codex` | `npx -y @agentclientprotocol/codex-acp` | same |
-| `opencode` | `opencode acp` | `npx -y opencode-ai acp` |
-| `grok-build` | `grok agent stdio` | `npx -y @xai-official/grok agent stdio` |
-| `cursor-cli` | `cursor-agent acp` | falls back to `agent acp` |
-| `pi` | `pi-acp` | `npx -y pi-acp` |
+| id | Name | Command | If the binary is missing |
+|----|------|---------|--------------------------|
+| `claude-code` | Claude Code | `npx -y @agentclientprotocol/claude-agent-acp` | first session downloads it (`on-demand`) |
+| `codex` | Codex CLI | `npx -y @agentclientprotocol/codex-acp` | same |
+| `opencode` | OpenCode | `opencode acp` | `npx -y opencode-ai acp` |
+| `grok-build` | Grok Build | `grok agent stdio` | `npx -y @xai-official/grok agent stdio` |
+| `cursor-cli` | Cursor Agent | `cursor-agent acp` | falls back to `agent acp` |
+| `pi` | Pi | `pi-acp` | `npx -y pi-acp` |
+
+Harness ids are what GradatiON matches. Cursor Agent's id stays `cursor-cli`. A config entry with id `cursor-agent` is that same harness (same launch profile), not a second product. `bridge/listHarnesses` reports the id stored in config, so new configs should keep `cursor-cli`.
 
 `bridge/listHarnesses` reports `readiness`: `ready` (binary on PATH), `on-demand` (will run via npx), or `missing` (session start is refused, with `install` / `authHint`). `available` stays true for `ready` and `on-demand`. The bridge resolves that command on its own PATH and starts the absolute file. A harness `env` `PATH` is still passed to the process, and it cannot select a different binary.
 
-Cursor's CLI is `cursor-agent`. The older name `agent` is still accepted, but if both exist the bridge launches `cursor-agent`. Installing Grok can point the bare `agent` command at Grok.
+Cursor Agent launches `cursor-agent acp`. The older binary name `agent` is still accepted, but if both exist the bridge launches `cursor-agent`. Installing Grok can point the bare `agent` command at Grok.
 
 Auth is per CLI, not a bridge prompt: Claude (`ANTHROPIC_API_KEY` or `claude` login), Codex (`codex login` or `CODEX_API_KEY` / `OPENAI_API_KEY`), Grok (`XAI_API_KEY` or `grok` login), Cursor (`cursor-agent login`). Do not put API keys in harness `args`. The phone receives those args. `env` values are never sent to the phone. `doctor` and error payloads redact `--api-key` and `sk-…` values.
 
@@ -202,7 +204,7 @@ gradation-bridge revoke <deviceId>
 
 ## Development
 
-0.4.8 caps harness stdout, stderr, and the on-disk session transcript so a noisy agent cannot exhaust the bridge. 0.4.7 cancels a harness request when it times out, so a late result cannot overlap the next prompt, and `bridge/gitStatus` / `bridge/diff` do not run repo textconv, clean filters, or status/diff aliases. 0.4.6 keeps the harness out of the bridge config and data directories, refuses a new prompt or respawn once `session/close` has started, limits an allow_once command approval to that command, ignores repo `core.fsmonitor` and `diff.external` on `bridge/gitStatus` and `bridge/diff`, and includes the cert SAN on `bridge/diagnostics`. 0.4.5 resolves harness and terminal binaries on the bridge PATH before applying a caller `PATH`, rejects a missing terminal command before spending an approval, and SIGKILLs a cancelled command that ignores SIGTERM so `terminal/wait_for_exit` cannot stick. 0.4.3 hardens TLS pairing (key/cert match, no stub fingerprint, Tailscale CGNAT and `fd7a:`, SAN mismatch warning), catalog restore after a crash, one-way approval grants, and permission races when the mode changes or the prompt is cancelled. 0.4.2 hardened reconnect-after-login, `$/cancel_request`, harness reaping, and cert fingerprints.
+0.4.9 names the built-in Cursor harness Cursor Agent and keeps GradatiON id `cursor-cli`. Config id `cursor-agent` uses that same launch profile (`cursor-agent acp`, otherwise `agent acp`). 0.4.8 caps harness stdout, stderr, and the on-disk session transcript so a noisy agent cannot exhaust the bridge. 0.4.7 cancels a harness request when it times out, so a late result cannot overlap the next prompt, and `bridge/gitStatus` / `bridge/diff` do not run repo textconv, clean filters, or status/diff aliases. 0.4.6 keeps the harness out of the bridge config and data directories, refuses a new prompt or respawn once `session/close` has started, limits an allow_once command approval to that command, ignores repo `core.fsmonitor` and `diff.external` on `bridge/gitStatus` and `bridge/diff`, and includes the cert SAN on `bridge/diagnostics`. 0.4.5 resolves harness and terminal binaries on the bridge PATH before applying a caller `PATH`, rejects a missing terminal command before spending an approval, and SIGKILLs a cancelled command that ignores SIGTERM so `terminal/wait_for_exit` cannot stick. 0.4.3 hardens TLS pairing (key/cert match, no stub fingerprint, Tailscale CGNAT and `fd7a:`, SAN mismatch warning), catalog restore after a crash, one-way approval grants, and permission races when the mode changes or the prompt is cancelled. 0.4.2 hardened reconnect-after-login, `$/cancel_request`, harness reaping, and cert fingerprints.
 
 ```bash
 npm install

@@ -7,6 +7,14 @@ import { homedir } from "node:os";
 
 export type PermissionMode = "ask" | "auto-edit" | "plan" | "full-auto";
 
+/** Wire id GradatiON matches for Cursor Agent. */
+export const CURSOR_HARNESS_ID = "cursor-cli";
+/**
+ * Config id accepted as the same Cursor Agent harness.
+ * New configs keep CURSOR_HARNESS_ID. The phone matches that id.
+ */
+export const CURSOR_HARNESS_ALIAS = "cursor-agent";
+
 export interface HarnessConfig {
   /** Stable id, e.g. "claude-code", "codex", "opencode", "grok-build", "cursor-cli", "pi", or custom. */
   id: string;
@@ -63,8 +71,8 @@ export const DEFAULT_HARNESSES: HarnessConfig[] = [
     args: ["agent", "stdio"],
   },
   {
-    id: "cursor-cli",
-    name: "Cursor CLI",
+    id: CURSOR_HARNESS_ID,
+    name: "Cursor Agent",
     command: "cursor-agent",
     args: ["acp"],
   },

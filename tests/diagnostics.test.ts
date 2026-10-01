@@ -8,7 +8,7 @@ import { ensurePrimaryToken } from "../src/auth/token.js";
 import { log, recentLogs, resetLogsForTests, setLogLevel } from "../src/log/diagnostics.js";
 import { ensureTlsMaterial } from "../src/auth/cert.js";
 import { buildPairingPayload, pairingSafetyLines } from "../src/auth/pairing.js";
-import type { BridgeConfig } from "../src/config/types.js";
+import { defaultConfig, type BridgeConfig } from "../src/config/types.js";
 import { SessionManager } from "../src/session/manager.js";
 import { startBridgeServer, type BridgeServer } from "../src/server/ws.js";
 
@@ -69,6 +69,18 @@ describe("diagnostics and pairing safety", () => {
     expect(report).toMatch(/cannot read or write the config or data directory/);
     expect(report).toContain("tls:     missing");
     expect(report).not.toMatch(/cert fp:/);
+  });
+
+  it("prints Cursor Agent by name and keeps the cursor-cli id", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-doc-cursor-"));
+    dirs.push(root);
+    process.env.XDG_CONFIG_HOME = join(root, "config");
+    process.env.XDG_DATA_HOME = join(root, "data");
+    mkdirSync(process.env.XDG_CONFIG_HOME, { recursive: true });
+    mkdirSync(process.env.XDG_DATA_HOME, { recursive: true });
+    const report = formatDoctorReport(defaultConfig());
+    expect(report).toContain("cursor-cli (Cursor Agent)");
+    expect(report).not.toContain("Cursor CLI");
   });
 
   it("prints the cert fingerprint and not the pairing token", () => {

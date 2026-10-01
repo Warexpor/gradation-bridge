@@ -1,5 +1,10 @@
 import { createRequire } from "node:module";
-import type { BridgeConfig, HarnessConfig } from "../config/types.js";
+import {
+  CURSOR_HARNESS_ALIAS,
+  CURSOR_HARNESS_ID,
+  type BridgeConfig,
+  type HarnessConfig,
+} from "../config/types.js";
 import { resolveHarnessLaunch, type HarnessLaunch, type HarnessReadiness } from "./catalog.js";
 import { which } from "./path.js";
 
@@ -23,6 +28,9 @@ export interface HarnessInfo {
 const ALIASES: Record<string, string> = {
   claude: "claude-code",
   "claude-code": "claude-code",
+  // Cursor Agent. The listed id stays whatever config stored (`cursor-cli` by default).
+  [CURSOR_HARNESS_ALIAS]: CURSOR_HARNESS_ID,
+  [CURSOR_HARNESS_ID]: CURSOR_HARNESS_ID,
 };
 
 export function toPublicHarness(launch: HarnessLaunch): HarnessInfo {
