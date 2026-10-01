@@ -99,6 +99,8 @@ Options:
   --port N      Override listen port (default from config, usually 8787)
 
 doctor prints harness readiness and pairing safety without printing tokens.
+Built-in harness Cursor Agent uses id cursor-cli so GradatiON can match it.
+It launches cursor-agent acp, or agent acp when cursor-agent is not on PATH.
 The pairing link is a secret: anyone with it can run code on this machine.
 
 On first run a 32-byte bearer token and self-signed TLS cert are generated.

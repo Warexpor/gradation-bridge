@@ -3,11 +3,16 @@
  *
  * Defaults follow current ACP adapters. Existing configs that still name the
  * old Zed packages are left alone (spawn uses the configured argv) and get a
- * notice. Cursor prefers `cursor-agent` when both it and `agent` are on PATH:
- * installing Grok can point the bare `agent` name at Grok.
+ * notice. Cursor Agent prefers `cursor-agent` when both it and `agent` are on PATH:
+ * installing Grok can point the bare `agent` name at Grok. The wire id stays
+ * `cursor-cli`. Config id `cursor-agent` is the same launch profile.
  */
 
-import type { HarnessConfig } from "../config/types.js";
+import {
+  CURSOR_HARNESS_ALIAS,
+  CURSOR_HARNESS_ID,
+  type HarnessConfig,
+} from "../config/types.js";
 import { redactArgs } from "../log/redact.js";
 import { commandExists, which } from "./path.js";
 
@@ -60,7 +65,7 @@ const PROFILES: Record<string, Profile> = {
     authHint: "Sign in with the Grok CLI, or set XAI_API_KEY.",
   },
   "cursor-cli": {
-    install: "Cursor CLI from https://cursor.com/docs/cli/acp (`cursor-agent` or `agent`)",
+    install: "Cursor Agent from https://cursor.com/docs/cli/acp (`cursor-agent` or `agent`)",
     docs: "https://cursor.com/docs/cli/acp",
     authHint:
       "Run `cursor-agent login` (or `agent login`). Do not put API keys in harness args; the phone can see those args.",
@@ -86,8 +91,8 @@ function finish(
     notice?: string;
   },
 ): HarnessLaunch {
-  const profile = PROFILES[h.id];
-  const notice = partial.notice ?? legacyNotice(h);
+  const profile = profileFor(h.id);
+  const notice = joinNotice(partial.notice, legacyNotice(h));
   const displayArgs = redactArgs(partial.args);
   const commandPath = which(partial.command);
   return {
@@ -110,6 +115,20 @@ function finish(
   };
 }
 
+function profileFor(id: string): Profile | undefined {
+  if (id === CURSOR_HARNESS_ALIAS) return PROFILES[CURSOR_HARNESS_ID];
+  return PROFILES[id];
+}
+
+function isCursorHarnessId(id: string): boolean {
+  return id === CURSOR_HARNESS_ID || id === CURSOR_HARNESS_ALIAS;
+}
+
+function joinNotice(...parts: Array<string | undefined>): string | undefined {
+  const text = parts.filter((part): part is string => Boolean(part)).join(" ");
+  return text.length > 0 ? text : undefined;
+}
+
 function legacyNotice(h: HarnessConfig): string | undefined {
   const args = h.args ?? [];
   if (h.id === "claude-code" && args.includes("@zed-industries/claude-code-acp")) {
@@ -120,6 +139,9 @@ function legacyNotice(h: HarnessConfig): string | undefined {
   }
   if (h.id === "codex" && args.includes("@zed-industries/codex-acp")) {
     return "Config still uses @zed-industries/codex-acp. Upstream moved to @agentclientprotocol/codex-acp.";
+  }
+  if (h.id === CURSOR_HARNESS_ALIAS) {
+    return "Id cursor-agent is an alias of cursor-cli. GradatiON matches cursor-cli.";
   }
   return undefined;
 }
@@ -206,7 +228,7 @@ function resolveCursor(h: HarnessConfig): HarnessLaunch {
       readiness: "ready",
       detail:
         "Found `agent` but not `cursor-agent`. If Grok is installed, `agent` may not be Cursor.",
-      notice: "Install the current Cursor CLI so the binary is `cursor-agent`, or set command to an absolute path.",
+      notice: "Install Cursor Agent so the binary is `cursor-agent`, or set command to an absolute path.",
     });
   }
   return finish(h, {
@@ -276,7 +298,7 @@ function resolvePi(h: HarnessConfig): HarnessLaunch {
 }
 
 export function resolveHarnessLaunch(h: HarnessConfig): HarnessLaunch {
-  if (h.id === "cursor-cli" && isCursorDefault(h)) return resolveCursor(h);
+  if (isCursorHarnessId(h.id) && isCursorDefault(h)) return resolveCursor(h);
   if (h.id === "grok-build" && isGrokDefault(h)) return resolveGrok(h);
   if (h.id === "opencode" && isOpenCodeDefault(h)) return resolveOpenCode(h);
   if (h.id === "pi" && isPiDefault(h)) return resolvePi(h);

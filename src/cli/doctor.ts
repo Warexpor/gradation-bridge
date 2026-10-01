@@ -71,7 +71,7 @@ export function formatDoctorReport(config: BridgeConfig): string {
   }
   for (const h of harnesses) {
     const args = h.args.length ? ` ${h.args.join(" ")}` : "";
-    lines.push(`- ${h.id} [${h.readiness}] ${h.command}${args}`);
+    lines.push(`- ${h.id} (${h.name}) [${h.readiness}] ${h.command}${args}`);
     lines.push(`    ${h.detail}`);
     if (h.notice) lines.push(`    notice: ${h.notice}`);
     const launcherMissing =

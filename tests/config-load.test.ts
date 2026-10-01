@@ -32,8 +32,13 @@ describe("loadConfig", () => {
     const claude = cfg.harnesses.find((h) => h.id === "claude-code");
     const cursor = cfg.harnesses.find((h) => h.id === "cursor-cli");
     expect(claude?.args).toContain("@agentclientprotocol/claude-agent-acp");
+    expect(cursor?.name).toBe("Cursor Agent");
     expect(cursor?.command).toBe("cursor-agent");
-    expect(cfg.harnesses.map((h) => h.id)).not.toContain("gemini");
+    expect(cursor?.args).toEqual(["acp"]);
+    const ids = cfg.harnesses.map((h) => h.id);
+    expect(ids).toContain("cursor-cli");
+    expect(ids).not.toContain("cursor-agent");
+    expect(ids).not.toContain("gemini");
   });
 
   it("rejects an unknown permission mode without replacing the file", () => {
