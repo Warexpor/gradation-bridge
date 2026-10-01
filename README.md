@@ -141,13 +141,23 @@ Bridge extensions (see GradatiON `docs/code-mode-plan.md` §3.2):
 - `bridge/permissionResolved`, `bridge/sessionStatus` (notifications)
 - `bridge/diff`, `bridge/gitStatus` (sandboxed `git diff` / `git status --porcelain` under allowedRoots)
 
-Harness launch failures use JSON-RPC code `-32010` and a `data` object (`readiness`, `install`, `authHint`, redacted `stderr`). Sandbox and approval denials use `-32003`. Unknown sessions use `-32002`. Stderr is also kept on the session preview when the process exits.
+Harness launch failures use JSON-RPC code `-32010` and a `data` object (`readiness`, `install`, `authHint`, redacted `stderr`). Sandbox and approval denials use `-32003`. Unknown sessions use `-32002`. A second `session/prompt` while one is running is `-32005`. An agent that is not running is `-32004`. Stderr is also kept on the session preview when the process exits.
 
 `GRADATION_LOG=debug|info|warn|error|silent` (or config `logLevel`) sets the stderr threshold. `debug` records non-JSON harness stdout.
 
-Every notification carries `_meta.seq` from an append-only JSONL log so a reconnecting phone can resume via `session/load` + `_meta.afterSeq`.
+Every notification carries `_meta.seq` from an append-only JSONL log so a reconnecting phone can resume via `session/load` + `_meta.afterSeq`. `session/load` replays `seq > afterSeq` (skipping corrupt log lines), respawns the harness if the agent process has died, and returns `{ replayed, agentAlive, lastSeq, status }` merged with whatever the agent's `session/load` returned. A prompt that finishes while the phone is gone is also logged as `bridge/promptResult` so the next load can see `stopReason`.
+
+`session/cancel` is accepted as a notification or a request. It is forwarded to the agent and aborts an in-flight `session/request_permission` so cancel is not stuck behind the approval dialog.
 
 `session/new` params include `_meta:{ harness, permissionMode, model? }` (GradatiON sends these).
+
+### Reliability
+
+- **Reconnect.** Pending permission requests stay open across a dropped socket and are re-sent to the next phone (first answer still wins). Live sockets are pinged every 20s and dropped if they never pong, or if their bearer token is revoked.
+- **Backpressure.** Each socket has an outbound queue. Past a 1MB kernel buffer, frames wait in user space. `session/update` chunks are the first frames dropped when a phone stops reading; responses, status, permissions, and replay are kept. `session/load` paces replay instead of bursting the socket.
+- **Malformed frames.** Non-JSON, `null`, arrays, and non-2.0 envelopes return a JSON-RPC error and leave the socket up. Payload cap is 8MB.
+- **Auth / TLS.** Token checks hash then compare in constant time. A corrupt `devices.json` fails closed and is not overwritten with a new token. New self-signed certs include `subjectAltName` for localhost, loopback, and the bind address (an existing cert is left in place so the pinned fingerprint does not change).
+- **Process lifecycle.** Each harness is its own process group, so shutting a session down also kills `npx` grandchildren. Terminals for that session are killed with it, and their captured output is capped at 1MB.
 
 ## Safety
 
@@ -185,9 +195,9 @@ Requires Node 20+. Depends on [`@agentclientprotocol/sdk`](https://www.npmjs.com
 
 ## Remaining stubs / next
 
-- Push notifications when no phone is attached (§3.1.7 of the plan) — not implemented. A permission request with no phone is cancelled.
-- Richer terminal UX (PTY / streaming). Output is buffered until `terminal/output`.
-- Multi-session sharing one long-lived agent process (today: one process per session).
+- Push notifications when no phone is attached (§3.1.7 of the plan) — not implemented. A permission request is held for a reconnecting phone and cancelled if nobody answers.
+- Richer terminal UX (PTY / streaming). Output is buffered until `terminal/output`, capped at 1MB. FS browse/read/write already realpath-sandbox.
+- Multi-session sharing one long-lived agent process (today: one process per session). `session/load` respawns a dead per-session process; it does not restore sessions after the bridge itself restarts.
 - ACP `authenticate` is not relayed. Harness login stays on the machine; `session/new` surfaces `authMethods` so the phone can say why a start failed.
 
 ## License

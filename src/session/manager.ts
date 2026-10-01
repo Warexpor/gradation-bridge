@@ -1,11 +1,12 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { spawn as spawnProc } from "node:child_process";
+import { spawn as spawnProc, type ChildProcess } from "node:child_process";
 import type { BridgeConfig, PermissionMode } from "../config/types.js";
 import { BridgeError } from "../errors.js";
+import { killProcessTree } from "../proc/tree.js";
 import { findHarness } from "../harness/registry.js";
-import { launchErrorData, resolveHarnessLaunch } from "../harness/catalog.js";
+import { launchErrorData, resolveHarnessLaunch, type HarnessLaunch } from "../harness/catalog.js";
 import { AcpStdioClient, type AcpJsonRpcRequest } from "../acp/client.js";
 import {
   optionKindById,
@@ -51,14 +52,32 @@ export interface SessionRecord {
   sessionModes?: unknown;
   agentInfo?: { name: string; version?: string };
   authMethods?: Array<{ id: string; name?: string; description?: string }>;
+  mcpServers: unknown[];
+  /** Bumped each time a new agent process is bound so a late exit is ignored. */
+  clientGeneration: number;
+  promptInFlight: boolean;
+  cancelRequested: boolean;
 }
 
 export type SessionSummary = Omit<
   SessionRecord,
-  "log" | "client" | "agentSessionId" | "grants" | "sessionModes" | "agentInfo" | "authMethods"
+  | "log"
+  | "client"
+  | "agentSessionId"
+  | "grants"
+  | "sessionModes"
+  | "agentInfo"
+  | "authMethods"
+  | "mcpServers"
+  | "clientGeneration"
+  | "promptInFlight"
+  | "cancelRequested"
 >;
 
-export type BridgeEmitter = (msg: unknown) => void;
+export type BridgeEmitter = (
+  msg: unknown,
+  opts?: { droppable?: boolean },
+) => void | boolean | Promise<void | boolean>;
 
 export interface SessionManagerOptions {
   config: BridgeConfig;
@@ -69,6 +88,8 @@ export interface SessionManagerOptions {
     method: string,
     params: unknown,
   ) => Promise<{ result?: unknown; error?: unknown; requestId: string | number }>;
+  /** Abort in-flight phone requests for a session (cancel / disconnect policy). */
+  cancelPhoneRequests?: (sessionId: string) => void;
   version?: string;
 }
 
@@ -83,7 +104,13 @@ export class SessionManager {
   private phoneInitialize: Record<string, unknown> | undefined;
   private terminals = new Map<
     string,
-    { child: ReturnType<typeof spawnProc>; sessionId: string; chunks: Buffer[] }
+    {
+      child: ChildProcess;
+      sessionId: string;
+      chunks: Buffer[];
+      bytes: number;
+      truncated: boolean;
+    }
   >();
 
   constructor(opts?: SessionManagerOptions) {
@@ -92,9 +119,12 @@ export class SessionManager {
     };
   }
 
-  setHooks(hooks: Pick<SessionManagerOptions, "broadcast" | "requestPhone">): void {
+  setHooks(
+    hooks: Pick<SessionManagerOptions, "broadcast" | "requestPhone" | "cancelPhoneRequests">,
+  ): void {
     if (hooks.broadcast) this.opts.broadcast = hooks.broadcast;
     if (hooks.requestPhone) this.opts.requestPhone = hooks.requestPhone;
+    if (hooks.cancelPhoneRequests) this.opts.cancelPhoneRequests = hooks.cancelPhoneRequests;
   }
 
   updateConfig(config: BridgeConfig): void {
@@ -121,7 +151,9 @@ export class SessionManager {
       .filter((s) => s.status !== "closed")
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     if (opts?.before) items = items.filter((s) => s.updatedAt < opts.before!);
-    if (opts?.limit != null) items = items.slice(0, opts.limit);
+    if (opts?.limit != null && Number.isFinite(opts.limit)) {
+      items = items.slice(0, Math.max(0, Math.floor(opts.limit)));
+    }
     return items.map((s) => this.toSummary(s));
   }
 
@@ -166,8 +198,7 @@ export class SessionManager {
   }
 
   setPermissionMode(sessionId: string, mode: PermissionMode): void {
-    const rec = this.sessions.get(sessionId);
-    if (!rec) throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
+    const rec = this.requireSession(sessionId);
     if (rec.permissionMode !== mode) {
       rec.grants = [];
       rec.permissionMode = mode;
@@ -220,10 +251,13 @@ export class SessionManager {
 
   close(sessionId: string): boolean {
     const rec = this.sessions.get(sessionId);
-    if (!rec) return false;
+    if (!rec || rec.status === "closed") return false;
+    rec.clientGeneration += 1;
     rec.status = "closed";
+    rec.promptInFlight = false;
     rec.client?.kill();
     rec.client = null;
+    this.killTerminals(sessionId);
     rec.log.close();
     this.emitSessionStatus(rec);
     return true;
@@ -231,14 +265,7 @@ export class SessionManager {
 
   async closeAll(): Promise<void> {
     for (const id of [...this.sessions.keys()]) this.close(id);
-    for (const [tid, t] of this.terminals) {
-      try {
-        t.child.kill("SIGTERM");
-      } catch {
-        /* ignore */
-      }
-      this.terminals.delete(tid);
-    }
+    this.killTerminals();
   }
 
   /**
@@ -295,43 +322,14 @@ export class SessionManager {
       client: null,
       agentSessionId: tempId,
       grants: [],
+      mcpServers: params.mcpServers ?? [],
+      clientGeneration: 0,
+      promptInFlight: false,
+      cancelRequested: false,
     };
     this.sessions.set(tempId, rec);
 
-    // Capture session id by reference so handlers see re-keying.
-    const self = this;
-    const client = new AcpStdioClient({
-      harness: { ...harness, command: launch.command, args: launch.args },
-      cwd,
-      env: config.env,
-      onNotification: (msg) => {
-        const current = self.sessions.get(rec.sessionId) ?? rec;
-        self.onAgentNotification(current, msg.method, msg.params);
-      },
-      onRequest: (req) => {
-        const current = self.sessions.get(rec.sessionId) ?? rec;
-        return self.onAgentRequest(current, req);
-      },
-      onStderr: (line) => {
-        log("debug", `harness ${harness.id} stderr: ${line}`);
-      },
-      onExit: (code, signal) => {
-        if (rec.status !== "closed") {
-          rec.status = "error";
-          const tail = client.stderrTail().split("\n").filter(Boolean).slice(-1)[0];
-          rec.preview = tail
-            ? `agent exited (code=${code}, signal=${signal}): ${tail}`
-            : `agent exited (code=${code}, signal=${signal})`;
-          rec.updatedAt = new Date().toISOString();
-          log(
-            "warn",
-            `harness ${harness.id} exited code=${code} signal=${signal} session=${rec.sessionId}`,
-          );
-          self.emitSessionStatus(rec);
-        }
-      },
-    });
-    rec.client = client;
+    const client = this.openClient(rec, launch);
 
     try {
       client.start();
@@ -348,7 +346,7 @@ export class SessionManager {
       rec.authMethods = agentInit.authMethods;
       const created = await client.newSession({
         cwd,
-        mcpServers: params.mcpServers ?? [],
+        mcpServers: rec.mcpServers,
         _meta: {
           harness: harness.id,
           permissionMode,
@@ -369,7 +367,8 @@ export class SessionManager {
       return rec;
     } catch (e) {
       const stderr = client.stderrTail().slice(-2000);
-      rec.status = "error";
+      rec.clientGeneration += 1;
+      rec.status = "closed";
       client.kill();
       rec.client = null;
       this.sessions.delete(rec.sessionId);
@@ -386,30 +385,46 @@ export class SessionManager {
 
   async prompt(sessionId: string, params: unknown): Promise<unknown> {
     const rec = this.requireSession(sessionId);
-    if (!rec.client?.running) throw new Error(`session agent not running: ${sessionId}`);
+    if (rec.promptInFlight) {
+      throw new BridgeError(-32005, "prompt already in progress", { sessionId });
+    }
+    const client = rec.client;
+    if (!client?.running) {
+      throw new BridgeError(-32004, `session agent not running: ${sessionId}`, { sessionId });
+    }
+    rec.promptInFlight = true;
+    rec.cancelRequested = false;
     this.setStatus(sessionId, "running");
     const body =
       params && typeof params === "object" && !Array.isArray(params)
         ? (params as Record<string, unknown>)
         : {};
     try {
-      const result = await rec.client.prompt({ ...body, sessionId: rec.agentSessionId });
+      const result = await client.prompt({ ...body, sessionId: rec.agentSessionId });
+      this.emitPromptResult(rec, { result });
       if (rec.status === "running" || rec.status === "needs_approval") {
         this.setStatus(sessionId, "idle");
       }
       return result;
     } catch (e) {
-      this.setStatus(sessionId, "error", {
-        preview: e instanceof Error ? e.message : String(e),
-      });
+      const message = e instanceof Error ? e.message : String(e);
+      this.emitPromptResult(rec, { error: { message } });
+      if (rec.status !== "closed") {
+        this.setStatus(sessionId, "error", { preview: message });
+      }
       throw e;
+    } finally {
+      rec.promptInFlight = false;
     }
   }
 
   cancel(sessionId: string): void {
     const rec = this.sessions.get(sessionId);
-    if (!rec?.client?.running) return;
-    rec.client.cancel(sessionId);
+    if (!rec || rec.status === "closed") return;
+    rec.cancelRequested = true;
+    // Unblock an agent waiting on session/request_permission.
+    this.opts.cancelPhoneRequests?.(sessionId);
+    if (rec.client?.running) rec.client.cancel(rec.agentSessionId);
   }
 
   /**
@@ -426,30 +441,55 @@ export class SessionManager {
   ): Promise<Record<string, unknown>> {
     const rec = this.sessions.get(sessionId);
     if (!rec) {
-      const err = new Error(`unknown session: ${sessionId}`) as Error & { code?: number };
-      err.code = -32002;
-      throw err;
+      throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
     }
-    const afterSeq = opts.afterSeq ?? 0;
+    const rawAfter = opts.afterSeq ?? 0;
+    const afterSeq = Number.isFinite(rawAfter) ? Math.max(0, Math.floor(rawAfter)) : 0;
+    if (opts.mcpServers && opts.mcpServers.length > 0) {
+      rec.mcpServers = opts.mcpServers;
+    }
+    let replayed = 0;
     for (const entry of rec.log.replay(afterSeq)) {
-      opts.send(entry.event);
+      try {
+        const sent = await opts.send(entry.event);
+        if (sent === false) break;
+      } catch {
+        break;
+      }
+      replayed++;
     }
+
+    let agentAlive = Boolean(rec.client?.running);
     let agentResult: unknown = {};
-    if (rec.client?.running) {
+    if (!agentAlive && rec.status !== "closed" && !rec.promptInFlight) {
+      try {
+        await this.respawnAgent(rec);
+        agentAlive = Boolean(rec.client?.running);
+      } catch {
+        agentAlive = false;
+      }
+    } else if (agentAlive && rec.client && !rec.promptInFlight) {
       try {
         agentResult = await rec.client.loadSession({
-          sessionId,
+          sessionId: rec.agentSessionId,
           cwd: opts.cwd ?? rec.cwd,
-          mcpServers: opts.mcpServers ?? [],
+          mcpServers: rec.mcpServers,
         });
       } catch {
-        /* replay alone is enough */
+        /* replay alone is enough when the agent has no load support */
       }
     }
+    const replayMeta = {
+      sessionId: rec.sessionId,
+      replayed,
+      agentAlive,
+      lastSeq: rec.log.lastSeq,
+      status: rec.status,
+    };
     if (agentResult && typeof agentResult === "object") {
-      return agentResult as Record<string, unknown>;
+      return { ...(agentResult as Record<string, unknown>), ...replayMeta };
     }
-    return {};
+    return replayMeta;
   }
 
   private phoneCapabilities(): Record<string, unknown> | undefined {
@@ -494,8 +534,90 @@ export class SessionManager {
 
   private requireSession(sessionId: string): SessionRecord {
     const rec = this.sessions.get(sessionId);
-    if (!rec) throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
+    if (!rec || rec.status === "closed") {
+      throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
+    }
     return rec;
+  }
+
+  private openClient(rec: SessionRecord, launch?: HarnessLaunch): AcpStdioClient {
+    const harness = findHarness(this.opts.config, rec.harness);
+    if (!harness) {
+      throw new BridgeError(-32602, `unknown harness: ${rec.harness}`, { harnessId: rec.harness });
+    }
+    const resolved = launch ?? resolveHarnessLaunch(harness);
+    if (!resolved.available) {
+      throw new BridgeError(
+        -32010,
+        `harness ${harness.id} is not available: ${resolved.detail}`,
+        launchErrorData(resolved),
+      );
+    }
+    const gen = ++rec.clientGeneration;
+    const self = this;
+    const client = new AcpStdioClient({
+      harness: { ...harness, command: resolved.command, args: resolved.args },
+      cwd: rec.cwd,
+      env: this.opts.config.env,
+      onNotification: (msg) => {
+        const current = self.sessions.get(rec.sessionId) ?? rec;
+        self.onAgentNotification(current, msg.method, msg.params);
+      },
+      onRequest: (req) => {
+        const current = self.sessions.get(rec.sessionId) ?? rec;
+        return self.onAgentRequest(current, req);
+      },
+      onStderr: (line) => {
+        log("debug", `harness ${harness.id} stderr: ${line}`);
+      },
+      onExit: (code, signal) => {
+        if (rec.clientGeneration !== gen) return;
+        if (rec.status === "closed") return;
+        rec.status = "error";
+        const tail = client.stderrTail().split("\n").filter(Boolean).slice(-1)[0];
+        rec.preview = tail
+          ? `agent exited (code=${code}, signal=${signal}): ${tail}`
+          : `agent exited (code=${code}, signal=${signal})`;
+        rec.updatedAt = new Date().toISOString();
+        log(
+          "warn",
+          `harness ${harness.id} exited code=${code} signal=${signal} session=${rec.sessionId}`,
+        );
+        self.emitSessionStatus(rec);
+      },
+    });
+    rec.client = client;
+    return client;
+  }
+
+  /** Start a fresh harness and ask it to resume `rec.sessionId`. */
+  private async respawnAgent(rec: SessionRecord): Promise<void> {
+    const previous = rec.client;
+    const client = this.openClient(rec);
+    previous?.kill();
+    try {
+      client.start();
+      await client.initialize({
+        clientInfo: {
+          name: "gradation-bridge",
+          version: this.opts.version ?? "0.1.0",
+        },
+        clientCapabilities: this.phoneCapabilities(),
+      });
+      await client.loadSession({
+        sessionId: rec.agentSessionId,
+        cwd: rec.cwd,
+        mcpServers: rec.mcpServers,
+      });
+      if (rec.status === "error" || rec.status === "idle") {
+        this.setStatus(rec.sessionId, "idle");
+      }
+    } catch (e) {
+      rec.clientGeneration += 1;
+      client.kill();
+      if (rec.client === client) rec.client = null;
+      throw e;
+    }
   }
 
   private onAgentNotification(rec: SessionRecord, method: string, params: unknown): void {
@@ -594,6 +716,11 @@ export class SessionManager {
       return { outcome: { outcome: "cancelled" } };
     }
 
+    const resumeAfterAsk = (): void => {
+      if (rec.status !== "needs_approval") return;
+      this.setStatus(rec.sessionId, rec.promptInFlight ? "running" : "idle");
+    };
+
     try {
       const { result, requestId } = await this.opts.requestPhone(
         "session/request_permission",
@@ -602,7 +729,7 @@ export class SessionManager {
       const outcome = (result as { outcome?: { outcome?: string; optionId?: string } })?.outcome;
       const optionId = outcome?.optionId;
       const optionKind = optionKindById(options, optionId);
-      if (outcome?.outcome === "selected") {
+      if (!rec.cancelRequested && outcome?.outcome === "selected") {
         const grant = grantFromOption(
           optionKind,
           grantFamilyForKind(kind),
@@ -610,20 +737,16 @@ export class SessionManager {
         );
         if (grant) rec.grants.push(grant);
       }
-      this.opts.broadcast?.({
-        jsonrpc: "2.0",
-        method: "bridge/permissionResolved",
-        params: {
-          sessionId: rec.sessionId,
-          requestId,
-          optionKind: optionKind ?? outcome?.outcome ?? "cancelled",
-          _meta: { seq: rec.log.lastSeq },
-        },
-      });
-      if (rec.status === "needs_approval") this.setStatus(rec.sessionId, "running");
+      const resolvedKind = rec.cancelRequested
+        ? "cancelled"
+        : (optionKind ?? outcome?.outcome ?? "cancelled");
+      this.notePermissionResolved(rec, requestId, resolvedKind);
+      resumeAfterAsk();
+      if (rec.cancelRequested) return { outcome: { outcome: "cancelled" } };
       return result ?? { outcome: { outcome: "cancelled" } };
     } catch {
-      if (rec.status === "needs_approval") this.setStatus(rec.sessionId, "idle");
+      this.notePermissionResolved(rec, undefined, "cancelled");
+      resumeAfterAsk();
       return { outcome: { outcome: "cancelled" } };
     }
   }
@@ -675,10 +798,36 @@ export class SessionManager {
       cwd,
       env,
       stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
     });
-    child.stdout?.on("data", (b: Buffer) => chunks.push(b));
-    child.stderr?.on("data", (b: Buffer) => chunks.push(b));
-    this.terminals.set(terminalId, { child, sessionId: rec.sessionId, chunks });
+    child.on("error", () => {
+      // Keep the process from crashing the bridge; output/wait report the failure.
+    });
+    const term = {
+      child,
+      sessionId: rec.sessionId,
+      chunks,
+      bytes: 0,
+      truncated: false,
+    };
+    const push = (b: Buffer): void => {
+      const cap = SessionManager.MAX_TERMINAL_BYTES;
+      if (term.bytes >= cap) {
+        term.truncated = true;
+        return;
+      }
+      if (term.bytes + b.length > cap) {
+        chunks.push(b.subarray(0, cap - term.bytes));
+        term.bytes = cap;
+        term.truncated = true;
+        return;
+      }
+      chunks.push(b);
+      term.bytes += b.length;
+    };
+    child.stdout?.on("data", push);
+    child.stderr?.on("data", push);
+    this.terminals.set(terminalId, term);
     return { terminalId };
   }
 
@@ -694,7 +843,7 @@ export class SessionManager {
     const exited = t.child.exitCode !== null;
     return {
       output,
-      truncated: false,
+      truncated: t.truncated,
       ...(exited
         ? { exitStatus: { exitCode: t.child.exitCode, signal: t.child.signalCode } }
         : {}),
@@ -705,11 +854,7 @@ export class SessionManager {
     const p = (params ?? {}) as { terminalId?: string };
     const t = p.terminalId ? this.terminals.get(p.terminalId) : undefined;
     if (t) {
-      try {
-        t.child.kill("SIGTERM");
-      } catch {
-        /* ignore */
-      }
+      killProcessTree(t.child, "SIGTERM");
       this.terminals.delete(p.terminalId!);
     }
     return {};
@@ -742,9 +887,49 @@ export class SessionManager {
     const entry = rec.log.append(frame);
     rec.lastSeq = entry.seq;
     rec.updatedAt = entry.ts;
-    this.opts.broadcast?.(entry.event);
+    const droppable = frame.method === "session/update";
+    void this.opts.broadcast?.(entry.event, { droppable });
     return entry.seq;
   }
+
+  private emitPromptResult(
+    rec: SessionRecord,
+    body: { result?: unknown; error?: { message: string } },
+  ): void {
+    if (!this.sessions.has(rec.sessionId)) return;
+    this.broadcastLogged(rec, {
+      jsonrpc: "2.0",
+      method: "bridge/promptResult",
+      params: { sessionId: rec.sessionId, ...body },
+    });
+  }
+
+  private notePermissionResolved(
+    rec: SessionRecord,
+    requestId: string | number | undefined,
+    optionKind: string,
+  ): void {
+    if (!this.sessions.has(rec.sessionId)) return;
+    this.broadcastLogged(rec, {
+      jsonrpc: "2.0",
+      method: "bridge/permissionResolved",
+      params: {
+        sessionId: rec.sessionId,
+        requestId,
+        optionKind,
+      },
+    });
+  }
+
+  private killTerminals(sessionId?: string): void {
+    for (const [tid, t] of this.terminals) {
+      if (sessionId && t.sessionId !== sessionId) continue;
+      killProcessTree(t.child, "SIGTERM");
+      this.terminals.delete(tid);
+    }
+  }
+
+  private static readonly MAX_TERMINAL_BYTES = 1024 * 1024;
 
   private emitSessionStatus(rec: SessionRecord): void {
     const entry = rec.log.append({
