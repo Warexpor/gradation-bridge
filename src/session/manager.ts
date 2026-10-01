@@ -1151,7 +1151,7 @@ export class SessionManager {
     }
     if (decision.action === "ask") {
       const before = rec.grants.length;
-      if (!consumeGrant(rec.grants, family, path, argv)) {
+      if (!consumeGrant(rec.grants, family, path, argv, rec.cwd)) {
         const message =
           family === "write"
             ? "write requires approval before the agent can change files"
