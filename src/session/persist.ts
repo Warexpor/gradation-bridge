@@ -3,7 +3,19 @@
  * meta.json is what lets a restarted bridge list the session and respawn the harness.
  */
 
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import type { ToolGrant } from "../approval/grants.js";
@@ -70,6 +82,10 @@ export function writeSessionMeta(dir: string, meta: SessionMeta): void {
   if (!isSafeSessionId(meta.sessionId)) {
     throw new Error("refusing to persist an unsafe session id");
   }
+  if (meta.agentSessionId !== meta.sessionId) {
+    throw new Error("refusing to persist a session id that does not match the agent");
+  }
+  assertRealSessionsRoot();
   const expected = join(sessionsRoot(), meta.sessionId);
   if (dir !== expected) {
     throw new Error("refusing to persist a session outside the catalog");
@@ -86,9 +102,34 @@ export function writeSessionMeta(dir: string, meta: SessionMeta): void {
 }
 
 /** Newest first. Closed sessions and corrupt files are skipped. */
+function assertRealSessionsRoot(): void {
+  const root = sessionsRoot();
+  if (!existsSync(root)) return;
+  const info = lstatSync(root);
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error("refusing to use a symlinked sessions directory");
+  }
+}
+
+function readRegular(path: string): string {
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    return readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
 export function loadPersistedMetas(): SessionMeta[] {
   const root = sessionsRoot();
   if (!existsSync(root)) return [];
+  try {
+    assertRealSessionsRoot();
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    log("warn", `skipping session catalog: ${message}`);
+    return [];
+  }
   const found: SessionMeta[] = [];
   let skipped = 0;
   for (const name of readdirSync(root)) {
@@ -116,7 +157,7 @@ export function loadPersistedMetas(): SessionMeta[] {
     }
     let parsed: z.SafeParseReturnType<unknown, z.infer<typeof MetaSchema>>;
     try {
-      parsed = MetaSchema.safeParse(JSON.parse(readFileSync(metaPath, "utf8")));
+      parsed = MetaSchema.safeParse(JSON.parse(readRegular(metaPath)));
     } catch {
       skipped++;
       log("warn", `skipping session ${name}: meta.json is not valid JSON`);
@@ -127,9 +168,12 @@ export function loadPersistedMetas(): SessionMeta[] {
       log("warn", `skipping session ${name}: meta.json does not match the session catalog`);
       continue;
     }
-    if (parsed.data.sessionId !== name) {
+    if (parsed.data.sessionId !== name || parsed.data.agentSessionId !== name) {
       skipped++;
-      log("warn", `skipping session ${name}: meta sessionId does not match the directory`);
+      log(
+        "warn",
+        `skipping session ${name}: session id does not match the directory`,
+      );
       continue;
     }
     if (parsed.data.status === "closed") continue;

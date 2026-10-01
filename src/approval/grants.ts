@@ -4,7 +4,7 @@
  * so an agent cannot skip session/request_permission.
  */
 
-import { isAbsolute, normalize, resolve } from "node:path";
+import { isAbsolute, normalize, resolve, sep } from "node:path";
 import { resolveRealPath } from "./sandbox.js";
 
 export type GrantFamily = "write" | "exec";
@@ -51,14 +51,19 @@ export function grantFromOption(
   };
 }
 
+/**
+ * A grant with no path covers the family (an allow_always that named no file).
+ * A grant with a path covers that path and descendants only. Approving
+ * `/proj/a.ts` must not authorize a write of `/proj`.
+ */
 function samePath(grantPath: string | undefined, opPath: string | undefined): boolean {
   if (!grantPath || !opPath) return true;
   const g = normalize(grantPath);
   const o = normalize(opPath);
   if (g === o) return true;
-  const root = g.endsWith("/") ? g : g + "/";
-  const child = o.endsWith("/") ? o : o + "/";
-  return child.startsWith(root) || root.startsWith(child);
+  const root = g.endsWith(sep) ? g : g + sep;
+  const child = o.endsWith(sep) ? o : o + sep;
+  return child.startsWith(root);
 }
 
 /**

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ensureDirs } from "../src/config/load.js";
 import { SessionManager } from "../src/session/manager.js";
+import { SessionLog } from "../src/session/log.js";
 import { writeSessionMeta, type SessionMeta } from "../src/session/persist.js";
 
 const roots: string[] = [];
@@ -95,5 +96,57 @@ describe("persisted sessions", () => {
     const rest = sessions.listForProtocol({ cursor: "s-new" });
     expect(rest.sessions.map((s) => s.sessionId)).toEqual(["s-mid"]);
     expect(sessions.listForProtocol({ cursor: "missing" }).sessions).toHaveLength(0);
+  });
+
+  it("seals a crashed prompt and an open permission, once", () => {
+    const { workspace } = useDataDir();
+    const dir = join(process.env.XDG_DATA_HOME!, "gradation-bridge", "sessions");
+    writeSessionMeta(join(dir, "s-run"), meta(workspace, { sessionId: "s-run", status: "running", preview: "mid" }));
+    const running = new SessionLog("s-run");
+    running.append({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "s-run" } });
+
+    writeSessionMeta(
+      join(dir, "s-ask"),
+      meta(workspace, { sessionId: "s-ask", status: "needs_approval" }),
+    );
+    const asking = new SessionLog("s-ask");
+    asking.append({
+      jsonrpc: "2.0",
+      method: "session/request_permission",
+      params: { sessionId: "s-ask" },
+    });
+
+    const doneMeta = meta(workspace, { sessionId: "s-done", status: "running" });
+    doneMeta.preview = "kept";
+    writeSessionMeta(join(dir, "s-done"), doneMeta);
+    const done = new SessionLog("s-done");
+    done.append({
+      jsonrpc: "2.0",
+      method: "bridge/promptResult",
+      params: { sessionId: "s-done", result: { stopReason: "end_turn" } },
+    });
+
+    const config = {
+      allowedRoots: [workspace],
+      defaultPermissionMode: "ask" as const,
+      harnesses: [],
+    };
+    const sessions = new SessionManager({ config });
+    expect(sessions.get("s-run")?.status).toBe("idle");
+    expect(sessions.get("s-run")?.preview).toMatch(/restarted/);
+    expect(sessions.get("s-ask")?.status).toBe("idle");
+    expect(sessions.get("s-done")?.preview).toBe("kept");
+
+    const methods = (id: string) =>
+      [...new SessionLog(id).replay(0)].map((entry) => (entry.event as { method?: string }).method);
+    expect(methods("s-run").filter((m) => m === "bridge/promptResult")).toEqual(["bridge/promptResult"]);
+    expect(methods("s-ask")).toContain("bridge/permissionResolved");
+    expect(methods("s-done").filter((m) => m === "bridge/promptResult")).toHaveLength(1);
+
+    const again = new SessionManager({ config });
+    expect([...new SessionLog("s-run").replay(0)].filter(
+      (entry) => (entry.event as { method?: string }).method === "bridge/promptResult",
+    )).toHaveLength(1);
+    expect(again.get("s-run")?.status).toBe("idle");
   });
 });

@@ -39,7 +39,12 @@ function useEnv(root: string): () => void {
   };
 }
 
-async function openClient(url: string, token: string, autoAllow = false) {
+async function openClient(
+  url: string,
+  token: string,
+  autoAllow = false,
+  hooks?: { beforeAllow?: () => Promise<void> },
+) {
   const ws = new WebSocket(url, { headers: { Authorization: `Bearer ${token}` } });
   await new Promise<void>((resolve, reject) => {
     ws.once("open", () => resolve());
@@ -65,19 +70,26 @@ async function openClient(url: string, token: string, autoAllow = false) {
       return;
     }
     if (msg.method) updates.push(msg);
-    if (autoAllow && msg.method === "session/request_permission" && msg.id != null) {
+    if ((autoAllow || hooks?.beforeAllow) && msg.method === "session/request_permission" && msg.id != null) {
       const allow = msg.params?.options?.find((o) => o.kind === "allow_once");
-      ws.send(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          id: msg.id,
-          result: { outcome: { outcome: "selected", optionId: allow?.optionId ?? "allow-once" } },
-        }),
-      );
+      const respond = (): void => {
+        ws.send(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: { outcome: { outcome: "selected", optionId: allow?.optionId ?? "allow-once" } },
+          }),
+        );
+      };
+      if (hooks?.beforeAllow) void hooks.beforeAllow().then(respond);
+      else respond();
     }
   });
   return {
     updates,
+    notify: (method: string, params?: unknown) => {
+      ws.send(JSON.stringify({ jsonrpc: "2.0", method, params: params ?? {} }));
+    },
     call: (method: string, params?: unknown) => {
       const id = nextId++;
       ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} }));
@@ -266,8 +278,10 @@ describe("execution policy and protocol surfaces", () => {
       clientCapabilities: { _meta: { ping: true } },
     })) as {
       authMethods: unknown[];
+      agentCapabilities: { sessionCapabilities: { additionalDirectories?: unknown } };
       _meta: { bridge: { permissionModes: Array<{ id: string }> } };
     };
+    expect(init.agentCapabilities?.sessionCapabilities?.additionalDirectories).toEqual({});
     expect(init.authMethods).toEqual([]);
     expect(init._meta.bridge.permissionModes.map((m) => m.id)).toEqual([
       "ask",
@@ -354,6 +368,61 @@ describe("execution policy and protocol surfaces", () => {
     expect(data.install).toBeTruthy();
     expect(JSON.stringify(data)).not.toContain("sk-supersecretvalue");
     expect(JSON.stringify(data)).not.toContain("should-not-leak");
+    await client.close();
+  });
+
+  it("drops an in-flight approval when the permission mode changes", async () => {
+    await boot({
+      mode: "ask",
+      env: { FAKE_ACP_PERMISSION: "1", FAKE_ACP_FS_WRITE: "1" },
+    });
+    let sessionId = "";
+    let client!: Awaited<ReturnType<typeof openClient>>;
+    client = await openClient(server!.url, token, false, {
+      beforeAllow: async () => {
+        await client.call("bridge/setPermissionMode", { sessionId, permissionMode: "plan" });
+      },
+    });
+    await client.call("initialize", { protocolVersion: 1 });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "ask" },
+    })) as { sessionId: string };
+    sessionId = created.sessionId;
+    const result = (await client.call("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "edit" }],
+    })) as { stopReason: string };
+    expect(result.stopReason).toBe("cancelled");
+    expect(readFileSync(join(workspace, "README.md"), "utf8")).toBe("# test\n");
+    await client.close();
+  });
+
+  it("refuses a write that arrives after the prompt was cancelled", async () => {
+    await boot({
+      mode: "auto-edit",
+      env: { FAKE_ACP_FS_WRITE: "1", FAKE_ACP_IGNORE_CANCEL: "1", FAKE_ACP_SLOW_MS: "300" },
+    });
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", { protocolVersion: 1 });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "auto-edit" },
+    })) as { sessionId: string };
+    const pending = client.call("session/prompt", {
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "edit" }],
+    });
+    const deadline = Date.now() + 5_000;
+    while (client.updates.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    client.notify("session/cancel", { sessionId: created.sessionId });
+    await pending;
+    expect(texts(client.updates).join("\n")).toMatch(/write failed:.*cancel/i);
+    expect(readFileSync(join(workspace, "README.md"), "utf8")).toBe("# test\n");
     await client.close();
   });
 });

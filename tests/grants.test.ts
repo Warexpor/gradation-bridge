@@ -26,4 +26,16 @@ describe("approval grants", () => {
     expect(consumeGrant(grants, "write", "/tmp/proj/secret.env")).toBe(false);
     expect(grants).toHaveLength(1);
   });
+
+  it("does not let a file grant authorize its parent, and a directory grant covers children", () => {
+    const file: ToolGrant[] = [{ family: "write", path: "/tmp/proj/README.md", always: true }];
+    expect(consumeGrant(file, "write", "/tmp/proj")).toBe(false);
+    expect(consumeGrant(file, "write", "/tmp")).toBe(false);
+    expect(consumeGrant(file, "write", "/tmp/proj/README.md.bak")).toBe(false);
+    expect(consumeGrant(file, "write", "/tmp/proj/README.md")).toBe(true);
+
+    const dir: ToolGrant[] = [{ family: "write", path: "/tmp/proj", always: true }];
+    expect(consumeGrant(dir, "write", "/tmp/proj/src/a.ts")).toBe(true);
+    expect(consumeGrant(dir, "write", "/tmp/proj")).toBe(true);
+  });
 });

@@ -60,10 +60,12 @@ export function pickOptionId(
     const hit = options.find((o) => o.kind === kind);
     if (hit) return hit.optionId;
   }
-  // Fall back: first option whose kind contains allow/reject
   const needle = prefer === "allow" ? "allow" : "reject";
-  const soft = options.find((o) => o.kind.includes(needle));
-  return soft?.optionId ?? options[0]?.optionId;
+  const soft = options.find((o) => o.kind.toLowerCase().includes(needle));
+  if (soft) return soft.optionId;
+  // A deny must not fall through to an allow option. Cancel instead.
+  if (prefer === "reject") return undefined;
+  return options[0]?.optionId;
 }
 
 export function optionKindById(

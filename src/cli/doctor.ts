@@ -21,7 +21,11 @@ export function formatDoctorReport(config: BridgeConfig): string {
       ? `ready (${tls.certPath})`
       : tls.state === "stub"
         ? `stub (${tls.certPath}) — not a certificate; install openssl and delete this file`
-        : `missing (${tls.certPath}) — created on first start when openssl is on PATH`;
+        : tls.state === "incomplete"
+          ? `incomplete (${tls.certPath}) — ${tls.detail ?? "certificate or key is missing"}; delete the remaining file to mint a new pair`
+          : tls.state === "invalid"
+            ? `invalid (${tls.certPath}) — ${tls.detail ?? "key and certificate do not match"}; delete server.key and server.crt to mint a new pair`
+            : `missing (${tls.certPath}) — created on first start when openssl is on PATH`;
   const lines: string[] = [
     "gradation-bridge doctor",
     `config:  ${configPath()}`,

@@ -156,9 +156,11 @@ describe("bridge e2e with fake ACP agent", () => {
       clientInfo: { name: "test", version: "0" },
     })) as {
       protocolVersion: number;
+      agentCapabilities: { sessionCapabilities: { additionalDirectories?: unknown } };
       _meta: { bridge: { version: string; harnesses: Array<{ id: string }> } };
     };
     expect(init.protocolVersion).toBe(1);
+    expect(init.agentCapabilities.sessionCapabilities.additionalDirectories).toEqual({});
     expect(init._meta.bridge.harnesses.some((h) => h.id === "fake")).toBe(true);
 
     const harnesses = (await client.call("bridge/listHarnesses")) as {
@@ -228,6 +230,9 @@ describe("bridge e2e with fake ACP agent", () => {
     await client.call("bridge/closeSession", { sessionId: created.sessionId });
     const afterClose = (await client.call("bridge/listSessions")) as { sessions: unknown[] };
     expect(afterClose.sessions).toHaveLength(0);
+    await expect(
+      client.call("session/load", { sessionId: created.sessionId, cwd: workspace, mcpServers: [] }),
+    ).rejects.toThrow(/unknown session/);
 
     await client.close();
   }, 60_000);

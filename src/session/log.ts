@@ -1,4 +1,15 @@
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { dataDir, ensureDirs } from "../config/load.js";
 import { isSafeSessionId } from "./ids.js";
@@ -28,7 +39,7 @@ export class SessionLog {
     const dir = baseDir ?? join(dataDir(), "sessions", sessionId);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     this.path = join(dir, "events.jsonl");
-    assertNotSymlink(this.path);
+    assertRegularLog(this.path);
     if (existsSync(this.path)) {
       this.seq = recoverLastSeq(this.path);
     }
@@ -40,21 +51,27 @@ export class SessionLog {
 
   append(event: unknown): LoggedEvent {
     this.seq += 1;
-    assertNotSymlink(this.path);
+    assertRegularLog(this.path);
     const stamped = injectSeq(event, this.seq);
     const entry: LoggedEvent = {
       seq: this.seq,
       ts: new Date().toISOString(),
       event: stamped,
     };
-    appendFileSync(this.path, JSON.stringify(entry) + "\n", { mode: 0o600 });
+    try {
+      appendRegular(this.path, JSON.stringify(entry) + "\n");
+    } catch (e) {
+      this.seq -= 1;
+      throw e;
+    }
     return entry;
   }
 
   /** Yield events with seq > afterSeq. Corrupt lines are skipped. */
   *replay(afterSeq = 0): Generator<LoggedEvent> {
     if (!existsSync(this.path)) return;
-    const text = readFileSync(this.path, "utf8");
+    assertRegularLog(this.path);
+    const text = readRegular(this.path);
     for (const line of text.split("\n")) {
       if (!line.trim()) continue;
       let entry: LoggedEvent;
@@ -96,7 +113,7 @@ export class SessionLog {
   }
 }
 
-function assertNotSymlink(path: string): void {
+function assertRegularLog(path: string): void {
   let info: ReturnType<typeof lstatSync>;
   try {
     info = lstatSync(path);
@@ -106,6 +123,29 @@ function assertNotSymlink(path: string): void {
   }
   if (info.isSymbolicLink()) {
     throw new Error("refusing to follow a symlinked session log");
+  }
+  if (!info.isFile()) {
+    throw new Error("refusing to use a session log that is not a regular file");
+  }
+}
+
+const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
+
+function readRegular(path: string): string {
+  const fd = openSync(path, constants.O_RDONLY | NOFOLLOW);
+  try {
+    return readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function appendRegular(path: string, line: string): void {
+  const fd = openSync(path, constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | NOFOLLOW, 0o600);
+  try {
+    writeSync(fd, line);
+  } finally {
+    closeSync(fd);
   }
 }
 
@@ -129,7 +169,7 @@ function injectSeq(event: unknown, seq: number): unknown {
 }
 
 function recoverLastSeq(path: string): number {
-  const text = readFileSync(path, "utf8");
+  const text = readRegular(path);
   let last = 0;
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;

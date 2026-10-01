@@ -30,4 +30,13 @@ describe("permissions helpers", () => {
     expect(pickOptionId(options, "reject")).toBe("c");
     expect(optionKindById(options, "a")).toBe("allow_always");
   });
+
+  it("does not select an allow option when the policy is rejecting", () => {
+    const allowOnly = [
+      { optionId: "a", kind: "allow_once" },
+      { optionId: "b", kind: "allow_always" },
+    ];
+    expect(pickOptionId(allowOnly, "reject")).toBeUndefined();
+    expect(pickOptionId(allowOnly, "allow")).toBe("a");
+  });
 });

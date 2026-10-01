@@ -23,6 +23,7 @@
  *   FAKE_ACP_ELICIT_DUMP=<file> — write the elicitation result JSON
  *   FAKE_ACP_CANCEL_ELICIT=1    — `$/cancel_request` the elicitation as soon as it is sent
  *   FAKE_ACP_ELICIT_IGNORE_CANCEL=1 — still elicit after session/cancel
+ *   FAKE_ACP_IGNORE_CANCEL=1    — keep going after session/cancel (bridge must still refuse writes)
  *   FAKE_ACP_WRITE_ON_TERM=1    — emit a session update from the SIGTERM handler
  *   FAKE_ACP_AUTH_HOLD_MS=N     — delay authenticate before it succeeds
  *   FAKE_ACP_TRACE=<file>       — append init/auth/new lines with this process id
@@ -63,6 +64,7 @@ const elicitForeign = process.env.FAKE_ACP_ELICIT_FOREIGN === "1";
 const elicitDump = process.env.FAKE_ACP_ELICIT_DUMP;
 const cancelElicit = process.env.FAKE_ACP_CANCEL_ELICIT === "1";
 const elicitIgnoreCancel = process.env.FAKE_ACP_ELICIT_IGNORE_CANCEL === "1";
+const ignoreCancel = process.env.FAKE_ACP_IGNORE_CANCEL === "1";
 const writeOnTerm = process.env.FAKE_ACP_WRITE_ON_TERM === "1";
 let lastSessionId = "";
 const authHoldMs = Number(process.env.FAKE_ACP_AUTH_HOLD_MS ?? "0") || 0;
@@ -176,7 +178,7 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     },
   });
   if (slowMs) await sleep(slowMs);
-  if (session.cancelled && !elicitIgnoreCancel) {
+  if (session.cancelled && !elicitIgnoreCancel && !ignoreCancel) {
     respond(id, { stopReason: "cancelled" });
     return;
   }
@@ -203,7 +205,7 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     },
   });
 
-  if (session.cancelled && !elicitIgnoreCancel) {
+  if (session.cancelled && !elicitIgnoreCancel && !ignoreCancel) {
     respond(id, { stopReason: "cancelled" });
     return;
   }
@@ -256,7 +258,7 @@ async function handlePrompt(id: number | string, params: Record<string, unknown>
     }
   }
 
-  if (session.cancelled && !elicitIgnoreCancel) {
+  if (session.cancelled && !elicitIgnoreCancel && !ignoreCancel) {
     respond(id, { stopReason: "cancelled" });
     return;
   }

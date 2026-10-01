@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { BridgeConfig, PermissionMode } from "../config/types.js";
 import { BridgeError } from "../errors.js";
@@ -23,7 +23,7 @@ import {
   sanitizeElicitationResponse,
 } from "../acp/elicitation.js";
 import { assertSupportedPrompt, firstPromptText } from "../acp/prompt.js";
-import { assertNotDirectory, assertWritableContent, readTextFileWindow } from "../acp/text-file.js";
+import { assertNotDirectory, assertWritableContent, readTextFileWindow, writeTextNoFollow } from "../acp/text-file.js";
 import {
   optionKindById,
   pathFromToolCall,
@@ -45,7 +45,7 @@ import { assertAllowedRealPath, assertAllowedWorkspace, SandboxError } from "../
 import { log } from "../log/diagnostics.js";
 import { redactSecrets } from "../log/redact.js";
 import { isSafeSessionId } from "./ids.js";
-import { SessionLog } from "./log.js";
+import { SessionLog, type LoggedEvent } from "./log.js";
 import {
   loadPersistedMetas,
   removeSessionStorage,
@@ -171,6 +171,12 @@ export class SessionManager {
   private warmAbort = new Set<string>();
   /** Bumped when a session authenticate is cancelled. Captured at the start of the call. */
   private sessionAuthEpoch = new Map<string, number>();
+  /** Bumped when the permission mode changes so an in-flight approval cannot outlive it. */
+  private permissionEpoch = new Map<string, number>();
+  /** Resolves when the in-flight prompt's finally runs, including after the agent dies. */
+  private promptGates = new Map<string, Promise<void>>();
+  /** One respawn per session so two phones cannot start two harnesses. */
+  private respawnInflight = new Map<string, Promise<unknown>>();
 
   constructor(opts?: SessionManagerOptions) {
     this.opts = opts ?? {
@@ -265,6 +271,7 @@ export class SessionManager {
     if (rec.permissionMode !== mode) {
       rec.grants = [];
       rec.permissionMode = mode;
+      this.permissionEpoch.set(sessionId, (this.permissionEpoch.get(sessionId) ?? 0) + 1);
     }
     rec.updatedAt = new Date().toISOString();
     this.warnFullAuto(mode);
@@ -379,6 +386,9 @@ export class SessionManager {
     }
     if (rec.status !== "closed") await this.closeSession(sessionId, { missing: "error" });
     this.sessions.delete(sessionId);
+    this.permissionEpoch.delete(sessionId);
+    this.promptGates.delete(sessionId);
+    this.respawnInflight.delete(sessionId);
     try {
       rec.log.discard();
     } catch {
@@ -598,6 +608,11 @@ export class SessionManager {
     }
     rec.promptInFlight = true;
     rec.cancelRequested = false;
+    let releaseGate = (): void => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    this.promptGates.set(sessionId, gate);
     this.maybeTitle(rec, params);
     this.setStatus(sessionId, "running");
     const body =
@@ -620,6 +635,8 @@ export class SessionManager {
       throw e;
     } finally {
       rec.promptInFlight = false;
+      releaseGate();
+      if (this.promptGates.get(sessionId) === gate) this.promptGates.delete(sessionId);
     }
   }
 
@@ -642,15 +659,17 @@ export class SessionManager {
       afterSeq?: number;
       send: BridgeEmitter;
       mcpServers?: unknown[];
+      additionalDirectories?: string[];
     },
   ): Promise<Record<string, unknown>> {
     const rec = this.sessions.get(sessionId);
-    if (!rec) {
+    if (!rec || rec.status === "closed") {
       throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
     }
     const rawAfter = opts.afterSeq ?? 0;
     const afterSeq = Number.isFinite(rawAfter) ? Math.max(0, Math.floor(rawAfter)) : 0;
     if (opts.cwd) this.assertSameSessionCwd(rec, opts.cwd);
+    this.applyAdditionalDirectories(rec, opts.additionalDirectories);
     if (opts.mcpServers && opts.mcpServers.length > 0) {
       rec.mcpServers = opts.mcpServers;
     }
@@ -665,10 +684,18 @@ export class SessionManager {
       replayed++;
     }
 
+    if (!rec.client?.running) {
+      const gate = this.promptGates.get(sessionId);
+      if (gate) await gate;
+    }
+    if ((rec.status as SessionStatus) === "closed") {
+      throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
+    }
+
     let agentAlive = Boolean(rec.client?.running);
     let agentResult: unknown = {};
     let warning: string | undefined;
-    if (!agentAlive && rec.status !== "closed" && !rec.promptInFlight) {
+    if (!agentAlive && !rec.promptInFlight) {
       this.assertSessionWorkspace(rec);
       try {
         agentResult = await this.respawnAgent(rec, "load");
@@ -712,23 +739,23 @@ export class SessionManager {
    */
   async resume(
     sessionId: string,
-    opts?: { cwd?: string; mcpServers?: unknown[] },
+    opts?: { cwd?: string; mcpServers?: unknown[]; additionalDirectories?: string[] },
   ): Promise<Record<string, unknown>> {
     const rec = this.sessions.get(sessionId);
     if (!rec || rec.status === "closed") {
       throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
     }
     this.assertSessionWorkspace(rec);
-    if (opts?.cwd) {
-      const cwd = assertAllowedRealPath(opts.cwd, this.opts.config.allowedRoots, rec.cwd);
-      if (cwd !== rec.cwd) {
-        throw new BridgeError(-32602, "cwd does not match the session", {
-          sessionId,
-          cwd,
-        });
-      }
-    }
+    if (opts?.cwd) this.assertSameSessionCwd(rec, opts.cwd);
+    this.applyAdditionalDirectories(rec, opts?.additionalDirectories);
     if (opts?.mcpServers && opts.mcpServers.length > 0) rec.mcpServers = opts.mcpServers;
+    if (!rec.client?.running) {
+      const gate = this.promptGates.get(sessionId);
+      if (gate) await gate;
+    }
+    if ((rec.status as SessionStatus) === "closed") {
+      throw new BridgeError(-32002, `unknown session: ${sessionId}`, { sessionId });
+    }
     if (rec.promptInFlight) {
       throw new BridgeError(-32005, "prompt already in progress", { sessionId });
     }
@@ -1023,6 +1050,13 @@ export class SessionManager {
   }
 
   private assertMutatingTool(rec: SessionRecord, family: GrantFamily, path?: string): void {
+    if (rec.cancelRequested || rec.closing || rec.status === "closed") {
+      throw new BridgeError(-32003, "session cancelled", {
+        sessionId: rec.sessionId,
+        permissionMode: rec.permissionMode,
+        kind: family,
+      });
+    }
     const decision = decidePermission(rec.permissionMode, {
       kind: family === "write" ? "write" : "execute",
       path,
@@ -1125,7 +1159,17 @@ export class SessionManager {
   }
 
   /** Start a fresh harness and ask it to load or resume `rec.sessionId`. */
-  private async respawnAgent(rec: SessionRecord, mode: "load" | "resume"): Promise<unknown> {
+  private respawnAgent(rec: SessionRecord, mode: "load" | "resume"): Promise<unknown> {
+    const existing = this.respawnInflight.get(rec.sessionId);
+    if (existing) return existing;
+    const run = this.respawnAgentOnce(rec, mode).finally(() => {
+      if (this.respawnInflight.get(rec.sessionId) === run) this.respawnInflight.delete(rec.sessionId);
+    });
+    this.respawnInflight.set(rec.sessionId, run);
+    return run;
+  }
+
+  private async respawnAgentOnce(rec: SessionRecord, mode: "load" | "resume"): Promise<unknown> {
     const previous = rec.client;
     const client = this.openClient(rec);
     previous?.kill();
@@ -1237,6 +1281,9 @@ export class SessionManager {
     params: RequestPermissionParams,
     reqSignal?: AbortSignal,
   ): Promise<unknown> {
+    if (reqSignal?.aborted || rec.cancelRequested || rec.closing) {
+      return { outcome: { outcome: "cancelled" } };
+    }
     const toolCall = params.toolCall;
     const kind = policyKindFromToolCall(toolCall);
     const path = pathFromToolCall(toolCall);
@@ -1265,6 +1312,8 @@ export class SessionManager {
     }
 
     this.setStatus(rec.sessionId, "needs_approval");
+    const epoch = this.permissionEpoch.get(rec.sessionId) ?? 0;
+    const generation = rec.clientGeneration;
     // Log + stamp seq, then send the stamped params to phones
     const entry = rec.log.append({
       jsonrpc: "2.0",
@@ -1303,7 +1352,13 @@ export class SessionManager {
       const outcome = (result as { outcome?: { outcome?: string; optionId?: string } })?.outcome;
       const optionId = outcome?.optionId;
       const optionKind = optionKindById(options, optionId);
-      const aborted = Boolean(reqSignal?.aborted || rec.cancelRequested);
+      const aborted = Boolean(
+        reqSignal?.aborted ||
+          rec.cancelRequested ||
+          rec.closing ||
+          (this.permissionEpoch.get(rec.sessionId) ?? 0) !== epoch ||
+          rec.clientGeneration !== generation,
+      );
       if (!aborted && outcome?.outcome === "selected") {
         const grant = grantFromOption(
           optionKind,
@@ -1349,7 +1404,7 @@ export class SessionManager {
     this.assertMutatingTool(rec, "write", path);
     assertNotDirectory(path);
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, content, "utf8");
+    writeTextNoFollow(path, content);
     return {};
   }
 
@@ -1518,6 +1573,11 @@ export class SessionManager {
       const authMethods = storedAuthMethods(meta.authMethods);
       const authDirty = JSON.stringify(meta.authMethods ?? []) !== JSON.stringify(authMethods ?? []);
       const stale = meta.status === "running" || meta.status === "needs_approval";
+      let preview = meta.preview;
+      if (meta.status === "running" || meta.status === "needs_approval") {
+        const sealed = sealInterruptedSession(sessionLog, meta.status);
+        if (sealed === "prompt") preview = "bridge restarted before the prompt finished";
+      }
       let workspaceOk = true;
       try {
         assertAllowedWorkspace(meta.cwd, this.opts.config.allowedRoots);
@@ -1534,7 +1594,7 @@ export class SessionManager {
         title: meta.title,
         createdAt: meta.createdAt,
         updatedAt: meta.updatedAt,
-        preview: workspaceOk ? meta.preview : "workspace is outside allowed roots",
+        preview: workspaceOk ? preview : "workspace is outside allowed roots",
         branch: meta.branch,
         status: workspaceOk ? (stale ? "idle" : meta.status) : "error",
         permissionMode: meta.permissionMode,
@@ -1683,6 +1743,12 @@ export class SessionManager {
     );
   }
 
+  private applyAdditionalDirectories(rec: SessionRecord, raw: string[] | undefined): void {
+    if (raw === undefined) return;
+    rec.additionalDirectories = sandboxAdditionalDirectories(raw, this.opts.config.allowedRoots);
+    this.persist(rec);
+  }
+
   private assertSameSessionCwd(rec: SessionRecord, cwd: string): void {
     const resolved = assertAllowedRealPath(cwd, this.opts.config.allowedRoots, rec.cwd);
     if (resolved !== rec.cwd) {
@@ -1806,6 +1872,50 @@ export class SessionManager {
 export { SandboxError };
 
 const PERMISSION_MODE_IDS = new Set<PermissionMode>(["ask", "auto-edit", "plan", "full-auto"]);
+
+/**
+ * A crash leaves `running` or `needs_approval` on disk with no terminal event.
+ * Append one so the next load does not replay an open prompt or permission.
+ * Returns which event was added.
+ */
+function sealInterruptedSession(
+  sessionLog: SessionLog,
+  status: "running" | "needs_approval",
+): "prompt" | "permission" | undefined {
+  const events = [...sessionLog.replay(0)];
+  if (status === "running") {
+    if (eventMethod(events[events.length - 1]) === "bridge/promptResult") return undefined;
+    sessionLog.append({
+      jsonrpc: "2.0",
+      method: "bridge/promptResult",
+      params: {
+        sessionId: sessionLog.sessionId,
+        error: { message: "bridge restarted before the prompt finished" },
+      },
+    });
+    return "prompt";
+  }
+  let open = false;
+  for (const entry of events) {
+    const method = eventMethod(entry);
+    if (method === "session/request_permission") open = true;
+    else if (method === "bridge/permissionResolved") open = false;
+  }
+  if (!open) return undefined;
+  sessionLog.append({
+    jsonrpc: "2.0",
+    method: "bridge/permissionResolved",
+    params: { sessionId: sessionLog.sessionId, optionKind: "cancelled" },
+  });
+  return "permission";
+}
+
+function eventMethod(entry: LoggedEvent | undefined): string | undefined {
+  const event = entry?.event;
+  if (!event || typeof event !== "object") return undefined;
+  const method = (event as { method?: unknown }).method;
+  return typeof method === "string" ? method : undefined;
+}
 
 function isPermissionMode(modeId: string): modeId is PermissionMode {
   return PERMISSION_MODE_IDS.has(modeId as PermissionMode);

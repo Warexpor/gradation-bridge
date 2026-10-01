@@ -11,6 +11,7 @@
  */
 
 import { hostname, networkInterfaces } from "node:os";
+import { chooseBindHost, formatAdvertiseHost, isTailscaleAddress, type BindCandidate } from "./net/bind.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -94,7 +95,7 @@ Usage:
 
 Options:
   --lan         Bind to a non-loopback IPv4 address (LAN)
-  --tailscale   Bind to a Tailscale (100.x / fd7a:) address if present
+  --tailscale   Bind to a Tailscale (100.64.0.0/10 or fd7a:) address if present
   --port N      Override listen port (default from config, usually 8787)
 
 doctor prints harness readiness and pairing safety without printing tokens.
@@ -106,32 +107,23 @@ Config: ~/.config/gradation-bridge/config.json
 }
 
 function pickBindHost(flags: { lan: boolean; tailscale: boolean }): string {
-  if (!flags.lan && !flags.tailscale) return "127.0.0.1";
-  const ifaces = networkInterfaces();
-  const candidates: { address: string; kind: "tailscale" | "lan" }[] = [];
-  for (const list of Object.values(ifaces)) {
+  const candidates: BindCandidate[] = [];
+  for (const list of Object.values(networkInterfaces())) {
     if (!list) continue;
     for (const info of list) {
-      if (info.internal) continue;
-      if (info.family !== "IPv4") continue;
-      const addr = info.address;
-      if (addr.startsWith("100.")) {
-        candidates.push({ address: addr, kind: "tailscale" });
-      } else {
-        candidates.push({ address: addr, kind: "lan" });
-      }
+      if (info.family !== "IPv4" && info.family !== "IPv6") continue;
+      candidates.push({
+        address: info.address,
+        family: info.family,
+        internal: info.internal,
+      });
     }
   }
-  if (flags.tailscale) {
-    const ts = candidates.find((c) => c.kind === "tailscale");
-    if (ts) return ts.address;
-    process.stderr.write("warning: no Tailscale IPv4 found; falling back to LAN/loopback\n");
+  const host = chooseBindHost(flags, candidates);
+  if (flags.tailscale && !isTailscaleAddress(host)) {
+    process.stderr.write("warning: no Tailscale address found; falling back to LAN/loopback\n");
   }
-  if (flags.lan || flags.tailscale) {
-    const lan = candidates.find((c) => c.kind === "lan");
-    if (lan) return lan.address;
-  }
-  return "127.0.0.1";
+  return host;
 }
 
 async function main(): Promise<void> {
@@ -175,7 +167,7 @@ async function main(): Promise<void> {
   const tls = ensureTlsMaterial({ bindHost: host });
   const sessions = new SessionManager({ config, version: VERSION });
 
-  const hasRealCert = tls.certPem.includes("BEGIN CERTIFICATE");
+  const hasRealCert = tls.usable;
   const server = await startBridgeServer({
     host,
     port,
@@ -187,15 +179,16 @@ async function main(): Promise<void> {
 
   // Prefer advertising the listen host; for loopback, wss://127.0.0.1 works for same-machine tests.
   const scheme = hasRealCert ? "wss" : "ws";
-  const advertiseUrl = `${scheme}://${host}:${port}/v1`;
+  const advertiseUrl = `${scheme}://${formatAdvertiseHost(host)}:${port}/v1`;
 
   printPairingBanner({
     url: advertiseUrl,
     token,
-    fingerprintSha256: tls.fingerprintSha256,
+    fingerprintSha256: hasRealCert ? tls.fingerprintSha256 : undefined,
     name: config.hostName ?? hostname(),
     host,
     port,
+    tlsWarning: tls.sanWarning,
     created: tokenCreated || tls.created,
   });
   log("info", `listening on ${advertiseUrl}`);

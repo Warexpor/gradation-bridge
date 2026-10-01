@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { configDir, ensureDirs } from "../config/load.js";
 
@@ -47,7 +47,10 @@ function tokenMatches(presented: string, expected: string): boolean {
 function saveDevices(file: DevicesFile): void {
   ensureDirs();
   mkdirSync(configDir(), { recursive: true, mode: 0o700 });
-  writeFileSync(devicesPath(), JSON.stringify(file, null, 2) + "\n", { mode: 0o600 });
+  const dest = devicesPath();
+  const tmp = join(configDir(), `.devices.${process.pid}.tmp`);
+  writeFileSync(tmp, JSON.stringify(file, null, 2) + "\n", { mode: 0o600 });
+  renameSync(tmp, dest);
 }
 
 /** Generate a 32-byte token as lowercase hex (64 chars). */
