@@ -88,6 +88,15 @@ const terminalMiss = process.env.FAKE_ACP_TERMINAL_MISS === "1";
 const terminalPoison = process.env.FAKE_ACP_TERMINAL_POISON === "1";
 const terminalHang = process.env.FAKE_ACP_TERMINAL_HANG === "1";
 
+function modelFromMeta(params: Record<string, unknown> | undefined): string | undefined {
+  const meta = params?._meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return undefined;
+  const model = (meta as { model?: unknown }).model;
+  if (typeof model === "number" && Number.isSafeInteger(model)) return String(model);
+  if (typeof model === "string" && model.trim()) return model.trim();
+  return undefined;
+}
+
 function write(obj: unknown): void {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
@@ -609,7 +618,7 @@ async function dispatch(msg: JsonRpcRequest): Promise<void> {
             id: "model",
             name: "Model",
             type: "select",
-            currentValue: "small",
+            currentValue: modelFromMeta(params) ?? "small",
             options: [{ value: "small", name: "Small" }],
           },
         ],

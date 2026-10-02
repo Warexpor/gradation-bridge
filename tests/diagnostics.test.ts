@@ -61,13 +61,17 @@ describe("diagnostics and pairing safety", () => {
           },
         ],
       },
-      "0.4.18",
+      "0.4.19",
     );
-    expect(report).toContain("gradation-bridge doctor (0.4.18)");
+    expect(report).toContain("gradation-bridge doctor (0.4.19)");
     expect(report).toContain("tokens are not printed");
     expect(report).toMatch(/drop blocked host env names/);
     expect(report).toMatch(/Digit-string wire ids/);
     expect(report).toMatch(/session\/\* \/ bridge session methods/);
+    expect(report).toMatch(/modeId/);
+    expect(report).toMatch(/configId/);
+    expect(report).toMatch(/_meta\.model|meta\.model/);
+    expect(report).toMatch(/phone-triggered git/);
     expect(report).toMatch(/JAVA_TOOL_OPTIONS/);
     expect(report).toContain("[redacted]");
     expect(report).not.toContain(token);
