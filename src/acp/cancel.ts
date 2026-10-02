@@ -47,14 +47,33 @@ export function mapDeleteByRpcId<T>(map: Map<string | number, T>, id: string | n
 }
 
 function rpcIdAliases(id: string | number): Array<string | number> {
+  const out: Array<string | number> = [];
+  const push = (value: string | number) => {
+    if (value === id) return;
+    if (!out.includes(value)) out.push(value);
+  };
   if (typeof id === "number") {
     if (!Number.isInteger(id) || !Number.isSafeInteger(id)) return [];
-    return [String(id)];
+    push(String(id));
+    push(`${id}.0`);
+    return out;
   }
-  if (!/^-?\d+$/.test(id)) return [];
-  const asNum = Number(id);
-  if (!Number.isSafeInteger(asNum)) return [];
-  return [asNum];
+  if (/^-?\d+$/.test(id)) {
+    const asNum = Number(id);
+    if (!Number.isSafeInteger(asNum)) return [];
+    push(asNum);
+    push(`${asNum}.0`);
+    return out;
+  }
+  // Whole-number double string from a proxy that stringified 9 as "9.0".
+  if (/^-?\d+\.0+$/.test(id)) {
+    const asNum = Number(id);
+    if (!Number.isSafeInteger(asNum)) return [];
+    push(asNum);
+    push(String(asNum));
+    return out;
+  }
+  return [];
 }
 
 /** Domain cancellation marker for a request the bridge forwarded to the phone. */

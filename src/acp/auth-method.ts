@@ -6,6 +6,7 @@
 
 import { BridgeError } from "../errors.js";
 import { redactArgs } from "../log/redact.js";
+import { wireIdString, wireIdsEqual } from "./wire-id.js";
 
 export interface PublicAuthMethod {
   id: string;
@@ -38,9 +39,10 @@ export function readAgentInitialize(result: unknown): AgentInitInfo {
 }
 
 export function assertAgentAuthMethod(methods: PublicAuthMethod[], methodId: string): void {
-  const method = methods.find((entry) => entry.id === methodId);
+  const want = wireIdString(methodId) ?? methodId;
+  const method = methods.find((entry) => wireIdsEqual(entry.id, want));
   if (!method) {
-    throw new BridgeError(-32602, `unknown auth method: ${methodId}`, { authMethods: methods });
+    throw new BridgeError(-32602, `unknown auth method: ${want}`, { authMethods: methods });
   }
   if (method.type === "terminal") {
     throw new BridgeError(
@@ -87,13 +89,13 @@ export function publicAuthMethods(raw: unknown): PublicAuthMethod[] {
 function readOneMethod(entry: unknown): PublicAuthMethod | undefined {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
   const rec = entry as Record<string, unknown>;
-  if (typeof rec.id !== "string" || !rec.id || rec.id.length > 120) return undefined;
-  if (/[\u0000-\u001f]/.test(rec.id)) return undefined;
-  const name = typeof rec.name === "string" && rec.name ? rec.name.slice(0, 120) : rec.id;
+  const id = wireIdString(rec.id);
+  if (!id || id.length > 120) return undefined;
+  const name = typeof rec.name === "string" && rec.name ? rec.name.slice(0, 120) : id;
   const description =
     typeof rec.description === "string" ? rec.description.slice(0, 240) : undefined;
   const base = {
-    id: rec.id,
+    id,
     name,
     ...(description ? { description } : {}),
   };
