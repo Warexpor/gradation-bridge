@@ -28,6 +28,7 @@ import {
   mapGetByRpcId,
 } from "../acp/cancel.js";
 import { ACP_PROTOCOL_VERSION, negotiateProtocolVersion } from "../acp/protocol.js";
+import { wireIdString } from "../acp/wire-id.js";
 import { tlsDiagnostics } from "../auth/cert.js";
 import { formatListenUrl } from "../net/bind.js";
 import { parseRpcFrame, type JsonRpcMessage } from "./frames.js";
@@ -624,12 +625,7 @@ async function dispatch(
     case "session/load": {
       const sessionId = String(p.sessionId ?? "");
       const meta = (p._meta ?? {}) as Record<string, unknown>;
-      const afterSeq =
-        typeof meta.afterSeq === "number"
-          ? meta.afterSeq
-          : typeof meta.afterSeq === "string"
-            ? Number(meta.afterSeq)
-            : 0;
+      const afterSeq = coerceAfterSeq(meta.afterSeq);
       return opts.sessions.load(sessionId, {
         cwd: typeof p.cwd === "string" ? p.cwd : undefined,
         afterSeq: Number.isFinite(afterSeq) ? afterSeq : 0,
@@ -643,8 +639,8 @@ async function dispatch(
     case "auth/login": {
       const meta = (p._meta ?? {}) as Record<string, unknown>;
       return opts.sessions.authenticate({
-        methodId: typeof p.methodId === "string" ? p.methodId : "",
-        sessionId: typeof p.sessionId === "string" ? p.sessionId : undefined,
+        methodId: wireIdString(p.methodId) ?? "",
+        sessionId: wireIdString(p.sessionId),
         harnessId: typeof meta.harness === "string" ? meta.harness : undefined,
         cwd:
           typeof p.cwd === "string" ? p.cwd : typeof meta.cwd === "string" ? meta.cwd : undefined,
@@ -654,7 +650,7 @@ async function dispatch(
     case "auth/logout": {
       const meta = (p._meta ?? {}) as Record<string, unknown>;
       return opts.sessions.logout({
-        sessionId: typeof p.sessionId === "string" ? p.sessionId : undefined,
+        sessionId: wireIdString(p.sessionId),
         harnessId: typeof meta.harness === "string" ? meta.harness : undefined,
         cwd:
           typeof p.cwd === "string" ? p.cwd : typeof meta.cwd === "string" ? meta.cwd : undefined,
@@ -713,7 +709,7 @@ function cancelInflightPhoneCall(method: string, params: unknown, opts: WsServer
     method === "auth/logout"
   ) {
     opts.sessions.cancelAuth({
-      sessionId: typeof p.sessionId === "string" ? p.sessionId : undefined,
+      sessionId: wireIdString(p.sessionId),
       harnessId: typeof meta.harness === "string" ? meta.harness : undefined,
       cwd: typeof p.cwd === "string" ? p.cwd : typeof meta.cwd === "string" ? meta.cwd : undefined,
     });
@@ -745,4 +741,14 @@ function rememberWorkspace(config: BridgeConfig, cwd: string): void {
     const message = e instanceof Error ? e.message : String(e);
     log("warn", `could not save recent workspace: ${message}`);
   }
+}
+
+/** `_meta.afterSeq` may arrive as a number, `"42"`, or `"42.0"`. */
+function coerceAfterSeq(value: unknown): number {
+  if (typeof value === "number") return value;
+  if (typeof value === "string" && value.trim()) {
+    const n = Number(value.trim());
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
 }

@@ -58,6 +58,7 @@ export function formatDoctorReport(config: BridgeConfig, version?: string): stri
     "- Plan mode rejects writes and terminal commands on the bridge, not only in the agent.",
     "- Harness env PATH cannot replace the binary. The command is resolved on this process's PATH, then that file is started.",
     "- Harness and terminal children drop blocked host env names (GIT_TRACE*, LD_PRELOAD, NODE_OPTIONS, …).",
+    "- Digit-string wire ids (methodId, optionId, sessionId, JSON-RPC id) may arrive as JSON numbers or \"5.0\"; the bridge matches the agent-advertised form.",
     "- The harness cannot read or write the config or data directory, even when an allowed root contains them. An approved terminal command can still read files this user can read.",
     "",
     `permission default: ${config.defaultPermissionMode}`,

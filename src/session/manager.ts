@@ -27,13 +27,15 @@ import { assertSupportedPrompt, firstPromptText } from "../acp/prompt.js";
 import { assertNotDirectory, assertWritableContent, readTextFileWindow, writeTextNoFollow } from "../acp/text-file.js";
 import {
   commandArgvFromToolCall,
+  findOptionById,
+  normalizePermissionOptions,
   optionKindById,
   pathFromToolCall,
   pickOptionId,
   policyKindFromToolCall,
-  type PermissionOption,
   type RequestPermissionParams,
 } from "../acp/permissions.js";
+import { wireIdString } from "../acp/wire-id.js";
 import { decidePermission, requiresMachineWarning } from "../approval/policy.js";
 import {
   consumeGrant,
@@ -1413,7 +1415,7 @@ export class SessionManager {
       workspaceRoot: rec.cwd,
       allowedRoots: this.opts.config.allowedRoots,
     });
-    const options = (params.options ?? []) as PermissionOption[];
+    const options = normalizePermissionOptions(params.options);
 
     log(
       "info",
@@ -1469,8 +1471,9 @@ export class SessionManager {
         phoneParams,
         { signal: reqSignal, owner: `session:${rec.sessionId}` },
       );
-      const outcome = (result as { outcome?: { outcome?: string; optionId?: string } })?.outcome;
-      const optionId = outcome?.optionId;
+      const outcome = (result as { outcome?: { outcome?: string; optionId?: unknown } })?.outcome;
+      const matched = findOptionById(options, outcome?.optionId);
+      const optionId = matched?.optionId ?? wireIdString(outcome?.optionId);
       const optionKind = optionKindById(options, optionId);
       const aborted = Boolean(
         reqSignal?.aborted ||
@@ -1497,6 +1500,20 @@ export class SessionManager {
       this.notePermissionResolved(rec, requestId, resolvedKind);
       resumeAfterAsk();
       if (aborted) return { outcome: { outcome: "cancelled" } };
+      // Rewrite a numeric / "5.0" optionId to the agent-offered string so the
+      // harness sees the id it advertised.
+      if (
+        matched &&
+        result &&
+        typeof result === "object" &&
+        !Array.isArray(result) &&
+        outcome?.outcome === "selected"
+      ) {
+        return {
+          ...(result as Record<string, unknown>),
+          outcome: { ...outcome, optionId: matched.optionId },
+        };
+      }
       return result ?? { outcome: { outcome: "cancelled" } };
     } catch {
       this.notePermissionResolved(rec, undefined, "cancelled");

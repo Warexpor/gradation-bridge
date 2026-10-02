@@ -1,3 +1,5 @@
+import { wireIdString, wireIdsEqual } from "./wire-id.js";
+
 /**
  * Helpers for ACP session/request_permission: extract policy inputs and
  * pick an optionId when the bridge auto-allows / auto-denies.
@@ -98,8 +100,38 @@ export function pickOptionId(
 
 export function optionKindById(
   options: PermissionOption[] | undefined,
-  optionId: string | undefined,
+  optionId: unknown,
 ): string | undefined {
   if (!options || optionId == null) return undefined;
-  return options.find((o) => o.optionId === optionId)?.kind;
+  return findOptionById(options, optionId)?.kind;
+}
+
+/**
+ * Find the agent-offered option whose id matches a phone answer that may have
+ * rewritten a digit string as a JSON number or `"5.0"`.
+ */
+export function findOptionById(
+  options: PermissionOption[] | undefined,
+  optionId: unknown,
+): PermissionOption | undefined {
+  if (!options || optionId == null) return undefined;
+  return options.find((o) => wireIdsEqual(o.optionId, optionId));
+}
+
+/** Coerce agent option ids that arrived as JSON numbers into strings. */
+export function normalizePermissionOptions(raw: unknown): PermissionOption[] {
+  if (!Array.isArray(raw)) return [];
+  const out: PermissionOption[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const rec = entry as Record<string, unknown>;
+    const optionId = wireIdString(rec.optionId);
+    if (!optionId || typeof rec.kind !== "string" || !rec.kind) continue;
+    out.push({
+      optionId,
+      kind: rec.kind,
+      ...(typeof rec.name === "string" ? { name: rec.name } : {}),
+    });
+  }
+  return out;
 }
