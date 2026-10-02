@@ -585,8 +585,13 @@ async function dispatch(
 
     case "session/new": {
       const meta = (p._meta ?? {}) as Record<string, unknown>;
-      const harnessId = String(meta.harness ?? opts.config.harnesses[0]?.id ?? "");
-      const modeRaw = String(meta.permissionMode ?? opts.config.defaultPermissionMode ?? "ask");
+      // Digit-string harness / permissionMode may arrive as JSON numbers or "5.0".
+      const harnessId =
+        phoneHarnessId(meta.harness) ?? opts.config.harnesses[0]?.id ?? "";
+      const modeRaw =
+        phoneHarnessId(meta.permissionMode) ??
+        opts.config.defaultPermissionMode ??
+        "ask";
       const permissionMode = (
         VALID_MODES.has(modeRaw as PermissionMode) ? modeRaw : "ask"
       ) as PermissionMode;
@@ -642,7 +647,7 @@ async function dispatch(
       return opts.sessions.authenticate({
         methodId: wireIdString(p.methodId) ?? "",
         sessionId: wireIdString(p.sessionId),
-        harnessId: typeof meta.harness === "string" ? meta.harness : undefined,
+        harnessId: phoneHarnessId(meta.harness),
         cwd:
           typeof p.cwd === "string" ? p.cwd : typeof meta.cwd === "string" ? meta.cwd : undefined,
       });
@@ -652,7 +657,7 @@ async function dispatch(
       const meta = (p._meta ?? {}) as Record<string, unknown>;
       return opts.sessions.logout({
         sessionId: wireIdString(p.sessionId),
-        harnessId: typeof meta.harness === "string" ? meta.harness : undefined,
+        harnessId: phoneHarnessId(meta.harness),
         cwd:
           typeof p.cwd === "string" ? p.cwd : typeof meta.cwd === "string" ? meta.cwd : undefined,
       });
@@ -711,7 +716,7 @@ function cancelInflightPhoneCall(method: string, params: unknown, opts: WsServer
   ) {
     opts.sessions.cancelAuth({
       sessionId: wireIdString(p.sessionId),
-      harnessId: typeof meta.harness === "string" ? meta.harness : undefined,
+      harnessId: phoneHarnessId(meta.harness),
       cwd: typeof p.cwd === "string" ? p.cwd : typeof meta.cwd === "string" ? meta.cwd : undefined,
     });
   }
@@ -721,6 +726,11 @@ function cancelInflightPhoneCall(method: string, params: unknown, opts: WsServer
 /** Phone sessionId may arrive as a JSON number or `"5.0"` for digit-string ids. */
 function phoneSessionId(value: unknown): string {
   return wireIdString(value) ?? "";
+}
+
+/** Harness id: same digit-string canonicalization as sessionId / model. */
+function phoneHarnessId(value: unknown): string | undefined {
+  return wireIdString(value) ?? (typeof value === "string" ? value : undefined);
 }
 
 /** Sessions that `session/list` hides are unknown to the rest of the protocol. */

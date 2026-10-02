@@ -176,7 +176,19 @@ describe("getGitStatus / getGitDiff", () => {
       SSLKEYLOGFILE: "/tmp/keys",
       OPENSSL_CONF: "/tmp/openssl.cnf",
       NODE_OPTIONS: "--require /tmp/x.js",
+      NODE_PATH: "/tmp/node_modules",
       DOTNET_STARTUP_HOOKS: "/tmp/hook",
+      PYTHONSTARTUP: "/tmp/sitecustomize.py",
+      PYTHONPATH: "/tmp/evil-py",
+      PERL5OPT: "-Mevil",
+      PERL5LIB: "/tmp/evil-perl",
+      RUBYOPT: "-r/tmp/evil",
+      RUBYLIB: "/tmp/evil-ruby",
+      BASH_ENV: "/tmp/evil.bashrc",
+      ENV: "/tmp/evil.sh",
+      SHELLOPTS: "xtrace",
+      BASHOPTS: "extdebug",
+      GCONV_PATH: "/tmp/gconv",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.GIT_EXTERNAL_DIFF).toBeUndefined();
@@ -198,7 +210,19 @@ describe("getGitStatus / getGitDiff", () => {
     expect(env.SSLKEYLOGFILE).toBeUndefined();
     expect(env.OPENSSL_CONF).toBeUndefined();
     expect(env.NODE_OPTIONS).toBeUndefined();
+    expect(env.NODE_PATH).toBeUndefined();
     expect(env.DOTNET_STARTUP_HOOKS).toBeUndefined();
+    expect(env.PYTHONSTARTUP).toBeUndefined();
+    expect(env.PYTHONPATH).toBeUndefined();
+    expect(env.PERL5OPT).toBeUndefined();
+    expect(env.PERL5LIB).toBeUndefined();
+    expect(env.RUBYOPT).toBeUndefined();
+    expect(env.RUBYLIB).toBeUndefined();
+    expect(env.BASH_ENV).toBeUndefined();
+    expect(env.ENV).toBeUndefined();
+    expect(env.SHELLOPTS).toBeUndefined();
+    expect(env.BASHOPTS).toBeUndefined();
+    expect(env.GCONV_PATH).toBeUndefined();
     expect(env.GIT_CONFIG_COUNT).toBeUndefined();
     expect(env.GIT_CONFIG_KEY_0).toBeUndefined();
     expect(env.GIT_CONFIG_VALUE_0).toBeUndefined();

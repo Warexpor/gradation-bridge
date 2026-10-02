@@ -171,6 +171,23 @@ const STRIPPED_GIT_ENV = new Set([
   "SSLKEYLOGFILE",
   "OPENSSL_CONF",
   "NODE_OPTIONS",
+  "NODE_PATH",
+  "NODE_REPL_EXTERNAL_MODULE",
+  // Interpreter / shell startup hooks — same class as harness/terminal scrub.
+  // A phone-triggered git helper must not inherit bridge-process PYTHON*/PERL*/…
+  "PYTHONSTARTUP",
+  "PYTHONINSPECT",
+  "PYTHONPATH",
+  "PYTHONHOME",
+  "PERL5OPT",
+  "PERL5LIB",
+  "RUBYOPT",
+  "RUBYLIB",
+  "BASH_ENV",
+  "ENV",
+  "SHELLOPTS",
+  "BASHOPTS",
+  "GCONV_PATH",
 ]);
 
 /** Child env for git. Drops variables that can name a program or inject config. */

@@ -158,7 +158,10 @@ describe("protocol and process reliability", () => {
     for (const file of extras.splice(0)) rmSync(file, { force: true });
   });
 
-  async function boot(env: Record<string, string>): Promise<void> {
+  async function boot(
+    env: Record<string, string>,
+    opts?: { harnessId?: string },
+  ): Promise<void> {
     if (server) {
       await server.close();
       server = undefined;
@@ -176,7 +179,13 @@ describe("protocol and process reliability", () => {
       workspaces: [],
       defaultPermissionMode: "ask",
       port: 0,
-      harnesses: [{ ...fakeHarnessConfig(fakeAgent), env }],
+      harnesses: [
+        {
+          ...fakeHarnessConfig(fakeAgent),
+          ...(opts?.harnessId ? { id: opts.harnessId } : {}),
+          env,
+        },
+      ],
     };
     saveConfig(config);
     token = ensurePrimaryToken().token;
@@ -457,6 +466,30 @@ describe("protocol and process reliability", () => {
     const result = (await prompt) as { stopReason?: string };
     expect(result.stopReason).toBe("cancelled");
     await client.close();
+  }, 20_000);
+
+  it("starts a session when _meta.harness arrives as a number or \"5.0\"", async () => {
+    await boot({}, { harnessId: "5" });
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", { protocolVersion: 1 });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: 5, permissionMode: "ask" },
+    })) as { sessionId: string; _meta?: { harness?: string } };
+    expect(created._meta?.harness).toBe("5");
+    await client.close();
+
+    await boot({}, { harnessId: "5" });
+    const client2 = await openClient(server!.url, token);
+    await client2.call("initialize", { protocolVersion: 1 });
+    const created2 = (await client2.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "5.0", permissionMode: "ask" },
+    })) as { sessionId: string; _meta?: { harness?: string } };
+    expect(created2._meta?.harness).toBe("5");
+    await client2.close();
   }, 20_000);
 
   it("forwards digit-string model / modeId / configId sent as JSON numbers or \"5.0\"", async () => {
