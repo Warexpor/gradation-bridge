@@ -92,7 +92,8 @@ export function isEnvName(name: string): boolean {
  * git directory, editor, pager, askpass, proxy, interpreter startup) without
  * appearing in the command. `GIT_ALLOW_PROTOCOL` turns on helpers such as
  * `ext::` that git leaves off. `GIT_TRACE*` can write to an arbitrary path.
- * The process environment is still inherited; only the agent's overlay is refused.
+ * Inherited host env is scrubbed for these names before the agent overlay is
+ * applied, so a bridge-process `GIT_TRACE` sink cannot reach the command.
  */
 const BLOCKED_TERMINAL_ENV = new Set([
   "LD_PRELOAD",
@@ -167,6 +168,17 @@ export function blockedTerminalEnvName(name: string): boolean {
   if (name.startsWith("GIT_TRACE")) return true;
   if (name.startsWith("BASH_FUNC_")) return true;
   return false;
+}
+
+/** Child env for agent terminals. Drops blocked names from the host environment. */
+export function terminalChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(base)) {
+    if (value === undefined) continue;
+    if (blockedTerminalEnvName(key)) continue;
+    env[key] = value;
+  }
+  return env;
 }
 
 /** Reject a terminal/create the bridge cannot start. Does not spawn anything. */

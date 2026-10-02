@@ -72,6 +72,8 @@ export class AcpStdioClient {
   private groupPid: number | undefined;
   private groupReaped = false;
   private readonly outboundMethods = new Map<number | string, string>();
+  /** Outbound ids settled early; late harness replies complete these waiters. */
+  private readonly abandoned = new Map<number | string, () => void>();
   private readonly inboundCancels = new Map<number | string, () => void>();
   private requestHandler?: AcpInboundHandler;
   private notificationHandler?: (msg: AcpJsonRpcNotification) => void;
@@ -180,6 +182,8 @@ export class AcpStdioClient {
     this.flushStderr();
     this.child = null;
     this.outbound.length = 0;
+    for (const [, done] of this.abandoned) done();
+    this.abandoned.clear();
     const base = err ?? new Error(`ACP process exited (code=${code}, signal=${signal})`);
     this.failPending(this.withStderr(base));
     this.exitHandler?.(code, signal);
@@ -272,6 +276,12 @@ export class AcpStdioClient {
         } else {
           pending.resolve(obj.result);
         }
+      } else {
+        const done = this.abandoned.get(obj.id);
+        if (done) {
+          this.abandoned.delete(obj.id);
+          done();
+        }
       }
       return;
     }
@@ -343,15 +353,50 @@ export class AcpStdioClient {
   cancelOutbound(methods: string[]): void {
     for (const [id, method] of [...this.outboundMethods]) {
       if (!methods.includes(method)) continue;
+      this.outboundMethods.delete(id);
       this.notify("$/cancel_request", { requestId: id });
       const pending = this.pending.get(id);
       if (!pending) continue;
       this.pending.delete(id);
-      this.outboundMethods.delete(id);
       const err = new Error("request cancelled") as Error & { code?: number };
       err.code = REQUEST_CANCELLED;
       pending.reject(err);
     }
+  }
+
+  /**
+   * Resolve pending outbound calls (e.g. `session/prompt`) so the phone is not
+   * stuck when the harness ignores cancel, and return a promise that settles
+   * when the harness finally answers those ids (or `waitMs` elapses). A late
+   * write during that drain still sees `cancelRequested`.
+   */
+  finishOutbound(methods: string[], result: unknown, waitMs = 120_000): Promise<void> {
+    const waits: Promise<void>[] = [];
+    for (const [id, method] of [...this.outboundMethods]) {
+      if (!methods.includes(method)) continue;
+      this.outboundMethods.delete(id);
+      this.notify("$/cancel_request", { requestId: id });
+      const pending = this.pending.get(id);
+      if (pending) {
+        this.pending.delete(id);
+        pending.resolve(result);
+      }
+      waits.push(
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            if (!this.abandoned.has(id)) return;
+            this.abandoned.delete(id);
+            resolve();
+          }, waitMs);
+          timer.unref?.();
+          this.abandoned.set(id, () => {
+            clearTimeout(timer);
+            resolve();
+          });
+        }),
+      );
+    }
+    return waits.length === 0 ? Promise.resolve() : Promise.all(waits).then(() => {});
   }
 
   private respondResult(id: number | string, result: unknown): void {

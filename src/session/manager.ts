@@ -57,7 +57,7 @@ import {
   writeSessionMeta,
   type SessionMeta,
 } from "./persist.js";
-import { assertTerminalCreateParams, blockedTerminalEnvName, isEnvName, TerminalTable } from "./terminals.js";
+import { assertTerminalCreateParams, blockedTerminalEnvName, isEnvName, TerminalTable, terminalChildEnv } from "./terminals.js";
 import {
   MAX_CATALOG_BYTES,
   MAX_CLOSED_SESSIONS,
@@ -190,6 +190,8 @@ export class SessionManager {
   private permissionEpoch = new Map<string, number>();
   /** Resolves when the in-flight prompt's finally runs, including after the agent dies. */
   private promptGates = new Map<string, Promise<void>>();
+  /** Resolves when a cancelled prompt's harness turn has drained (or timed out). */
+  private promptDrains = new Map<string, Promise<void>>();
   /** One respawn per session so two phones cannot start two harnesses. */
   private respawnInflight = new Map<string, Promise<unknown>>();
   private readonly maxOpenSessions: number;
@@ -655,6 +657,8 @@ export class SessionManager {
   async prompt(sessionId: string, params: unknown): Promise<unknown> {
     const rec = this.requireSession(sessionId);
     this.assertLive(rec);
+    const drain = this.promptDrains.get(sessionId);
+    if (drain) await drain;
     if (rec.promptInFlight) {
       throw new BridgeError(-32005, "prompt already in progress", { sessionId });
     }
@@ -706,7 +710,16 @@ export class SessionManager {
     // or terminal/wait_for_exit. A command that ignores SIGTERM is SIGKILLed.
     this.terminals.interruptSession(sessionId);
     this.opts.cancelPhoneRequests?.({ sessionId });
-    if (rec.client?.running) rec.client.cancel(rec.agentSessionId);
+    if (rec.client?.running) {
+      rec.client.cancel(rec.agentSessionId);
+      // Unblock the phone now. Keep cancelRequested until the harness turn drains
+      // so a late write cannot land, and so a follow-up prompt waits for that drain.
+      const drain = rec.client.finishOutbound(["session/prompt"], { stopReason: "cancelled" });
+      this.promptDrains.set(sessionId, drain);
+      void drain.finally(() => {
+        if (this.promptDrains.get(sessionId) === drain) this.promptDrains.delete(sessionId);
+      });
+    }
   }
 
   /**
@@ -1540,7 +1553,7 @@ export class SessionManager {
     const cwd = p.cwd
       ? assertAllowedRealPath(p.cwd, this.opts.config.allowedRoots, rec.cwd)
       : rec.cwd;
-    const env: NodeJS.ProcessEnv = { ...process.env };
+    const env: NodeJS.ProcessEnv = terminalChildEnv();
     const entries = Array.isArray(p.env) ? p.env : [];
     for (const entry of entries) {
       const row = entry as { name?: unknown; value?: unknown } | null;

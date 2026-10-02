@@ -224,6 +224,52 @@ describe("ACP stdio client errors", () => {
     }
   });
 
+  it("finishOutbound resolves a prompt and waits for the late harness reply", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gb-acp-finish-out-"));
+    dirs.push(dir);
+    const log = join(dir, "log.ndjson");
+    const script = join(dir, "agent.mjs");
+    writeFileSync(
+      script,
+      [
+        "import { createInterface } from 'node:readline';",
+        "import { appendFileSync } from 'node:fs';",
+        "const rl = createInterface({ input: process.stdin });",
+        "const sleep = (ms) => new Promise((r) => setTimeout(r, ms));",
+        "rl.on('line', async (line) => {",
+        "  let msg;",
+        "  try { msg = JSON.parse(line); } catch { return; }",
+        "  appendFileSync(process.env.LOG, JSON.stringify(msg) + '\\n');",
+        "  if (msg.method === 'session/prompt') {",
+        "    await sleep(200);",
+        "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } }) + '\\n');",
+        "  }",
+        "});",
+        "",
+      ].join("\n"),
+    );
+    const client = new AcpStdioClient({
+      harness: { id: "slow-prompt", name: "slow-prompt", command: process.execPath, args: [script] },
+      cwd: dir,
+      env: { LOG: log },
+    });
+    client.start();
+    try {
+      const prompt = client.prompt({ sessionId: "s1", prompt: [] });
+      await readHarnessLog(log, 1);
+      const started = Date.now();
+      const drain = client.finishOutbound(["session/prompt"], { stopReason: "cancelled" });
+      await expect(prompt).resolves.toEqual({ stopReason: "cancelled" });
+      expect(Date.now() - started).toBeLessThan(150);
+      await drain;
+      expect(Date.now() - started).toBeGreaterThanOrEqual(150);
+      const lines = await readHarnessLog(log, 2);
+      expect(lines.map((msg) => msg.method)).toContain("$/cancel_request");
+    } finally {
+      client.kill();
+    }
+  });
+
   it("cancels a timed-out request and ignores the late result", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gb-acp-timeout-"));
     dirs.push(dir);

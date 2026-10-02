@@ -115,6 +115,25 @@ async function waitFor<T>(read: () => T | undefined): Promise<T> {
   throw new Error("timed out waiting");
 }
 
+
+async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const text = readFileSync(path, "utf8");
+      if (text.trim().length > 0) {
+        JSON.parse(text);
+        return text;
+      }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && !(err instanceof SyntaxError)) throw err;
+    }
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  throw new Error(`timeout waiting for ${path}`);
+}
+
 describe("protocol and process reliability", () => {
   let restore: (() => void) | undefined;
   let server: BridgeServer | undefined;
@@ -317,7 +336,7 @@ describe("protocol and process reliability", () => {
     await waitFor(() => client.inbound.find((msg) => msg.method === "session/update"));
     await client.call("session/cancel", { sessionId: created.sessionId });
     await prompt;
-    expect(JSON.parse(readFileSync(dump, "utf8"))).toEqual({ action: "cancel" });
+    expect(JSON.parse(await waitForFile(dump))).toEqual({ action: "cancel" });
     expect(client.inbound.some((msg) => msg.method === "elicitation/create")).toBe(false);
     await client.close();
   }, 20_000);
@@ -338,6 +357,30 @@ describe("protocol and process reliability", () => {
     await waitFor(() => client.inbound.find((msg) => msg.method === "session/update"));
     client.notify("$/cancel_request", { requestId: 3 });
     await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+    await client.close();
+  }, 20_000);
+
+  it("answers a cancelled prompt immediately when the harness ignores cancel", async () => {
+    await boot({
+      FAKE_ACP_SLOW_MS: "3000",
+      FAKE_ACP_IGNORE_CANCEL: "1",
+    });
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", { protocolVersion: 1 });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "ask" },
+    })) as { sessionId: string };
+    const prompt = client.call("session/prompt", {
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "slow" }],
+    });
+    await waitFor(() => client.inbound.find((msg) => msg.method === "session/update"));
+    const started = Date.now();
+    client.notify("$/cancel_request", { requestId: 3 });
+    await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+    expect(Date.now() - started).toBeLessThan(1500);
     await client.close();
   }, 20_000);
 
