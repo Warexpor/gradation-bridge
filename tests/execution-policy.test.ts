@@ -480,7 +480,12 @@ describe("execution policy and protocol surfaces", () => {
       await new Promise((r) => setTimeout(r, 20));
     }
     client.notify("session/cancel", { sessionId: created.sessionId });
-    await pending;
+    await expect(pending).resolves.toMatchObject({ stopReason: "cancelled" });
+    const deadlineWrite = Date.now() + 5_000;
+    while (Date.now() < deadlineWrite) {
+      if (/write failed:.*cancel/i.test(texts(client.updates).join("\n"))) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
     expect(texts(client.updates).join("\n")).toMatch(/write failed:.*cancel/i);
     expect(readFileSync(join(workspace, "README.md"), "utf8")).toBe("# test\n");
     await client.close();

@@ -106,6 +106,25 @@ async function openClient(
   };
 }
 
+
+async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const text = readFileSync(path, "utf8");
+      if (text.trim().length > 0) {
+        JSON.parse(text);
+        return text;
+      }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && !(err instanceof SyntaxError)) throw err;
+    }
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  throw new Error(`timeout waiting for ${path}`);
+}
+
 describe("auth and elicitation relay", () => {
   let restore: (() => void) | undefined;
   let server: BridgeServer | undefined;
@@ -429,7 +448,7 @@ describe("auth and elicitation relay", () => {
     expect(body.url).toBe("https://example.com/connect");
     await client.call("session/cancel", { sessionId: created.sessionId });
     await prompt;
-    const dumped = JSON.parse(readFileSync(dump, "utf8")) as { action?: string };
+    const dumped = JSON.parse(await waitForFile(dump)) as { action?: string };
     expect(dumped).toEqual({ action: "cancel" });
     const listed = (await client.call("session/list", {})) as {
       sessions: Array<{ sessionId: string; _meta?: { logout?: boolean; authMethods?: Array<{ id: string }> } }>;

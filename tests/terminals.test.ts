@@ -3,6 +3,7 @@ import {
   appendTerminalOutput,
   assertTerminalCreateParams,
   blockedTerminalEnvName,
+  terminalChildEnv,
   MAX_TERMINALS_PER_SESSION,
   resolveOutputByteLimit,
   TerminalTable,
@@ -52,6 +53,25 @@ describe("terminal output limit", () => {
     expect(blockedTerminalEnvName("BASH_FUNC_echo")).toBe(true);
     expect(blockedTerminalEnvName("PATH")).toBe(false);
     expect(blockedTerminalEnvName("TERM")).toBe(false);
+  });
+
+  it("drops blocked names from the inherited host environment", () => {
+    const env = terminalChildEnv({
+      PATH: "/usr/bin",
+      TERM: "xterm",
+      GIT_TRACE: "/tmp/trace",
+      GIT_TRACE2_EVENT: "/tmp/trace2",
+      LD_PRELOAD: "/tmp/evil.so",
+      NODE_OPTIONS: "--require /tmp/x.js",
+      HOME: "/home/user",
+    });
+    expect(env.PATH).toBe("/usr/bin");
+    expect(env.TERM).toBe("xterm");
+    expect(env.HOME).toBe("/home/user");
+    expect(env.GIT_TRACE).toBeUndefined();
+    expect(env.GIT_TRACE2_EVENT).toBeUndefined();
+    expect(env.LD_PRELOAD).toBeUndefined();
+    expect(env.NODE_OPTIONS).toBeUndefined();
   });
 
   it("rejects a create that cannot start", () => {
@@ -139,7 +159,7 @@ describe("TerminalTable", () => {
     const status = await terminals.wait("s", terminalId);
     expect(status.signal).toBe("SIGKILL");
     expect(terminals.output("s", terminalId).exitStatus?.signal).toBe("SIGKILL");
-  });
+  }, 10_000);
 
   it("interruptSession stops a live command and keeps the id", async () => {
     const terminals = table();
