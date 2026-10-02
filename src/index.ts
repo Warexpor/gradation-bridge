@@ -149,7 +149,7 @@ async function main(): Promise<void> {
     ensureDirs();
     const config = loadConfig();
     applyLogLevel(config.logLevel);
-    process.stdout.write(formatDoctorReport(config));
+    process.stdout.write(formatDoctorReport(config, VERSION));
     return;
   }
 

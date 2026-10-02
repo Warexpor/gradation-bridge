@@ -48,19 +48,24 @@ describe("diagnostics and pairing safety", () => {
     mkdirSync(process.env.XDG_CONFIG_HOME, { recursive: true });
     mkdirSync(process.env.XDG_DATA_HOME, { recursive: true });
     const token = ensurePrimaryToken().token;
-    const report = formatDoctorReport({
-      allowedRoots: ["/tmp/project"],
-      defaultPermissionMode: "ask",
-      harnesses: [
-        {
-          id: "custom",
-          name: "Custom",
-          command: "my-agent",
-          args: ["--api-key", "sk-supersecretvalue"],
-        },
-      ],
-    });
+    const report = formatDoctorReport(
+      {
+        allowedRoots: ["/tmp/project"],
+        defaultPermissionMode: "ask",
+        harnesses: [
+          {
+            id: "custom",
+            name: "Custom",
+            command: "my-agent",
+            args: ["--api-key", "sk-supersecretvalue"],
+          },
+        ],
+      },
+      "0.4.16",
+    );
+    expect(report).toContain("gradation-bridge doctor (0.4.16)");
     expect(report).toContain("tokens are not printed");
+    expect(report).toMatch(/drop blocked host env names/);
     expect(report).toContain("[redacted]");
     expect(report).not.toContain(token);
     expect(report).not.toContain("sk-supersecretvalue");

@@ -11,7 +11,7 @@ import type { BridgeConfig } from "../config/types.js";
 import { listHarnesses } from "../harness/registry.js";
 import { which } from "../harness/path.js";
 
-export function formatDoctorReport(config: BridgeConfig): string {
+export function formatDoctorReport(config: BridgeConfig, version?: string): string {
   const devices = listDevices();
   const active = devices.filter((d) => !d.revokedAt).length;
   const revoked = devices.length - active;
@@ -29,7 +29,7 @@ export function formatDoctorReport(config: BridgeConfig): string {
   const npx = which("npx");
   const npm = which("npm");
   const lines: string[] = [
-    "gradation-bridge doctor",
+    version ? `gradation-bridge doctor (${version})` : "gradation-bridge doctor",
     `config:  ${configPath()}`,
     `data:    ${dataDir()}`,
     `sessions: ${join(dataDir(), "sessions")} (restored on startup; session/delete removes one, including a closed session)`,
@@ -57,6 +57,7 @@ export function formatDoctorReport(config: BridgeConfig): string {
     "- In GradatiON, confirm the cert fingerprint matches this machine before trusting it.",
     "- Plan mode rejects writes and terminal commands on the bridge, not only in the agent.",
     "- Harness env PATH cannot replace the binary. The command is resolved on this process's PATH, then that file is started.",
+    "- Harness and terminal children drop blocked host env names (GIT_TRACE*, LD_PRELOAD, NODE_OPTIONS, …).",
     "- The harness cannot read or write the config or data directory, even when an allowed root contains them. An approved terminal command can still read files this user can read.",
     "",
     `permission default: ${config.defaultPermissionMode}`,
