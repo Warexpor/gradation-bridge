@@ -459,6 +459,51 @@ describe("protocol and process reliability", () => {
     await client.close();
   }, 20_000);
 
+  it("forwards digit-string model / modeId / configId sent as JSON numbers or \"5.0\"", async () => {
+    const dumpNew = tempFile("dump-new.json");
+    await boot({ FAKE_ACP_DUMP_NEW: dumpNew });
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", { protocolVersion: 1 });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "ask", model: 5 },
+    })) as { sessionId: string; configOptions?: Array<{ currentValue?: string }> };
+    expect(created.configOptions?.[0]?.currentValue).toBe("5");
+    const dumped = JSON.parse(await waitForFile(dumpNew)) as {
+      _meta?: { model?: unknown };
+    };
+    expect(dumped._meta?.model).toBe("5");
+
+    await client.call("session/set_mode", { sessionId: created.sessionId, modeId: "5.0" });
+    await client.call("session/set_mode", { sessionId: created.sessionId, modeId: 5 });
+
+    const configured = (await client.call("session/set_config_option", {
+      sessionId: created.sessionId,
+      configId: 7,
+      value: "9.0",
+    })) as { configOptions: Array<{ id?: string; currentValue?: string }> };
+    expect(configured.configOptions[0]?.id).toBe("7");
+    expect(configured.configOptions[0]?.currentValue).toBe("9");
+
+    await client.call("session/close", { sessionId: created.sessionId });
+    const dumpNew2 = tempFile("dump-new-2.json");
+    await boot({ FAKE_ACP_DUMP_NEW: dumpNew2 });
+    const client2 = await openClient(server!.url, token);
+    await client2.call("initialize", { protocolVersion: 1 });
+    const created2 = (await client2.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "ask", model: "5.0" },
+    })) as { configOptions?: Array<{ currentValue?: string }> };
+    expect(created2.configOptions?.[0]?.currentValue).toBe("5");
+    const dumped2 = JSON.parse(await waitForFile(dumpNew2)) as {
+      _meta?: { model?: unknown };
+    };
+    expect(dumped2._meta?.model).toBe("5");
+    await client2.close();
+  }, 20_000);
+
   it("ignores stdout from a harness that was already replaced", async () => {
     await boot({ FAKE_ACP_WRITE_ON_TERM: "1" });
     const client = await openClient(server!.url, token);

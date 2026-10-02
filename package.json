@@ -1,6 +1,6 @@
 {
   "name": "gradation-bridge",
-  "version": "0.4.18",
+  "version": "0.4.19",
   "description": "ACP bridge daemon for GradatiON Code mode \u2014 launches local coding agents and relays sessions to the phone over authenticated WebSocket.",
   "type": "module",
   "engines": {

@@ -501,7 +501,7 @@ async function dispatch(
     }
     case "bridge/setPermissionMode": {
       const sessionId = phoneSessionId(p.sessionId);
-      const modeId = String(p.permissionMode ?? p.modeId ?? "");
+      const modeId = wireIdString(p.permissionMode ?? p.modeId) ?? "";
       if (!VALID_MODES.has(modeId as PermissionMode)) {
         throw new BridgeError(-32602, `unknown permission mode: ${modeId}`, { modeId });
       }
@@ -600,7 +600,8 @@ async function dispatch(
         permissionMode,
         mcpServers: Array.isArray(p.mcpServers) ? p.mcpServers : [],
         additionalDirectories,
-        model: typeof meta.model === "string" ? meta.model : undefined,
+        // GradatiON sends digit-string model ids as JSON numbers (or "5.0").
+        model: wireIdString(meta.model),
       });
       rememberWorkspace(opts.config, cwd);
       return {
@@ -663,7 +664,7 @@ async function dispatch(
 
     case "session/set_mode": {
       const sessionId = phoneSessionId(p.sessionId);
-      const modeId = String(p.modeId ?? "");
+      const modeId = wireIdString(p.modeId) ?? "";
       if (!modeId) {
         throw new BridgeError(-32602, "modeId required");
       }

@@ -153,6 +153,24 @@ const STRIPPED_GIT_ENV = new Set([
   "GIT_TRACE_SHALLOW",
   "GIT_TRACE_REFS",
   "GIT_CURL_VERBOSE",
+  // Loader / runtime hooks — same class as harness/terminal scrub. Phone-triggered
+  // git must not inherit a bridge-process LD_PRELOAD or SSL key log path.
+  "LD_PRELOAD",
+  "LD_AUDIT",
+  "LD_PROFILE",
+  "LD_LIBRARY_PATH",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_LIBRARY_PATH",
+  "DYLD_FRAMEWORK_PATH",
+  "DYLD_FALLBACK_LIBRARY_PATH",
+  "DYLD_FALLBACK_FRAMEWORK_PATH",
+  "JAVA_TOOL_OPTIONS",
+  "_JAVA_OPTIONS",
+  "JDK_JAVA_OPTIONS",
+  "DOTNET_STARTUP_HOOKS",
+  "SSLKEYLOGFILE",
+  "OPENSSL_CONF",
+  "NODE_OPTIONS",
 ]);
 
 /** Child env for git. Drops variables that can name a program or inject config. */

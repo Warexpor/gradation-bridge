@@ -869,14 +869,16 @@ export class SessionManager {
     if (!client?.running) {
       throw new BridgeError(-32004, `session agent not running: ${sessionId}`, { sessionId });
     }
-    const configId = params.configId;
-    if (typeof configId !== "string" || !configId) {
+    const configId = wireIdString(params.configId);
+    if (!configId) {
       throw new BridgeError(-32602, "configId required");
     }
+    const value = wireIdString(params.value) ?? params.value;
     const result = await client.setConfigOption({
       ...params,
       sessionId: rec.agentSessionId,
       configId,
+      ...(value !== undefined ? { value } : {}),
     });
     this.captureSessionPayload(rec, result);
     this.persist(rec);

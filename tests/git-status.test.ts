@@ -171,6 +171,12 @@ describe("getGitStatus / getGitDiff", () => {
       GIT_TRACE: "/tmp/trace",
       GIT_TRACE2_EVENT: "/tmp/trace2",
       GIT_TRACE_PACKFILE: "/tmp/pack",
+      LD_PRELOAD: "/tmp/evil.so",
+      JAVA_TOOL_OPTIONS: "-javaagent:/tmp/x.jar",
+      SSLKEYLOGFILE: "/tmp/keys",
+      OPENSSL_CONF: "/tmp/openssl.cnf",
+      NODE_OPTIONS: "--require /tmp/x.js",
+      DOTNET_STARTUP_HOOKS: "/tmp/hook",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.GIT_EXTERNAL_DIFF).toBeUndefined();
@@ -187,6 +193,12 @@ describe("getGitStatus / getGitDiff", () => {
     expect(env.SSH_ASKPASS_REQUIRE).toBeUndefined();
     expect(env.GIT_PROXY_COMMAND).toBeUndefined();
     expect(env.GIT_ALLOW_PROTOCOL).toBeUndefined();
+    expect(env.LD_PRELOAD).toBeUndefined();
+    expect(env.JAVA_TOOL_OPTIONS).toBeUndefined();
+    expect(env.SSLKEYLOGFILE).toBeUndefined();
+    expect(env.OPENSSL_CONF).toBeUndefined();
+    expect(env.NODE_OPTIONS).toBeUndefined();
+    expect(env.DOTNET_STARTUP_HOOKS).toBeUndefined();
     expect(env.GIT_CONFIG_COUNT).toBeUndefined();
     expect(env.GIT_CONFIG_KEY_0).toBeUndefined();
     expect(env.GIT_CONFIG_VALUE_0).toBeUndefined();
