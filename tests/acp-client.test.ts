@@ -390,6 +390,42 @@ describe("ACP stdio client errors", () => {
       client.kill();
     }
   });
+
+  it("accepts a whole-number JSON sessionId from session/new", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gb-acp-sessnum-"));
+    dirs.push(dir);
+    const script = join(dir, "agent.mjs");
+    writeFileSync(
+      script,
+      [
+        "import { createInterface } from 'node:readline';",
+        "const rl = createInterface({ input: process.stdin });",
+        "rl.on('line', (line) => {",
+        "  let msg;",
+        "  try { msg = JSON.parse(line); } catch { return; }",
+        "  if (msg.method === 'session/new') {",
+        "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 42 } }) + '\\n');",
+        "    return;",
+        "  }",
+        "  if (msg.id != null) {",
+        "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');",
+        "  }",
+        "});",
+        "",
+      ].join("\n"),
+    );
+    const client = new AcpStdioClient({
+      harness: { id: "num", name: "num", command: process.execPath, args: [script] },
+      cwd: dir,
+    });
+    client.start();
+    try {
+      await client.initialize({ clientInfo: { name: "t", version: "0" } });
+      await expect(client.newSession({ cwd: dir })).resolves.toMatchObject({ sessionId: "42" });
+    } finally {
+      client.kill();
+    }
+  });
 });
 
 async function readHarnessLog(

@@ -420,7 +420,7 @@ async function dispatchNotification(
 ): Promise<void> {
   const p = (params ?? {}) as Record<string, unknown>;
   if (method === "session/cancel") {
-    opts.sessions.cancel(String(p.sessionId ?? ""));
+    opts.sessions.cancel(phoneSessionId(p.sessionId));
     return;
   }
   if (isCancelRequest(method)) {
@@ -500,7 +500,7 @@ async function dispatch(
       };
     }
     case "bridge/setPermissionMode": {
-      const sessionId = String(p.sessionId ?? "");
+      const sessionId = phoneSessionId(p.sessionId);
       const modeId = String(p.permissionMode ?? p.modeId ?? "");
       if (!VALID_MODES.has(modeId as PermissionMode)) {
         throw new BridgeError(-32602, `unknown permission mode: ${modeId}`, { modeId });
@@ -529,27 +529,27 @@ async function dispatch(
       return { sessions };
     }
     case "bridge/closeSession": {
-      const sessionId = String(p.sessionId ?? "");
+      const sessionId = phoneSessionId(p.sessionId);
       await opts.sessions.closeSession(sessionId, { missing: "ignore" });
       return {};
     }
     case "session/list":
       return opts.sessions.listForProtocol({
         cwd: typeof p.cwd === "string" ? p.cwd : undefined,
-        cursor: typeof p.cursor === "string" ? p.cursor : undefined,
+        cursor: wireIdString(p.cursor),
       });
     case "session/close": {
-      const sessionId = String(p.sessionId ?? "");
+      const sessionId = phoneSessionId(p.sessionId);
       await opts.sessions.closeSession(sessionId, { missing: "error" });
       return {};
     }
     case "session/delete": {
-      const sessionId = String(p.sessionId ?? "");
+      const sessionId = phoneSessionId(p.sessionId);
       await opts.sessions.deleteSession(sessionId);
       return {};
     }
     case "session/resume": {
-      const sessionId = String(p.sessionId ?? "");
+      const sessionId = phoneSessionId(p.sessionId);
       return opts.sessions.resume(sessionId, {
         cwd: typeof p.cwd === "string" ? p.cwd : undefined,
         mcpServers: Array.isArray(p.mcpServers) ? p.mcpServers : [],
@@ -557,11 +557,11 @@ async function dispatch(
       });
     }
     case "session/set_config_option": {
-      const sessionId = String(p.sessionId ?? "");
+      const sessionId = phoneSessionId(p.sessionId);
       return opts.sessions.setConfigOption(sessionId, p);
     }
     case "bridge/diff": {
-      const sessionId = String(p.sessionId ?? "");
+      const sessionId = phoneSessionId(p.sessionId);
       const filePath = String(p.path ?? "");
       const rec = requireListedSession(opts.sessions, sessionId);
       // Ensure workspace still under allowed roots; resolve file via realpath.
@@ -575,7 +575,7 @@ async function dispatch(
       return getGitDiff(rec.cwd, allowedFile);
     }
     case "bridge/gitStatus": {
-      const sessionId = String(p.sessionId ?? "");
+      const sessionId = phoneSessionId(p.sessionId);
       const rec = requireListedSession(opts.sessions, sessionId);
       const cwd = assertAllowedRealPath(rec.cwd, opts.config.allowedRoots);
       const status = await getGitStatus(cwd);
@@ -618,12 +618,12 @@ async function dispatch(
     }
 
     case "session/prompt": {
-      const sessionId = String(p.sessionId ?? "");
+      const sessionId = phoneSessionId(p.sessionId);
       return opts.sessions.prompt(sessionId, p);
     }
 
     case "session/load": {
-      const sessionId = String(p.sessionId ?? "");
+      const sessionId = phoneSessionId(p.sessionId);
       const meta = (p._meta ?? {}) as Record<string, unknown>;
       const afterSeq = coerceAfterSeq(meta.afterSeq);
       return opts.sessions.load(sessionId, {
@@ -657,12 +657,12 @@ async function dispatch(
       });
     }
     case "session/cancel": {
-      opts.sessions.cancel(String(p.sessionId ?? ""));
+      opts.sessions.cancel(phoneSessionId(p.sessionId));
       return {};
     }
 
     case "session/set_mode": {
-      const sessionId = String(p.sessionId ?? "");
+      const sessionId = phoneSessionId(p.sessionId);
       const modeId = String(p.modeId ?? "");
       if (!modeId) {
         throw new BridgeError(-32602, "modeId required");
@@ -699,7 +699,7 @@ function cancelInflightPhoneCall(method: string, params: unknown, opts: WsServer
   const p = (params ?? {}) as Record<string, unknown>;
   const meta = (p._meta ?? {}) as Record<string, unknown>;
   if (method === "session/prompt" || method === "session/load" || method === "session/resume") {
-    opts.sessions.cancel(String(p.sessionId ?? ""));
+    opts.sessions.cancel(phoneSessionId(p.sessionId));
     return;
   }
   if (
@@ -714,6 +714,12 @@ function cancelInflightPhoneCall(method: string, params: unknown, opts: WsServer
       cwd: typeof p.cwd === "string" ? p.cwd : typeof meta.cwd === "string" ? meta.cwd : undefined,
     });
   }
+}
+
+
+/** Phone sessionId may arrive as a JSON number or `"5.0"` for digit-string ids. */
+function phoneSessionId(value: unknown): string {
+  return wireIdString(value) ?? "";
 }
 
 /** Sessions that `session/list` hides are unknown to the rest of the protocol. */

@@ -151,6 +151,12 @@ const BLOCKED_TERMINAL_ENV = new Set([
   "NODE_OPTIONS",
   "NODE_PATH",
   "NODE_REPL_EXTERNAL_MODULE",
+  "JAVA_TOOL_OPTIONS",
+  "_JAVA_OPTIONS",
+  "JDK_JAVA_OPTIONS",
+  "DOTNET_STARTUP_HOOKS",
+  "SSLKEYLOGFILE",
+  "OPENSSL_CONF",
   "PYTHONSTARTUP",
   "PYTHONINSPECT",
   "PYTHONPATH",
@@ -177,7 +183,7 @@ export function terminalChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.
 
 /**
  * Child env for a harness process. Same blocked-name scrub as terminals, so a
- * bridge-process `GIT_TRACE` / `NODE_OPTIONS` / `LD_PRELOAD` cannot reach the agent.
+ * bridge-process `GIT_TRACE` / `NODE_OPTIONS` / `JAVA_TOOL_OPTIONS` / `LD_PRELOAD` cannot reach the agent.
  * Config and harness `env` overlays are scrubbed the same way.
  */
 export function harnessChildEnv(
