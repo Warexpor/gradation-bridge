@@ -31,4 +31,18 @@ describe("listDirectory", () => {
     expect(full.entries.find((entry) => entry.name === "nested")?.dir).toBe(true);
     expect(full.entries.find((entry) => entry.name === "a.txt")?.dir).toBe(false);
   });
+
+  it("stops after the cap instead of materializing every name", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-browse-cap-"));
+    dirs.push(root);
+    for (let i = 0; i < 2500; i++) {
+      writeFileSync(join(root, `f-${String(i).padStart(4, "0")}.txt`), "");
+    }
+    const listed = listDirectory(root, 100);
+    expect(listed.truncated).toBe(true);
+    expect(listed.entries).toHaveLength(100);
+    const empty = listDirectory(root, 0);
+    expect(empty.truncated).toBe(true);
+    expect(empty.entries).toHaveLength(0);
+  });
 });

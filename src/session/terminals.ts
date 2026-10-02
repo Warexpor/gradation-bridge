@@ -91,8 +91,8 @@ export function isEnvName(name: string): boolean {
  * These variables change which code that binary runs (loader, git config,
  * git directory, editor, pager, askpass, proxy, interpreter startup) without
  * appearing in the command. `GIT_ALLOW_PROTOCOL` turns on helpers such as
- * `ext::` that git leaves off. The process environment is still inherited;
- * only the agent's overlay is refused.
+ * `ext::` that git leaves off. `GIT_TRACE*` can write to an arbitrary path.
+ * The process environment is still inherited; only the agent's overlay is refused.
  */
 const BLOCKED_TERMINAL_ENV = new Set([
   "LD_PRELOAD",
@@ -104,6 +104,17 @@ const BLOCKED_TERMINAL_ENV = new Set([
   "DYLD_FRAMEWORK_PATH",
   "DYLD_FALLBACK_LIBRARY_PATH",
   "DYLD_FALLBACK_FRAMEWORK_PATH",
+  "GIT_TRACE",
+  "GIT_TRACE2",
+  "GIT_TRACE2_EVENT",
+  "GIT_TRACE2_PERF",
+  "GIT_TRACE_PACKFILE",
+  "GIT_TRACE_PERFORMANCE",
+  "GIT_TRACE_SETUP",
+  "GIT_TRACE_PACKET",
+  "GIT_TRACE_SHALLOW",
+  "GIT_TRACE_REFS",
+  "GIT_CURL_VERBOSE",
   "GIT_EXTERNAL_DIFF",
   "GIT_EXEC_PATH",
   "GIT_DIR",
@@ -153,6 +164,7 @@ const BLOCKED_TERMINAL_ENV = new Set([
 export function blockedTerminalEnvName(name: string): boolean {
   if (BLOCKED_TERMINAL_ENV.has(name)) return true;
   if (name.startsWith("GIT_CONFIG_KEY_") || name.startsWith("GIT_CONFIG_VALUE_")) return true;
+  if (name.startsWith("GIT_TRACE")) return true;
   if (name.startsWith("BASH_FUNC_")) return true;
   return false;
 }

@@ -179,6 +179,51 @@ describe("ACP stdio client errors", () => {
     }
   });
 
+  it("cancelOutbound rejects pending auth without waiting on the harness", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gb-acp-cancel-out-"));
+    dirs.push(dir);
+    const log = join(dir, "log.ndjson");
+    const script = join(dir, "agent.mjs");
+    writeFileSync(
+      script,
+      [
+        "import { createInterface } from 'node:readline';",
+        "import { appendFileSync } from 'node:fs';",
+        "const rl = createInterface({ input: process.stdin });",
+        "const sleep = (ms) => new Promise((r) => setTimeout(r, ms));",
+        "rl.on('line', async (line) => {",
+        "  let msg;",
+        "  try { msg = JSON.parse(line); } catch { return; }",
+        "  appendFileSync(process.env.LOG, JSON.stringify(msg) + '\\n');",
+        "  if (msg.method === 'authenticate') {",
+        "    await sleep(5_000);",
+        "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { late: true } }) + '\\n');",
+        "  }",
+        "});",
+        "",
+      ].join("\n"),
+    );
+    const client = new AcpStdioClient({
+      harness: { id: "slow-auth", name: "slow-auth", command: process.execPath, args: [script] },
+      cwd: dir,
+      env: { LOG: log },
+    });
+    client.start();
+    try {
+      const auth = client.authenticate("m1");
+      await readHarnessLog(log, 1);
+      client.cancelOutbound(["authenticate", "auth/login"]);
+      const err = await auth.catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error & { code?: number }).code).toBe(-32800);
+      expect((err as Error).message).toMatch(/cancelled/);
+      const lines = await readHarnessLog(log, 2);
+      expect(lines.map((msg) => msg.method)).toContain("$/cancel_request");
+    } finally {
+      client.kill();
+    }
+  });
+
   it("cancels a timed-out request and ignores the late result", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gb-acp-timeout-"));
     dirs.push(dir);

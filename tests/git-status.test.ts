@@ -168,9 +168,15 @@ describe("getGitStatus / getGitDiff", () => {
       SSH_ASKPASS_REQUIRE: "force",
       GIT_PROXY_COMMAND: "/tmp/proxy",
       GIT_ALLOW_PROTOCOL: "ext",
+      GIT_TRACE: "/tmp/trace",
+      GIT_TRACE2_EVENT: "/tmp/trace2",
+      GIT_TRACE_PACKFILE: "/tmp/pack",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.GIT_EXTERNAL_DIFF).toBeUndefined();
+    expect(env.GIT_TRACE).toBeUndefined();
+    expect(env.GIT_TRACE2_EVENT).toBeUndefined();
+    expect(env.GIT_TRACE_PACKFILE).toBeUndefined();
     expect(env.GIT_DIR).toBeUndefined();
     expect(env.GIT_WORK_TREE).toBeUndefined();
     expect(env.GIT_EDITOR).toBeUndefined();
@@ -189,6 +195,31 @@ describe("getGitStatus / getGitDiff", () => {
     expect(guardedGitArgs(["status"], ["filter.lfs.clean"])).toEqual(
       expect.arrayContaining(["-c", "filter.lfs.clean="]),
     );
+  });
+
+  it("does not write through an inherited GIT_TRACE sink", async () => {
+    tmp = mkdtempSync(join(tmpdir(), "gb-git-trace-"));
+    const sink = join(tmp, "trace.out");
+    git(tmp, ["init"]);
+    git(tmp, ["config", "user.email", "test@example.com"]);
+    git(tmp, ["config", "user.name", "Test"]);
+    writeFileSync(join(tmp, "a.txt"), "one\n");
+    git(tmp, ["add", "a.txt"]);
+    git(tmp, ["commit", "-m", "init"]);
+    writeFileSync(join(tmp, "a.txt"), "two\n");
+    const prev = process.env.GIT_TRACE;
+    const prevEvent = process.env.GIT_TRACE2_EVENT;
+    process.env.GIT_TRACE = sink;
+    process.env.GIT_TRACE2_EVENT = sink + ".event";
+    try {
+      await getGitStatus(tmp);
+      await getGitDiff(tmp, "a.txt");
+    } finally {
+      restoreEnv("GIT_TRACE", prev);
+      restoreEnv("GIT_TRACE2_EVENT", prevEvent);
+    }
+    expect(existsSync(sink)).toBe(false);
+    expect(existsSync(sink + ".event")).toBe(false);
   });
 
   it("does not run textconv, clean filters, or status/diff aliases", async () => {
