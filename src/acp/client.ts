@@ -335,11 +335,22 @@ export class AcpStdioClient {
     this.inboundCancels.get(requestId)?.();
   }
 
-  /** Ask the harness to stop outbound calls such as `authenticate`. */
+  /**
+   * Ask the harness to stop outbound calls such as `authenticate`.
+   * Drop the pending promise now so a harness that ignores `$/cancel_request`
+   * cannot leave the phone waiting until the ACP timeout.
+   */
   cancelOutbound(methods: string[]): void {
-    for (const [id, method] of this.outboundMethods) {
+    for (const [id, method] of [...this.outboundMethods]) {
       if (!methods.includes(method)) continue;
       this.notify("$/cancel_request", { requestId: id });
+      const pending = this.pending.get(id);
+      if (!pending) continue;
+      this.pending.delete(id);
+      this.outboundMethods.delete(id);
+      const err = new Error("request cancelled") as Error & { code?: number };
+      err.code = REQUEST_CANCELLED;
+      pending.reject(err);
     }
   }
 

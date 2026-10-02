@@ -45,6 +45,9 @@ describe("terminal output limit", () => {
     expect(blockedTerminalEnvName("SSH_ASKPASS_REQUIRE")).toBe(true);
     expect(blockedTerminalEnvName("GIT_PROXY_COMMAND")).toBe(true);
     expect(blockedTerminalEnvName("GIT_ALLOW_PROTOCOL")).toBe(true);
+    expect(blockedTerminalEnvName("GIT_TRACE")).toBe(true);
+    expect(blockedTerminalEnvName("GIT_TRACE2_EVENT")).toBe(true);
+    expect(blockedTerminalEnvName("GIT_TRACE_CUSTOM")).toBe(true);
     expect(blockedTerminalEnvName("NODE_OPTIONS")).toBe(true);
     expect(blockedTerminalEnvName("BASH_FUNC_echo")).toBe(true);
     expect(blockedTerminalEnvName("PATH")).toBe(false);

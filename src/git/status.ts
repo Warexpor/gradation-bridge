@@ -48,6 +48,8 @@ export interface GitDiffResult {
  * both blanked. `GIT_CONFIG` is removed from the child environment first.
  * With it set, `git config --local` errors and an unscoped `git config --list`
  * reads that other file, hiding the repo filters that status and diff still run.
+ * `GIT_TRACE*` is removed so a phone-triggered status or diff cannot write
+ * (or, on some builds, pipe) through an inherited trace sink.
  */
 const GIT_GUARD = [
   "-c",
@@ -139,6 +141,18 @@ const STRIPPED_GIT_ENV = new Set([
   "GIT_COMMON_DIR",
   "GIT_NAMESPACE",
   "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  // Trace sinks can write (or, on some builds, pipe) to an attacker-chosen path.
+  "GIT_TRACE",
+  "GIT_TRACE2",
+  "GIT_TRACE2_EVENT",
+  "GIT_TRACE2_PERF",
+  "GIT_TRACE_PACKFILE",
+  "GIT_TRACE_PERFORMANCE",
+  "GIT_TRACE_SETUP",
+  "GIT_TRACE_PACKET",
+  "GIT_TRACE_SHALLOW",
+  "GIT_TRACE_REFS",
+  "GIT_CURL_VERBOSE",
 ]);
 
 /** Child env for git. Drops variables that can name a program or inject config. */
@@ -148,6 +162,7 @@ export function gitChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Proce
     if (value === undefined) continue;
     if (STRIPPED_GIT_ENV.has(key)) continue;
     if (key.startsWith("GIT_CONFIG_KEY_") || key.startsWith("GIT_CONFIG_VALUE_")) continue;
+    if (key.startsWith("GIT_TRACE")) continue;
     env[key] = value;
   }
   env.GIT_TERMINAL_PROMPT = "0";
