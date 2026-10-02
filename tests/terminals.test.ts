@@ -51,6 +51,12 @@ describe("terminal output limit", () => {
     expect(blockedTerminalEnvName("GIT_TRACE2_EVENT")).toBe(true);
     expect(blockedTerminalEnvName("GIT_TRACE_CUSTOM")).toBe(true);
     expect(blockedTerminalEnvName("NODE_OPTIONS")).toBe(true);
+    expect(blockedTerminalEnvName("JAVA_TOOL_OPTIONS")).toBe(true);
+    expect(blockedTerminalEnvName("_JAVA_OPTIONS")).toBe(true);
+    expect(blockedTerminalEnvName("JDK_JAVA_OPTIONS")).toBe(true);
+    expect(blockedTerminalEnvName("DOTNET_STARTUP_HOOKS")).toBe(true);
+    expect(blockedTerminalEnvName("SSLKEYLOGFILE")).toBe(true);
+    expect(blockedTerminalEnvName("OPENSSL_CONF")).toBe(true);
     expect(blockedTerminalEnvName("BASH_FUNC_echo")).toBe(true);
     expect(blockedTerminalEnvName("PATH")).toBe(false);
     expect(blockedTerminalEnvName("TERM")).toBe(false);
@@ -64,6 +70,9 @@ describe("terminal output limit", () => {
       GIT_TRACE2_EVENT: "/tmp/trace2",
       LD_PRELOAD: "/tmp/evil.so",
       NODE_OPTIONS: "--require /tmp/x.js",
+      JAVA_TOOL_OPTIONS: "-javaagent:/tmp/x.jar",
+      DOTNET_STARTUP_HOOKS: "/tmp/hook.dll",
+      SSLKEYLOGFILE: "/tmp/keys",
       HOME: "/home/user",
     });
     expect(env.PATH).toBe("/usr/bin");
@@ -73,6 +82,9 @@ describe("terminal output limit", () => {
     expect(env.GIT_TRACE2_EVENT).toBeUndefined();
     expect(env.LD_PRELOAD).toBeUndefined();
     expect(env.NODE_OPTIONS).toBeUndefined();
+    expect(env.JAVA_TOOL_OPTIONS).toBeUndefined();
+    expect(env.DOTNET_STARTUP_HOOKS).toBeUndefined();
+    expect(env.SSLKEYLOGFILE).toBeUndefined();
   });
 
   it("scrubs the same blocked names from harness spawn env", () => {
@@ -82,12 +94,16 @@ describe("terminal output limit", () => {
       GIT_TRACE: "/tmp/trace",
       NODE_OPTIONS: "--require /tmp/x.js",
       LD_PRELOAD: "/tmp/evil.so",
+      JAVA_TOOL_OPTIONS: "-javaagent:/tmp/x.jar",
+      OPENSSL_CONF: "/tmp/evil.cnf",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.ANTHROPIC_API_KEY).toBe("sk-test");
     expect(env.GIT_TRACE).toBeUndefined();
     expect(env.NODE_OPTIONS).toBeUndefined();
     expect(env.LD_PRELOAD).toBeUndefined();
+    expect(env.JAVA_TOOL_OPTIONS).toBeUndefined();
+    expect(env.OPENSSL_CONF).toBeUndefined();
   });
 
   it("rejects a create that cannot start", () => {

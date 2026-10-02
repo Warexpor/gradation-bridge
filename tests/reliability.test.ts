@@ -433,6 +433,32 @@ describe("protocol and process reliability", () => {
     await client.close();
   }, 20_000);
 
+
+  it("prompts and cancels when the phone sends sessionId as a number or \"42.0\"", async () => {
+    await boot({
+      FAKE_ACP_SESSION_ID: "42",
+      FAKE_ACP_SESSION_AS_NUMBER: "1",
+      FAKE_ACP_SLOW_MS: "400",
+    });
+    const client = await openClient(server!.url, token);
+    await client.call("initialize", { protocolVersion: 1 });
+    const created = (await client.call("session/new", {
+      cwd: workspace,
+      mcpServers: [],
+      _meta: { harness: "fake", permissionMode: "ask" },
+    })) as { sessionId: string };
+    expect(created.sessionId).toBe("42");
+    const prompt = client.call("session/prompt", {
+      sessionId: "42.0",
+      prompt: [{ type: "text", text: "go" }],
+    });
+    await waitFor(() => client.inbound.find((msg) => msg.method === "session/update"));
+    await client.call("session/cancel", { sessionId: 42 });
+    const result = (await prompt) as { stopReason?: string };
+    expect(result.stopReason).toBe("cancelled");
+    await client.close();
+  }, 20_000);
+
   it("ignores stdout from a harness that was already replaced", async () => {
     await boot({ FAKE_ACP_WRITE_ON_TERM: "1" });
     const client = await openClient(server!.url, token);

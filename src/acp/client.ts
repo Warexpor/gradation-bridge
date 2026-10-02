@@ -19,6 +19,7 @@ import {
 } from "./cancel.js";
 import { harnessChildEnv } from "../session/terminals.js";
 import { ACP_PROTOCOL_VERSION } from "./protocol.js";
+import { wireIdString } from "./wire-id.js";
 
 export interface AcpJsonRpcRequest {
   jsonrpc?: string;
@@ -557,11 +558,13 @@ export class AcpStdioClient {
       mcpServers: params.mcpServers ?? [],
       ...extraRoots(params.additionalDirectories),
       ...(params._meta ? { _meta: params._meta } : {}),
-    })) as { sessionId?: unknown };
-    if (!result || typeof result.sessionId !== "string" || !result.sessionId) {
+    })) as Record<string, unknown> | null;
+    const sessionId = wireIdString(result?.sessionId);
+    if (!result || !sessionId) {
       throw new Error("session/new did not return sessionId");
     }
-    return result as Record<string, unknown> & { sessionId: string };
+    // Agents may advertise digit-string ids as JSON numbers; canonicalize before adopt.
+    return { ...result, sessionId };
   }
 
   async prompt(params: Record<string, unknown>): Promise<unknown> {
@@ -663,8 +666,7 @@ function extraRoots(dirs: string[] | undefined): { additionalDirectories?: strin
 
 function sessionIdFromParams(params: unknown): string | undefined {
   if (!params || typeof params !== "object" || Array.isArray(params)) return undefined;
-  const sessionId = (params as { sessionId?: unknown }).sessionId;
-  return typeof sessionId === "string" && sessionId ? sessionId : undefined;
+  return wireIdString((params as { sessionId?: unknown }).sessionId);
 }
 
 export function isMethodNotFound(err: unknown): boolean {

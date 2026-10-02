@@ -36,6 +36,7 @@
  *   FAKE_ACP_SLOW_MS=N          — delay between update chunks
  *   FAKE_ACP_EXIT_AFTER_PROMPT=1 — exit shortly after the prompt result is flushed
  *   FAKE_ACP_SESSION_ID=<id>     — force the id returned by session/new
+ *   FAKE_ACP_SESSION_AS_NUMBER=1 — encode a digit FAKE_ACP_SESSION_ID as a JSON number
  *   FAKE_ACP_NO_RESUME=1         — session/resume returns method-not-found
  *   FAKE_ACP_DUMP_NEW=<file>     — write session/new params JSON to a file
  *   FAKE_ACP_TERMINAL_TAIL=1     — terminal/create with a 4-byte output limit
@@ -79,6 +80,7 @@ const dumpPath = process.env.FAKE_ACP_DUMP;
 const slowMs = Number(process.env.FAKE_ACP_SLOW_MS ?? "0") || 0;
 const exitAfterPrompt = process.env.FAKE_ACP_EXIT_AFTER_PROMPT === "1";
 const forcedSessionId = process.env.FAKE_ACP_SESSION_ID;
+const sessionAsNumber = process.env.FAKE_ACP_SESSION_AS_NUMBER === "1";
 const noResume = process.env.FAKE_ACP_NO_RESUME === "1";
 const dumpNewPath = process.env.FAKE_ACP_DUMP_NEW;
 const terminalTail = process.env.FAKE_ACP_TERMINAL_TAIL === "1";
@@ -592,8 +594,12 @@ async function dispatch(msg: JsonRpcRequest): Promise<void> {
       const sessionId = forcedSessionId || `fake-${nextSession++}`;
       lastSessionId = sessionId;
       sessions.set(sessionId, { cwd: String(params.cwd ?? process.cwd()), cancelled: false });
+      const wireSessionId =
+        sessionAsNumber && /^-?\d+$/.test(sessionId) && Number.isSafeInteger(Number(sessionId))
+          ? Number(sessionId)
+          : sessionId;
       respond(id, {
-        sessionId,
+        sessionId: wireSessionId,
         modes: {
           currentModeId: "agent",
           availableModes: [{ id: "agent", name: "Agent", description: "Fake agent mode" }],
