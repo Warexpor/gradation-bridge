@@ -45,7 +45,7 @@ export function assertAgentAuthMethod(methods: PublicAuthMethod[], methodId: str
   if (method.type === "terminal") {
     throw new BridgeError(
       -32602,
-      "terminal authentication must be completed in a terminal on this machine",
+      "terminal authentication must be completed in a terminal on this machine (see doctor auth hints; the bridge cannot present an interactive TTY)",
       { methodId, type: "terminal", authMethods: methods },
     );
   }

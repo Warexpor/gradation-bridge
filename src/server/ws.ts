@@ -24,6 +24,8 @@ import {
   cancelledPhoneResult,
   isCancelRequest,
   readCancelRequestId,
+  mapDeleteByRpcId,
+  mapGetByRpcId,
 } from "../acp/cancel.js";
 import { ACP_PROTOCOL_VERSION, negotiateProtocolVersion } from "../acp/protocol.js";
 import { tlsDiagnostics } from "../auth/cert.js";
@@ -357,10 +359,10 @@ async function routeMessage(
     msg.method === undefined &&
     (msg.result !== undefined || msg.error !== undefined)
   ) {
-    const pending = pendingPhone.get(msg.id);
+    const pending = mapGetByRpcId(pendingPhone, msg.id);
     if (pending) {
       clearTimeout(pending.timer);
-      pendingPhone.delete(msg.id);
+      mapDeleteByRpcId(pendingPhone, msg.id);
       pending.resolve({ result: msg.result, error: msg.error, requestId: msg.id });
     }
     return;
@@ -422,7 +424,7 @@ async function dispatchNotification(
   }
   if (isCancelRequest(method)) {
     const requestId = readCancelRequestId(p);
-    if (requestId != null) phoneCalls.get(requestId)?.();
+    if (requestId != null) mapGetByRpcId(phoneCalls, requestId)?.();
   }
 }
 

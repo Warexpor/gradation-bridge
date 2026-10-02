@@ -22,6 +22,41 @@ export function readCancelRequestId(params: unknown): string | number | undefine
   return undefined;
 }
 
+/**
+ * Look up a pending JSON-RPC id when the peer used a string form of a number
+ * (or the reverse). Phone and harness stacks do not always agree on the type.
+ */
+export function mapGetByRpcId<T>(
+  map: Map<string | number, T>,
+  id: string | number,
+): T | undefined {
+  if (map.has(id)) return map.get(id);
+  for (const alt of rpcIdAliases(id)) {
+    if (map.has(alt)) return map.get(alt);
+  }
+  return undefined;
+}
+
+/** Delete by the stored key when the peer used a string/number alias. */
+export function mapDeleteByRpcId<T>(map: Map<string | number, T>, id: string | number): boolean {
+  if (map.delete(id)) return true;
+  for (const alt of rpcIdAliases(id)) {
+    if (map.delete(alt)) return true;
+  }
+  return false;
+}
+
+function rpcIdAliases(id: string | number): Array<string | number> {
+  if (typeof id === "number") {
+    if (!Number.isInteger(id) || !Number.isSafeInteger(id)) return [];
+    return [String(id)];
+  }
+  if (!/^-?\d+$/.test(id)) return [];
+  const asNum = Number(id);
+  if (!Number.isSafeInteger(asNum)) return [];
+  return [asNum];
+}
+
 /** Domain cancellation marker for a request the bridge forwarded to the phone. */
 export function cancelledPhoneResult(method: string): unknown {
   if (method === "elicitation/create") return { action: "cancel" };

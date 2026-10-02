@@ -10,7 +10,14 @@ import { log } from "../log/diagnostics.js";
 import { redactSecrets } from "../log/redact.js";
 import { resolveExecutable } from "../harness/path.js";
 import { killProcessTree, signalProcessGroup } from "../proc/tree.js";
-import { isCancelRequest, readCancelRequestId, REQUEST_CANCELLED } from "./cancel.js";
+import {
+  isCancelRequest,
+  mapDeleteByRpcId,
+  mapGetByRpcId,
+  readCancelRequestId,
+  REQUEST_CANCELLED,
+} from "./cancel.js";
+import { harnessChildEnv } from "../session/terminals.js";
 import { ACP_PROTOCOL_VERSION } from "./protocol.js";
 
 export interface AcpJsonRpcRequest {
@@ -110,11 +117,13 @@ export class AcpStdioClient {
   start(): void {
     if (this.child) throw new Error("ACP client already started");
     if (this.settled) throw new Error("ACP client already exited");
-    const env = {
+    // Drop blocked loader / git / interpreter names from the inherited host
+    // environment and from config/harness overlays, matching agent terminals.
+    const env = harnessChildEnv({
       ...process.env,
       ...this.opts.env,
       ...this.harness.env,
-    };
+    });
     // Resolve on the bridge PATH before the child env is applied. A harness
     // `env.PATH` still reaches the process, but it cannot select a different binary.
     const command =
@@ -261,9 +270,9 @@ export class AcpStdioClient {
       obj.method === undefined &&
       (obj.result !== undefined || obj.error !== undefined)
     ) {
-      const pending = this.pending.get(obj.id);
+      const pending = mapGetByRpcId(this.pending, obj.id);
       if (pending) {
-        this.pending.delete(obj.id);
+        mapDeleteByRpcId(this.pending, obj.id);
         if (obj.error) {
           const errObj = obj.error as { message?: string; code?: number };
           const err = new Error(errObj.message ?? JSON.stringify(obj.error)) as Error & {
@@ -277,9 +286,9 @@ export class AcpStdioClient {
           pending.resolve(obj.result);
         }
       } else {
-        const done = this.abandoned.get(obj.id);
+        const done = mapGetByRpcId(this.abandoned, obj.id);
         if (done) {
-          this.abandoned.delete(obj.id);
+          mapDeleteByRpcId(this.abandoned, obj.id);
           done();
         }
       }
@@ -342,7 +351,7 @@ export class AcpStdioClient {
 
   /** Stop an in-flight harness→bridge request. The handler returns a cancellation result. */
   cancelInbound(requestId: number | string): void {
-    this.inboundCancels.get(requestId)?.();
+    mapGetByRpcId(this.inboundCancels, requestId)?.();
   }
 
   /**
@@ -629,6 +638,7 @@ export class AcpStdioClient {
 }
 
 export const ACP_SDK_PACKAGE = "@agentclientprotocol/sdk";
+
 
 function capabilitiesForAgent(phone: Record<string, unknown>): Record<string, unknown> {
   const auth = phone.auth;

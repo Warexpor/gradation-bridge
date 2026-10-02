@@ -172,6 +172,23 @@ export function blockedTerminalEnvName(name: string): boolean {
 
 /** Child env for agent terminals. Drops blocked names from the host environment. */
 export function terminalChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return scrubBlockedEnv(base);
+}
+
+/**
+ * Child env for a harness process. Same blocked-name scrub as terminals, so a
+ * bridge-process `GIT_TRACE` / `NODE_OPTIONS` / `LD_PRELOAD` cannot reach the agent.
+ * Config and harness `env` overlays are scrubbed the same way.
+ */
+export function harnessChildEnv(
+  base: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+): NodeJS.ProcessEnv {
+  return scrubBlockedEnv(base);
+}
+
+function scrubBlockedEnv(
+  base: NodeJS.ProcessEnv | Record<string, string | undefined>,
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(base)) {
     if (value === undefined) continue;

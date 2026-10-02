@@ -3,6 +3,7 @@ import {
   appendTerminalOutput,
   assertTerminalCreateParams,
   blockedTerminalEnvName,
+  harnessChildEnv,
   terminalChildEnv,
   MAX_TERMINALS_PER_SESSION,
   resolveOutputByteLimit,
@@ -72,6 +73,21 @@ describe("terminal output limit", () => {
     expect(env.GIT_TRACE2_EVENT).toBeUndefined();
     expect(env.LD_PRELOAD).toBeUndefined();
     expect(env.NODE_OPTIONS).toBeUndefined();
+  });
+
+  it("scrubs the same blocked names from harness spawn env", () => {
+    const env = harnessChildEnv({
+      PATH: "/usr/bin",
+      ANTHROPIC_API_KEY: "sk-test",
+      GIT_TRACE: "/tmp/trace",
+      NODE_OPTIONS: "--require /tmp/x.js",
+      LD_PRELOAD: "/tmp/evil.so",
+    });
+    expect(env.PATH).toBe("/usr/bin");
+    expect(env.ANTHROPIC_API_KEY).toBe("sk-test");
+    expect(env.GIT_TRACE).toBeUndefined();
+    expect(env.NODE_OPTIONS).toBeUndefined();
+    expect(env.LD_PRELOAD).toBeUndefined();
   });
 
   it("rejects a create that cannot start", () => {

@@ -76,6 +76,71 @@ describe("ACP stdio client errors", () => {
     }
   });
 
+  it("scrubs blocked host env from the harness process", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gb-harness-env-"));
+    dirs.push(dir);
+    const out = join(dir, "env.json");
+    const script = join(dir, "agent.mjs");
+    writeFileSync(
+      script,
+      [
+        "import { writeFileSync } from 'node:fs';",
+        "writeFileSync(process.env.OUT, JSON.stringify({",
+        "  gitTrace: process.env.GIT_TRACE ?? null,",
+        "  nodeOptions: process.env.NODE_OPTIONS ?? null,",
+        "  ldPreload: process.env.LD_PRELOAD ?? null,",
+        "  keep: process.env.KEEP_ME ?? null,",
+        "}));",
+        "setTimeout(() => {}, 500);",
+        "",
+      ].join("\n"),
+    );
+    const prevTrace = process.env.GIT_TRACE;
+    const prevLd = process.env.LD_PRELOAD;
+    process.env.GIT_TRACE = "/tmp/should-not-reach-harness";
+    process.env.LD_PRELOAD = "/tmp/evil.so";
+    try {
+      const client = new AcpStdioClient({
+        harness: { id: "env", name: "env", command: process.execPath, args: [script] },
+        cwd: dir,
+        env: {
+          OUT: out,
+          KEEP_ME: "yes",
+          GIT_TRACE: "/tmp/from-overlay",
+          NODE_OPTIONS: "--require /tmp/nope.js",
+        },
+      });
+      client.start();
+      const deadline = Date.now() + 4_000;
+      let body = "";
+      while (Date.now() < deadline) {
+        try {
+          body = readFileSync(out, "utf8");
+          if (body) break;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      const parsed = JSON.parse(body) as {
+        gitTrace: string | null;
+        nodeOptions: string | null;
+        ldPreload: string | null;
+        keep: string | null;
+      };
+      expect(parsed.keep).toBe("yes");
+      expect(parsed.gitTrace).toBeNull();
+      expect(parsed.nodeOptions).toBeNull();
+      expect(parsed.ldPreload).toBeNull();
+      client.kill();
+    } finally {
+      if (prevTrace === undefined) delete process.env.GIT_TRACE;
+      else process.env.GIT_TRACE = prevTrace;
+      if (prevLd === undefined) delete process.env.LD_PRELOAD;
+      else process.env.LD_PRELOAD = prevLd;
+    }
+  });
+
   it("reports a missing command instead of hanging", async () => {
     const client = new AcpStdioClient({
       harness: {
