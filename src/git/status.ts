@@ -6,6 +6,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { relative, isAbsolute } from "node:path";
+import { isNpmConfigEnv } from "../proc/npm-config-env.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -183,14 +184,20 @@ const STRIPPED_GIT_ENV = new Set([
   "PYTHONINSPECT",
   "PYTHONPATH",
   "PYTHONHOME",
+  // site.ENABLE_USER_SITE loads usercustomize.py from this directory.
+  "PYTHONUSERBASE",
   "PERL5OPT",
   "PERL5LIB",
+  // Older Perl path, same class as PERL5LIB. Not covered by the PERL5* names.
+  "PERLLIB",
   "RUBYOPT",
   "RUBYLIB",
   "BASH_ENV",
   "ENV",
   "SHELLOPTS",
   "BASHOPTS",
+  // zsh reads startup files from here instead of $HOME.
+  "ZDOTDIR",
   "GCONV_PATH",
 ]);
 
@@ -205,6 +212,8 @@ export function gitChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Proce
     // Exported bash functions (`BASH_FUNC_foo%%`) are imported by any bash
     // git starts. Terminals already drop this prefix; git must too.
     if (key.startsWith("BASH_FUNC_")) continue;
+    // npm_config_* is case-insensitive. A helper must not inherit script-shell.
+    if (isNpmConfigEnv(key)) continue;
     env[key] = value;
   }
   env.GIT_TERMINAL_PROMPT = "0";

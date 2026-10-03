@@ -1,10 +1,11 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ensureDirs } from "../src/config/load.js";
 import { SandboxError } from "../src/approval/sandbox.js";
 import { SessionManager } from "../src/session/manager.js";
+import { privateWriteTempPath } from "../src/fs/atomic-write.js";
 import { sessionsRoot, writeSessionMeta, type SessionMeta } from "../src/session/persist.js";
 
 const roots: string[] = [];
@@ -270,6 +271,33 @@ describe("session catalog edges", () => {
     expect(sessions.list().find((s) => s.sessionId === "authed")?.logout).toBe(true);
     expect(readFileSync(join(dir, "authed", "meta.json"), "utf8")).not.toContain("sekret-value");
     expect(readFileSync(leak, "utf8")).toBe("LEAK-OUTSIDE\n");
+  });
+
+  it("refuses a symlink on meta.json or its temp file", () => {
+    const { root, workspace } = useDataDir();
+    const dir = sessionsRoot();
+    const outside = join(root, "outside-meta.json");
+    writeFileSync(outside, "KEEP-OUTSIDE\n");
+
+    const linkedDir = join(dir, "linkedmeta");
+    mkdirSync(linkedDir, { recursive: true });
+    symlinkSync(outside, join(linkedDir, "meta.json"));
+    expect(() => writeSessionMeta(linkedDir, meta(workspace, { sessionId: "linkedmeta" }))).toThrow(
+      /symlink/,
+    );
+    expect(lstatSync(join(linkedDir, "meta.json")).isSymbolicLink()).toBe(true);
+    expect(readFileSync(outside, "utf8")).toBe("KEEP-OUTSIDE\n");
+
+    const tempDir = join(dir, "tempmeta");
+    mkdirSync(tempDir, { recursive: true });
+    const tempLink = privateWriteTempPath(join(tempDir, "meta.json"));
+    symlinkSync(outside, tempLink);
+    expect(() => writeSessionMeta(tempDir, meta(workspace, { sessionId: "tempmeta" }))).toThrow(
+      /symlink/,
+    );
+    expect(lstatSync(tempLink).isSymbolicLink()).toBe(true);
+    expect(readFileSync(outside, "utf8")).toBe("KEEP-OUTSIDE\n");
+    expect(existsSync(join(tempDir, "meta.json"))).toBe(false);
   });
 
   it("skips a mismatched agent session id and a symlinked sessions directory", () => {

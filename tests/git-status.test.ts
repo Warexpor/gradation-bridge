@@ -13,7 +13,8 @@ import {
 } from "../src/git/status.js";
 
 function git(cwd: string, args: string[]): void {
-  execFileSync("git", args, { cwd, stdio: "ignore" });
+  // The suite only needs the commit objects. Do not wait on commit.gpgsign.
+  execFileSync("git", ["-c", "commit.gpgsign=false", ...args], { cwd, stdio: "ignore" });
 }
 
 function restoreEnv(key: string, value: string | undefined): void {
@@ -256,6 +257,12 @@ describe("getGitStatus / getGitDiff", () => {
       BASHOPTS: "extdebug",
       GCONV_PATH: "/tmp/gconv",
       "BASH_FUNC_echo%%": "() {  echo pwned; }",
+      PYTHONUSERBASE: "/tmp/pyuser",
+      ZDOTDIR: "/tmp/zsh",
+      PERLLIB: "/tmp/perl",
+      npm_config_script_shell: "/tmp/evil-sh",
+      NPM_CONFIG_SCRIPT_SHELL: "/tmp/evil-sh",
+      npm_lifecycle_event: "test",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.GIT_EXTERNAL_DIFF).toBeUndefined();
@@ -291,6 +298,12 @@ describe("getGitStatus / getGitDiff", () => {
     expect(env.BASHOPTS).toBeUndefined();
     expect(env.GCONV_PATH).toBeUndefined();
     expect(env["BASH_FUNC_echo%%"]).toBeUndefined();
+    expect(env.PYTHONUSERBASE).toBeUndefined();
+    expect(env.ZDOTDIR).toBeUndefined();
+    expect(env.PERLLIB).toBeUndefined();
+    expect(env.npm_config_script_shell).toBeUndefined();
+    expect(env.NPM_CONFIG_SCRIPT_SHELL).toBeUndefined();
+    expect(env.npm_lifecycle_event).toBe("test");
     expect(env.GIT_CONFIG_COUNT).toBeUndefined();
     expect(env.GIT_CONFIG_KEY_0).toBeUndefined();
     expect(env.GIT_CONFIG_VALUE_0).toBeUndefined();

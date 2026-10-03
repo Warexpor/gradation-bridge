@@ -58,8 +58,17 @@ describe("terminal output limit", () => {
     expect(blockedTerminalEnvName("SSLKEYLOGFILE")).toBe(true);
     expect(blockedTerminalEnvName("OPENSSL_CONF")).toBe(true);
     expect(blockedTerminalEnvName("BASH_FUNC_echo")).toBe(true);
+    expect(blockedTerminalEnvName("PYTHONUSERBASE")).toBe(true);
+    expect(blockedTerminalEnvName("ZDOTDIR")).toBe(true);
+    expect(blockedTerminalEnvName("PERLLIB")).toBe(true);
+    expect(blockedTerminalEnvName("npm_config_script_shell")).toBe(true);
+    expect(blockedTerminalEnvName("NPM_CONFIG_SCRIPT_SHELL")).toBe(true);
+    expect(blockedTerminalEnvName("Npm_Config_script_shell")).toBe(true);
+    expect(blockedTerminalEnvName("npm_config_script-shell")).toBe(true);
     expect(blockedTerminalEnvName("PATH")).toBe(false);
     expect(blockedTerminalEnvName("TERM")).toBe(false);
+    expect(blockedTerminalEnvName("npm_config")).toBe(false);
+    expect(blockedTerminalEnvName("npm_lifecycle_event")).toBe(false);
   });
 
   it("drops blocked names from the inherited host environment", () => {
@@ -74,6 +83,12 @@ describe("terminal output limit", () => {
       DOTNET_STARTUP_HOOKS: "/tmp/hook.dll",
       SSLKEYLOGFILE: "/tmp/keys",
       HOME: "/home/user",
+      PYTHONUSERBASE: "/tmp/pyuser",
+      ZDOTDIR: "/tmp/zsh",
+      PERLLIB: "/tmp/perl",
+      npm_config_script_shell: "/tmp/evil-sh",
+      NPM_CONFIG_SCRIPT_SHELL: "/tmp/evil-sh",
+      npm_lifecycle_event: "test",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.TERM).toBe("xterm");
@@ -85,6 +100,12 @@ describe("terminal output limit", () => {
     expect(env.JAVA_TOOL_OPTIONS).toBeUndefined();
     expect(env.DOTNET_STARTUP_HOOKS).toBeUndefined();
     expect(env.SSLKEYLOGFILE).toBeUndefined();
+    expect(env.PYTHONUSERBASE).toBeUndefined();
+    expect(env.ZDOTDIR).toBeUndefined();
+    expect(env.PERLLIB).toBeUndefined();
+    expect(env.npm_config_script_shell).toBeUndefined();
+    expect(env.NPM_CONFIG_SCRIPT_SHELL).toBeUndefined();
+    expect(env.npm_lifecycle_event).toBe("test");
   });
 
   it("scrubs the same blocked names from harness spawn env", () => {
@@ -96,6 +117,10 @@ describe("terminal output limit", () => {
       LD_PRELOAD: "/tmp/evil.so",
       JAVA_TOOL_OPTIONS: "-javaagent:/tmp/x.jar",
       OPENSSL_CONF: "/tmp/evil.cnf",
+      PYTHONUSERBASE: "/tmp/pyuser",
+      ZDOTDIR: "/tmp/zsh",
+      PERLLIB: "/tmp/perl",
+      Npm_Config_script_shell: "/tmp/evil-sh",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.ANTHROPIC_API_KEY).toBe("sk-test");
@@ -104,6 +129,10 @@ describe("terminal output limit", () => {
     expect(env.LD_PRELOAD).toBeUndefined();
     expect(env.JAVA_TOOL_OPTIONS).toBeUndefined();
     expect(env.OPENSSL_CONF).toBeUndefined();
+    expect(env.PYTHONUSERBASE).toBeUndefined();
+    expect(env.ZDOTDIR).toBeUndefined();
+    expect(env.PERLLIB).toBeUndefined();
+    expect(env.Npm_Config_script_shell).toBeUndefined();
   });
 
   it("rejects a create that cannot start", () => {
