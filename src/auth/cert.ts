@@ -1,9 +1,19 @@
 import { execFileSync } from "node:child_process";
 import { createHash, createPrivateKey, generateKeyPairSync, X509Certificate } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  lstatSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
 import { isIP } from "node:net";
 import { join } from "node:path";
 import { dataDir, ensureDirs } from "../config/load.js";
+import { writePrivateNoFollow } from "../fs/atomic-write.js";
 
 export interface TlsMaterial {
   keyPath: string;
@@ -53,9 +63,45 @@ export function tlsDiagnostics(certPem: string | undefined): {
   };
 }
 
+function tlsSymlinkError(): Error {
+  return new Error("refusing to use a symlinked TLS file");
+}
+
+function lstatOrMissing(path: string): ReturnType<typeof lstatSync> | undefined {
+  try {
+    return lstatSync(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw e;
+  }
+}
+
+/** Missing is fine. A symlink on `server.key` or `server.crt` is refused. */
+function assertNotTlsSymlink(path: string): void {
+  if (lstatOrMissing(path)?.isSymbolicLink()) throw tlsSymlinkError();
+}
+
+/** Read a TLS file without following a final-component symlink. */
+function readTlsFile(path: string): string {
+  assertNotTlsSymlink(path);
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ELOOP") throw tlsSymlinkError();
+    throw e;
+  }
+  try {
+    return readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /**
  * Read the on-disk cert without minting a new one.
  * `stub` means the openssl fallback marker, which must not be pinned.
+ * A symlink on either path is refused instead of followed.
  */
 export function inspectTlsFiles(): {
   certPath: string;
@@ -66,14 +112,16 @@ export function inspectTlsFiles(): {
   detail?: string;
 } {
   const { keyPath, certPath } = certPaths();
-  if (!existsSync(certPath)) return { certPath, state: "missing" };
-  const certPem = readFileSync(certPath, "utf8");
+  assertNotTlsSymlink(keyPath);
+  assertNotTlsSymlink(certPath);
+  if (!lstatOrMissing(certPath)) return { certPath, state: "missing" };
+  const certPem = readTlsFile(certPath);
   const diag = tlsDiagnostics(certPem);
   if (!diag.tls || !diag.certFingerprint) return { certPath, state: "stub" };
-  if (!existsSync(keyPath)) {
+  if (!lstatOrMissing(keyPath)) {
     return { certPath, state: "incomplete", detail: "certificate without a private key" };
   }
-  const problem = tlsPairProblem(readFileSync(keyPath, "utf8"), certPem);
+  const problem = tlsPairProblem(readTlsFile(keyPath), certPem);
   if (problem) return { certPath, state: "invalid", detail: problem, ...(diag.certSan ? { subjectAltName: diag.certSan } : {}) };
   return {
     certPath,
@@ -179,6 +227,34 @@ function tryOpensslSelfSigned(keyPath: string, certPath: string, sans: string[])
 }
 
 /**
+ * Mint into a private directory. `openssl -keyout` / `-out` follow a symlink,
+ * so those flags never receive `server.key` or `server.crt`.
+ */
+function mintOpensslMaterial(sans: string[]): { keyPem: string; certPem: string } | undefined {
+  const scratch = mkdtempSync(join(dataDir(), "certs", ".mint-"));
+  try {
+    chmodSync(scratch, 0o700);
+    const keyOut = join(scratch, "server.key");
+    const certOut = join(scratch, "server.crt");
+    if (!tryOpensslSelfSigned(keyOut, certOut, sans)) return undefined;
+    return {
+      keyPem: readFileSync(keyOut, "utf8"),
+      certPem: readFileSync(certOut, "utf8"),
+    };
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+/** Install key and cert. `O_NOFOLLOW` refuses a symlink on either path. */
+function installTlsMaterial(keyPath: string, certPath: string, keyPem: string, certPem: string): void {
+  assertNotTlsSymlink(keyPath);
+  assertNotTlsSymlink(certPath);
+  writePrivateNoFollow(keyPath, keyPem);
+  writePrivateNoFollow(certPath, certPem);
+}
+
+/**
  * Ensure TLS key+cert exist under the data dir. Prefers openssl for a real
  * self-signed cert (no extra npm deps). Falls back to writing an RSA key and
  * leaving a stub cert marker if openssl is missing.
@@ -187,16 +263,18 @@ export function ensureTlsMaterial(opts?: { bindHost?: string }): TlsMaterial {
   ensureDirs();
   const { keyPath, certPath } = certPaths();
   const sans = tlsSubjectAltNames(opts?.bindHost);
+  assertNotTlsSymlink(keyPath);
+  assertNotTlsSymlink(certPath);
 
-  if (existsSync(certPath)) {
-    const certPem = readFileSync(certPath, "utf8");
+  if (lstatOrMissing(certPath)) {
+    const certPem = readTlsFile(certPath);
     if (certPem.includes("BEGIN CERTIFICATE")) {
-      if (!existsSync(keyPath)) {
+      if (!lstatOrMissing(keyPath)) {
         throw new Error(
           `TLS certificate has no private key (${certPath}). Delete server.crt to mint a new pair. Refusing to replace a cert a phone may already have pinned.`,
         );
       }
-      const keyPem = readFileSync(keyPath, "utf8");
+      const keyPem = readTlsFile(keyPath);
       const problem = tlsPairProblem(keyPem, certPem);
       if (problem) {
         throw new Error(
@@ -219,18 +297,18 @@ export function ensureTlsMaterial(opts?: { bindHost?: string }): TlsMaterial {
     }
   }
 
-  if (tryOpensslSelfSigned(keyPath, certPath, sans)) {
-    const keyPem = readFileSync(keyPath, "utf8");
-    const certPem = readFileSync(certPath, "utf8");
-    const sanWarning = opts?.bindHost && !bindHostCoveredByCert(certPem, opts.bindHost)
+  const minted = mintOpensslMaterial(sans);
+  if (minted) {
+    installTlsMaterial(keyPath, certPath, minted.keyPem, minted.certPem);
+    const sanWarning = opts?.bindHost && !bindHostCoveredByCert(minted.certPem, opts.bindHost)
       ? `Cert has no SAN for ${opts.bindHost}. Phones may reject TLS. The pinned cert was left in place.`
       : undefined;
     return {
       keyPath,
       certPath,
-      keyPem,
-      certPem,
-      fingerprintSha256: fingerprintOfPem(certPem),
+      keyPem: minted.keyPem,
+      certPem: minted.certPem,
+      fingerprintSha256: fingerprintOfPem(minted.certPem),
       usable: true,
       ...(sanWarning ? { sanWarning } : {}),
       created: true,
@@ -242,10 +320,9 @@ export function ensureTlsMaterial(opts?: { bindHost?: string }): TlsMaterial {
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
     publicKeyEncoding: { type: "spki", format: "pem" },
   });
-  writeFileSync(keyPath, privateKey, { mode: 0o600 });
   const stub =
     "# openssl not found; install openssl and delete this file to mint a self-signed cert\n";
-  writeFileSync(certPath, stub, { mode: 0o600 });
+  installTlsMaterial(keyPath, certPath, privateKey, stub);
   return {
     keyPath,
     certPath,

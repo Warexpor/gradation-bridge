@@ -65,6 +65,13 @@ describe("terminal output limit", () => {
     expect(blockedTerminalEnvName("NPM_CONFIG_SCRIPT_SHELL")).toBe(true);
     expect(blockedTerminalEnvName("Npm_Config_script_shell")).toBe(true);
     expect(blockedTerminalEnvName("npm_config_script-shell")).toBe(true);
+    expect(blockedTerminalEnvName("GOFLAGS")).toBe(true);
+    expect(blockedTerminalEnvName("RUSTC")).toBe(true);
+    expect(blockedTerminalEnvName("RUSTC_WRAPPER")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_BUILD_RUSTC")).toBe(true);
+    expect(blockedTerminalEnvName("NODE_V8_COVERAGE")).toBe(true);
+    expect(blockedTerminalEnvName("NODE_REDIRECT_WARNINGS")).toBe(true);
+    expect(blockedTerminalEnvName("NODE_COMPILE_CACHE")).toBe(true);
     expect(blockedTerminalEnvName("PATH")).toBe(false);
     expect(blockedTerminalEnvName("TERM")).toBe(false);
     expect(blockedTerminalEnvName("npm_config")).toBe(false);
@@ -89,6 +96,15 @@ describe("terminal output limit", () => {
       npm_config_script_shell: "/tmp/evil-sh",
       NPM_CONFIG_SCRIPT_SHELL: "/tmp/evil-sh",
       npm_lifecycle_event: "test",
+      GOFLAGS: "-toolexec=/tmp/evil",
+      RUSTC: "/tmp/rustc",
+      RUSTC_WRAPPER: "/tmp/wrap",
+      CARGO_BUILD_RUSTC: "/tmp/rustc",
+      NODE_V8_COVERAGE: "/tmp/cov",
+      NODE_REDIRECT_WARNINGS: "/tmp/warnings",
+      NODE_COMPILE_CACHE: "/tmp/cache",
+      RUSTFLAGS: "-C debuginfo=0",
+      NODE_DEBUG: "http",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.TERM).toBe("xterm");
@@ -106,6 +122,15 @@ describe("terminal output limit", () => {
     expect(env.npm_config_script_shell).toBeUndefined();
     expect(env.NPM_CONFIG_SCRIPT_SHELL).toBeUndefined();
     expect(env.npm_lifecycle_event).toBe("test");
+    expect(env.GOFLAGS).toBeUndefined();
+    expect(env.RUSTC).toBeUndefined();
+    expect(env.RUSTC_WRAPPER).toBeUndefined();
+    expect(env.CARGO_BUILD_RUSTC).toBeUndefined();
+    expect(env.NODE_V8_COVERAGE).toBeUndefined();
+    expect(env.NODE_REDIRECT_WARNINGS).toBeUndefined();
+    expect(env.NODE_COMPILE_CACHE).toBeUndefined();
+    expect(env.RUSTFLAGS).toBe("-C debuginfo=0");
+    expect(env.NODE_DEBUG).toBe("http");
   });
 
   it("scrubs the same blocked names from harness spawn env", () => {
@@ -121,6 +146,12 @@ describe("terminal output limit", () => {
       ZDOTDIR: "/tmp/zsh",
       PERLLIB: "/tmp/perl",
       Npm_Config_script_shell: "/tmp/evil-sh",
+      GOFLAGS: "-toolexec=/tmp/evil",
+      RUSTC_WRAPPER: "/tmp/wrap",
+      CARGO_BUILD_RUSTC: "/tmp/rustc",
+      NODE_V8_COVERAGE: "/tmp/cov",
+      NODE_REDIRECT_WARNINGS: "/tmp/warnings",
+      NODE_COMPILE_CACHE: "/tmp/cache",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.ANTHROPIC_API_KEY).toBe("sk-test");
@@ -133,6 +164,12 @@ describe("terminal output limit", () => {
     expect(env.ZDOTDIR).toBeUndefined();
     expect(env.PERLLIB).toBeUndefined();
     expect(env.Npm_Config_script_shell).toBeUndefined();
+    expect(env.GOFLAGS).toBeUndefined();
+    expect(env.RUSTC_WRAPPER).toBeUndefined();
+    expect(env.CARGO_BUILD_RUSTC).toBeUndefined();
+    expect(env.NODE_V8_COVERAGE).toBeUndefined();
+    expect(env.NODE_REDIRECT_WARNINGS).toBeUndefined();
+    expect(env.NODE_COMPILE_CACHE).toBeUndefined();
   });
 
   it("rejects a create that cannot start", () => {

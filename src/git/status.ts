@@ -178,6 +178,10 @@ const STRIPPED_GIT_ENV = new Set([
   "NODE_OPTIONS",
   "NODE_PATH",
   "NODE_REPL_EXTERNAL_MODULE",
+  // Node writes coverage JSON, warning logs, and a compile cache to these paths.
+  "NODE_V8_COVERAGE",
+  "NODE_REDIRECT_WARNINGS",
+  "NODE_COMPILE_CACHE",
   // Interpreter / shell startup hooks — same class as harness/terminal scrub.
   // A phone-triggered git helper must not inherit bridge-process PYTHON*/PERL*/…
   "PYTHONSTARTUP",
@@ -199,6 +203,13 @@ const STRIPPED_GIT_ENV = new Set([
   // zsh reads startup files from here instead of $HOME.
   "ZDOTDIR",
   "GCONV_PATH",
+  // Go and Cargo startup hooks. GOFLAGS=-toolexec=… runs during go build.
+  // RUSTC replaces the compiler. RUSTC_WRAPPER and CARGO_BUILD_RUSTC run
+  // during cargo build.
+  "GOFLAGS",
+  "RUSTC",
+  "RUSTC_WRAPPER",
+  "CARGO_BUILD_RUSTC",
 ]);
 
 /** Child env for git. Drops variables that can name a program or inject config. */
