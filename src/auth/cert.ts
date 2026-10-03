@@ -115,6 +115,20 @@ function readMintedNoFollow(path: string): string | undefined {
   }
 }
 
+/**
+ * A private key other users can read is not safe to keep serving.
+ * The certificate may be world-readable. Group and other bits on the key are not.
+ */
+function assertOwnerOnlyKey(path: string): void {
+  const info = lstatOrMissing(path);
+  if (!info || info.isSymbolicLink() || !info.isFile()) return;
+  if ((Number(info.mode) & 0o077) !== 0) {
+    throw new Error(
+      `TLS private key is readable by other users (${path}). chmod 600 the file. Refusing to start with a key other accounts can read.`,
+    );
+  }
+}
+
 /** Read a TLS file without following a final-component symlink. */
 function readTlsFile(path: string): string {
   if (!assertTlsPath(path)) {
@@ -161,6 +175,7 @@ export function inspectTlsFiles(): {
   if (!assertTlsPath(keyPath)) {
     return { certPath, state: "incomplete", detail: "certificate without a private key" };
   }
+  assertOwnerOnlyKey(keyPath);
   const problem = tlsPairProblem(readTlsFile(keyPath), certPem);
   if (problem) return { certPath, state: "invalid", detail: problem, ...(diag.certSan ? { subjectAltName: diag.certSan } : {}) };
   return {
@@ -196,12 +211,23 @@ export function bindHostCoveredByCert(certPem: string, bindHost: string): boolea
   return cert.checkHost(bare) != null;
 }
 
+/**
+ * SHA-256 of the leaf certificate DER, lowercase hex.
+ * A PEM chain is more than one certificate. Hashing every block together
+ * does not match the leaf the phone sees on the TLS handshake.
+ */
 export function fingerprintOfPem(certPem: string): string {
-  const b64 = certPem
-    .replace(/-----BEGIN CERTIFICATE-----/g, "")
-    .replace(/-----END CERTIFICATE-----/g, "")
-    .replace(/\s+/g, "");
-  const der = Buffer.from(b64, "base64");
+  try {
+    const fp = new X509Certificate(certPem).fingerprint256;
+    if (fp) return fp.replace(/:/g, "").toLowerCase();
+  } catch {
+    // Not a certificate Node can parse. Callers treat an empty fingerprint
+    // as "no pin" only when the PEM has no certificate block at all.
+  }
+  const match = /-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/.exec(certPem);
+  if (!match?.[1]) return "";
+  const der = Buffer.from(match[1], "base64");
+  if (der.length === 0) return "";
   return createHash("sha256").update(der).digest("hex");
 }
 
@@ -345,6 +371,7 @@ export function ensureTlsMaterial(opts?: { bindHost?: string }): TlsMaterial {
           `TLS certificate has no private key (${certPath}). Delete server.crt to mint a new pair. Refusing to replace a cert a phone may already have pinned.`,
         );
       }
+      assertOwnerOnlyKey(keyPath);
       const keyPem = readTlsFile(keyPath);
       const problem = tlsPairProblem(keyPem, certPem);
       if (problem) {

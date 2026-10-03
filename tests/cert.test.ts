@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { generateKeyPairSync } from "node:crypto";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { generateKeyPairSync, X509Certificate } from "node:crypto";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { bindHostCoveredByCert, ensureTlsMaterial, inspectTlsFiles, tlsSubjectAltNames } from "../src/auth/cert.js";
+import { bindHostCoveredByCert, ensureTlsMaterial, fingerprintOfPem, inspectTlsFiles, tlsSubjectAltNames } from "../src/auth/cert.js";
 
 const restores: Array<() => void> = [];
 
@@ -256,5 +256,60 @@ describe("tls subject alt names", () => {
     execFileSync("mkfifo", [join(certDir, "server.crt")]);
     expect(() => inspectTlsFiles()).toThrow(/non-regular/);
     expect(() => ensureTlsMaterial()).toThrow(/non-regular/);
+  });
+
+  it("pins the leaf certificate when server.crt holds a chain", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-cert-chain-"));
+    const prevConfig = process.env.XDG_CONFIG_HOME;
+    const prevData = process.env.XDG_DATA_HOME;
+    process.env.XDG_CONFIG_HOME = join(root, "config");
+    process.env.XDG_DATA_HOME = join(root, "data");
+    mkdirSync(process.env.XDG_CONFIG_HOME, { recursive: true });
+    mkdirSync(process.env.XDG_DATA_HOME, { recursive: true });
+    restores.push(() => {
+      if (prevConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prevConfig;
+      if (prevData === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevData;
+    });
+
+    const tls = ensureTlsMaterial({ bindHost: "127.0.0.1" });
+    const leaf = new X509Certificate(tls.certPem).fingerprint256.replace(/:/g, "").toLowerCase();
+    expect(fingerprintOfPem(tls.certPem)).toBe(leaf);
+    const chain = `${tls.certPem.trim()}\n${tls.certPem.trim()}\n`;
+    expect(fingerprintOfPem(chain)).toBe(leaf);
+    writeFileSync(tls.certPath, chain, { mode: 0o644 });
+    const inspected = inspectTlsFiles();
+    expect(inspected.state).toBe("ready");
+    expect(inspected.fingerprintSha256).toBe(leaf);
+  });
+
+  it("refuses a private key other users can read and still serves a public cert", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-cert-mode-"));
+    const prevConfig = process.env.XDG_CONFIG_HOME;
+    const prevData = process.env.XDG_DATA_HOME;
+    process.env.XDG_CONFIG_HOME = join(root, "config");
+    process.env.XDG_DATA_HOME = join(root, "data");
+    mkdirSync(process.env.XDG_CONFIG_HOME, { recursive: true });
+    mkdirSync(process.env.XDG_DATA_HOME, { recursive: true });
+    restores.push(() => {
+      if (prevConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prevConfig;
+      if (prevData === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevData;
+    });
+
+    const tls = ensureTlsMaterial({ bindHost: "127.0.0.1" });
+    chmodSync(tls.certPath, 0o644);
+    expect(inspectTlsFiles().state).toBe("ready");
+    chmodSync(tls.keyPath, 0o640);
+    expect(() => ensureTlsMaterial()).toThrow(/readable by other users/);
+    expect(() => inspectTlsFiles()).toThrow(/readable by other users/);
+    expect(readFileSync(tls.keyPath, "utf8")).toBe(tls.keyPem);
+    expect(readFileSync(tls.certPath, "utf8")).toBe(tls.certPem);
+    chmodSync(tls.keyPath, 0o600);
+    const again = ensureTlsMaterial({ bindHost: "127.0.0.1" });
+    expect(again.created).toBe(false);
+    expect(again.fingerprintSha256).toBe(tls.fingerprintSha256);
   });
 });

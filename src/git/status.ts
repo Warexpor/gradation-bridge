@@ -7,6 +7,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { relative, isAbsolute } from "node:path";
 import { isNpmConfigEnv } from "../proc/npm-config-env.js";
+import { blockedTerminalEnvName } from "../session/terminals.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -251,6 +252,8 @@ export function gitChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Proce
   for (const [key, value] of Object.entries(base)) {
     if (value === undefined) continue;
     if (STRIPPED_GIT_ENV.has(key)) continue;
+    // Same program hooks as harness and terminal children (rustdoc, CC, …).
+    if (blockedTerminalEnvName(key)) continue;
     if (key.startsWith("GIT_CONFIG_KEY_") || key.startsWith("GIT_CONFIG_VALUE_")) continue;
     if (key.startsWith("GIT_TRACE")) continue;
     if (isCargoTargetHookEnv(key)) continue;
