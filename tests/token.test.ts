@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,6 +7,7 @@ import {
   revokeDevice,
   verifyBearerToken,
 } from "../src/auth/token.js";
+import { privateWriteTempPath } from "../src/fs/atomic-write.js";
 
 const restores: Array<() => void> = [];
 
@@ -50,5 +51,31 @@ describe("bearer tokens", () => {
     expect(() => ensurePrimaryToken()).toThrow(/corrupt/);
     expect(readFileSync(path, "utf8")).toBe("{not-json");
     expect(verifyBearerToken("anything")).toBe(false);
+  });
+
+  it("refuses a symlink planted on devices.json", () => {
+    const root = withEnv();
+    const dir = join(root, "config", "gradation-bridge");
+    mkdirSync(dir, { recursive: true });
+    const dest = join(dir, "devices.json");
+    const outside = join(root, "outside-devices.json");
+    writeFileSync(outside, '{"devices":[]}\n');
+    symlinkSync(outside, dest);
+    expect(() => ensurePrimaryToken()).toThrow(/symlink/);
+    expect(lstatSync(dest).isSymbolicLink()).toBe(true);
+    expect(readFileSync(outside, "utf8")).toBe('{"devices":[]}\n');
+  });
+
+  it("refuses a symlink planted on the devices temp file", () => {
+    const root = withEnv();
+    const dir = join(root, "config", "gradation-bridge");
+    mkdirSync(dir, { recursive: true });
+    const tempLink = privateWriteTempPath(join(dir, "devices.json"));
+    const leaked = join(root, "leaked-devices.json");
+    writeFileSync(leaked, "KEEP\n");
+    symlinkSync(leaked, tempLink);
+    expect(() => ensurePrimaryToken()).toThrow(/symlink/);
+    expect(lstatSync(tempLink).isSymbolicLink()).toBe(true);
+    expect(readFileSync(leaked, "utf8")).toBe("KEEP\n");
   });
 });

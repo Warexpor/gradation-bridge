@@ -12,14 +12,13 @@ import {
   openSync,
   readdirSync,
   readFileSync,
-  renameSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import type { ToolGrant } from "../approval/grants.js";
 import { dataDir } from "../config/load.js";
+import { writePrivateNoFollow } from "../fs/atomic-write.js";
 import { log } from "../log/diagnostics.js";
 import { compareRecentSession, isSafeSessionId } from "./ids.js";
 import { MAX_CATALOG_BYTES, MAX_CLOSED_SESSIONS } from "./limits.js";
@@ -98,9 +97,7 @@ export function writeSessionMeta(dir: string, meta: SessionMeta): void {
     throw new Error("refusing to persist a session through a symlink");
   }
   const dest = join(dir, "meta.json");
-  const tmp = join(dir, `.meta.${process.pid}.tmp`);
-  writeFileSync(tmp, JSON.stringify(meta) + "\n", { mode: 0o600 });
-  renameSync(tmp, dest);
+  writePrivateNoFollow(dest, JSON.stringify(meta) + "\n");
 }
 
 /** Newest first. Closed sessions and corrupt files are skipped. */

@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
+import { writePrivateNoFollow } from "../fs/atomic-write.js";
 import { type BridgeConfig, defaultConfig } from "./types.js";
 
 const HarnessSchema = z
@@ -56,7 +57,7 @@ export function loadConfig(): BridgeConfig {
   const path = configPath();
   if (!existsSync(path)) {
     const cfg = defaultConfig();
-    writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
+    writePrivateNoFollow(path, JSON.stringify(cfg, null, 2) + "\n");
     return cfg;
   }
   let parsedJson: unknown;
@@ -86,5 +87,5 @@ export function loadConfig(): BridgeConfig {
 
 export function saveConfig(cfg: BridgeConfig): void {
   ensureDirs();
-  writeFileSync(configPath(), JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
+  writePrivateNoFollow(configPath(), JSON.stringify(cfg, null, 2) + "\n");
 }

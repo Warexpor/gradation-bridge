@@ -9,6 +9,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { isNpmConfigEnv } from "../proc/npm-config-env.js";
 import { killProcessTree } from "../proc/tree.js";
 
 const KILL_GRACE_MS = 2_000;
@@ -161,10 +162,16 @@ const BLOCKED_TERMINAL_ENV = new Set([
   "PYTHONINSPECT",
   "PYTHONPATH",
   "PYTHONHOME",
+  // site.ENABLE_USER_SITE loads usercustomize.py from this directory.
+  "PYTHONUSERBASE",
   "PERL5OPT",
   "PERL5LIB",
+  // Older Perl path, same class as PERL5LIB. Not covered by the PERL5* names.
+  "PERLLIB",
   "RUBYOPT",
   "RUBYLIB",
+  // zsh reads startup files from here instead of $HOME.
+  "ZDOTDIR",
   "GCONV_PATH",
 ]);
 
@@ -173,6 +180,8 @@ export function blockedTerminalEnvName(name: string): boolean {
   if (name.startsWith("GIT_CONFIG_KEY_") || name.startsWith("GIT_CONFIG_VALUE_")) return true;
   if (name.startsWith("GIT_TRACE")) return true;
   if (name.startsWith("BASH_FUNC_")) return true;
+  // Any case: npm folds NPM_CONFIG_* into the same table as npm_config_*.
+  if (isNpmConfigEnv(name)) return true;
   return false;
 }
 

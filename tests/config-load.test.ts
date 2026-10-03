@@ -1,8 +1,10 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadConfig } from "../src/config/load.js";
+import { loadConfig, saveConfig } from "../src/config/load.js";
+import { defaultConfig } from "../src/config/types.js";
+import { privateWriteTempPath } from "../src/fs/atomic-write.js";
 
 const dirs: string[] = [];
 const prevConfig = process.env.XDG_CONFIG_HOME;
@@ -53,5 +55,27 @@ describe("loadConfig", () => {
     mkdirSync(join(path, ".."), { recursive: true });
     writeFileSync(path, "{");
     expect(() => loadConfig()).toThrow(/Invalid JSON/);
+  });
+
+  it("refuses a symlink on config.json or its temp file", () => {
+    const path = useEnv();
+    const dir = join(path, "..");
+    mkdirSync(dir, { recursive: true });
+    const outside = join(dir, "..", "outside-config.json");
+    writeFileSync(outside, "KEEP\n");
+    symlinkSync(outside, path);
+    expect(() => saveConfig(defaultConfig())).toThrow(/symlink/);
+    expect(lstatSync(path).isSymbolicLink()).toBe(true);
+    expect(readFileSync(outside, "utf8")).toBe("KEEP\n");
+
+    const fresh = useEnv();
+    mkdirSync(join(fresh, ".."), { recursive: true });
+    const leaked = join(fresh, "..", "..", "leaked-config.json");
+    writeFileSync(leaked, "KEEP\n");
+    const tempLink = privateWriteTempPath(fresh);
+    symlinkSync(leaked, tempLink);
+    expect(() => loadConfig()).toThrow(/symlink/);
+    expect(lstatSync(tempLink).isSymbolicLink()).toBe(true);
+    expect(readFileSync(leaked, "utf8")).toBe("KEEP\n");
   });
 });
