@@ -66,6 +66,24 @@ describe("bearer tokens", () => {
     expect(readFileSync(outside, "utf8")).toBe('{"devices":[]}\n');
   });
 
+  it("does not accept a token behind a devices.json symlink", () => {
+    const root = withEnv();
+    const dir = join(root, "config", "gradation-bridge");
+    mkdirSync(dir, { recursive: true });
+    const outside = join(root, "outside-devices.json");
+    const token = "ab".repeat(32);
+    writeFileSync(
+      outside,
+      JSON.stringify({
+        devices: [{ id: "attacker", token, createdAt: "2020-01-01T00:00:00.000Z" }],
+      }),
+    );
+    symlinkSync(outside, join(dir, "devices.json"));
+    expect(() => ensurePrimaryToken()).toThrow(/symlink/);
+    expect(verifyBearerToken(token)).toBe(false);
+    expect(readFileSync(outside, "utf8")).toContain(token);
+  });
+
   it("refuses a symlink planted on the devices temp file", () => {
     const root = withEnv();
     const dir = join(root, "config", "gradation-bridge");

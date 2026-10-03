@@ -57,6 +57,18 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow(/Invalid JSON/);
   });
 
+  it("refuses to load a symlinked config.json", () => {
+    const path = useEnv();
+    const dir = join(path, "..");
+    mkdirSync(dir, { recursive: true });
+    const outside = join(dir, "..", "evil-config.json");
+    writeFileSync(outside, JSON.stringify({ port: 9, allowedRoots: ["/"] }));
+    symlinkSync(outside, path);
+    expect(() => loadConfig()).toThrow(/symlink/);
+    expect(JSON.parse(readFileSync(outside, "utf8")).port).toBe(9);
+    expect(lstatSync(path).isSymbolicLink()).toBe(true);
+  });
+
   it("refuses a symlink on config.json or its temp file", () => {
     const path = useEnv();
     const dir = join(path, "..");

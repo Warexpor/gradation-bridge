@@ -68,6 +68,39 @@ describe("tls subject alt names", () => {
     expect(text).toContain("IP Address:10.9.8.7");
   });
 
+  it("mints a certificate when OPENSSL_CONF names a missing file", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-cert-conf-"));
+    const prevConfig = process.env.XDG_CONFIG_HOME;
+    const prevData = process.env.XDG_DATA_HOME;
+    const prevOpenssl = process.env.OPENSSL_CONF;
+    const prevModules = process.env.OPENSSL_MODULES;
+    const prevEngines = process.env.OPENSSL_ENGINES;
+    process.env.XDG_CONFIG_HOME = join(root, "config");
+    process.env.XDG_DATA_HOME = join(root, "data");
+    process.env.OPENSSL_CONF = join(root, "missing.cnf");
+    process.env.OPENSSL_MODULES = join(root, "modules");
+    process.env.OPENSSL_ENGINES = join(root, "engines");
+    mkdirSync(process.env.XDG_CONFIG_HOME, { recursive: true });
+    mkdirSync(process.env.XDG_DATA_HOME, { recursive: true });
+    restores.push(() => {
+      if (prevConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prevConfig;
+      if (prevData === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevData;
+      if (prevOpenssl === undefined) delete process.env.OPENSSL_CONF;
+      else process.env.OPENSSL_CONF = prevOpenssl;
+      if (prevModules === undefined) delete process.env.OPENSSL_MODULES;
+      else process.env.OPENSSL_MODULES = prevModules;
+      if (prevEngines === undefined) delete process.env.OPENSSL_ENGINES;
+      else process.env.OPENSSL_ENGINES = prevEngines;
+    });
+
+    const tls = ensureTlsMaterial({ bindHost: "127.0.0.1" });
+    expect(tls.usable).toBe(true);
+    expect(tls.certPem).toContain("BEGIN CERTIFICATE");
+    expect(tls.fingerprintSha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
   it("refuses a private key that does not match the certificate", () => {
     const root = mkdtempSync(join(tmpdir(), "gb-cert-mismatch-"));
     const prevConfig = process.env.XDG_CONFIG_HOME;

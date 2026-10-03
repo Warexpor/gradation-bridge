@@ -1,8 +1,8 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { writePrivateNoFollow } from "../fs/atomic-write.js";
+import { readPrivateNoFollow, writePrivateNoFollow } from "../fs/atomic-write.js";
 import { type BridgeConfig, defaultConfig } from "./types.js";
 
 const HarnessSchema = z
@@ -55,14 +55,20 @@ export function ensureDirs(): void {
 export function loadConfig(): BridgeConfig {
   ensureDirs();
   const path = configPath();
-  if (!existsSync(path)) {
-    const cfg = defaultConfig();
-    writePrivateNoFollow(path, JSON.stringify(cfg, null, 2) + "\n");
-    return cfg;
+  let text: string;
+  try {
+    text = readPrivateNoFollow(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+      const cfg = defaultConfig();
+      writePrivateNoFollow(path, JSON.stringify(cfg, null, 2) + "\n");
+      return cfg;
+    }
+    throw e;
   }
   let parsedJson: unknown;
   try {
-    parsedJson = JSON.parse(readFileSync(path, "utf8"));
+    parsedJson = JSON.parse(text);
   } catch (e) {
     const detail = e instanceof Error ? e.message : String(e);
     throw new Error(`Invalid JSON in ${path}: ${detail}`);
