@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -46,6 +46,29 @@ describe("parsePorcelainStatus", () => {
     expect(r.ahead).toBe(0);
     expect(r.behind).toBe(0);
     expect(r.files).toEqual([]);
+  });
+
+  it("keeps dots in branch names and unborn headers", () => {
+    const dotted = parsePorcelainStatus("## feature.2...main [ahead 1]\n");
+    expect(dotted.branch).toBe("feature.2");
+    expect(dotted.ahead).toBe(1);
+    expect(dotted.behind).toBe(0);
+
+    const release = parsePorcelainStatus("## release/1.2.3\n M a.txt\n");
+    expect(release.branch).toBe("release/1.2.3");
+    expect(release.files).toEqual([{ path: "a.txt", status: " M" }]);
+
+    const unborn = parsePorcelainStatus("## No commits yet on release/1.2\n");
+    expect(unborn.branch).toBe("release/1.2");
+    expect(parsePorcelainStatus("## Initial commit on master\n").branch).toBe("master");
+    expect(parsePorcelainStatus("## HEAD (no branch)\n").branch).toBe("HEAD");
+
+    const both = parsePorcelainStatus(
+      "## feature.1...origin/feature.1 [ahead 2, behind 3]\n",
+    );
+    expect(both.branch).toBe("feature.1");
+    expect(both.ahead).toBe(2);
+    expect(both.behind).toBe(3);
   });
 });
 
@@ -228,9 +251,48 @@ describe("getGitStatus / getGitDiff", () => {
     expect(env.GIT_CONFIG_VALUE_0).toBeUndefined();
     expect(env.GIT_PAGER).toBe("");
     expect(env.GIT_CONFIG_NOSYSTEM).toBe("1");
+    expect(env.GIT_NO_LAZY_FETCH).toBe("1");
+    expect(gitChildEnv({ GIT_NO_LAZY_FETCH: "0", PATH: "/usr/bin" }).GIT_NO_LAZY_FETCH).toBe("1");
     expect(guardedGitArgs(["status"], ["filter.lfs.clean"])).toEqual(
       expect.arrayContaining(["-c", "filter.lfs.clean="]),
     );
+  });
+
+  it("does not lazy-fetch a promisor ext:: remote", async () => {
+    tmp = mkdtempSync(join(tmpdir(), "gb-git-promisor-"));
+    const origin = join(tmp, "origin");
+    const clone = join(tmp, "clone");
+    const marker = join(tmp, "ran");
+    const script = join(tmp, "ext.sh");
+    mkdirSync(origin);
+    writeFileSync(script, `#!/bin/sh\necho RAN >> ${JSON.stringify(marker)}\nexit 0\n`);
+    chmodSync(script, 0o755);
+    git(origin, ["init", "-b", "main"]);
+    git(origin, ["config", "user.email", "test@example.com"]);
+    git(origin, ["config", "user.name", "Test"]);
+    writeFileSync(join(origin, "a.txt"), "hello\n");
+    git(origin, ["add", "a.txt"]);
+    git(origin, ["commit", "-m", "init"]);
+    execFileSync("git", ["clone", "--no-local", origin, clone], { cwd: tmp, stdio: "ignore" });
+    const blob = execFileSync("git", ["rev-parse", "HEAD:a.txt"], { cwd: clone, encoding: "utf8" }).trim();
+    const packDir = execFileSync("git", ["rev-parse", "--git-path", "objects/pack"], {
+      cwd: clone,
+      encoding: "utf8",
+    }).trim();
+    const packAbs = packDir.startsWith("/") ? packDir : join(clone, packDir);
+    for (const name of readdirSync(packAbs).filter((entry) => entry.endsWith(".pack"))) {
+      execFileSync("git", ["unpack-objects"], { cwd: clone, input: readFileSync(join(packAbs, name)) });
+    }
+    for (const name of readdirSync(packAbs)) rmSync(join(packAbs, name));
+    rmSync(join(clone, ".git", "objects", blob.slice(0, 2), blob.slice(2)), { force: true });
+    git(clone, ["config", "remote.origin.promisor", "true"]);
+    git(clone, ["config", "extensions.partialclone", "origin"]);
+    git(clone, ["remote", "set-url", "origin", `ext::${script}`]);
+    git(clone, ["config", "protocol.ext.allow", "always"]);
+
+    await getGitStatus(clone);
+    await getGitDiff(clone, "a.txt");
+    expect(existsSync(marker)).toBe(false);
   });
 
   it("does not write through an inherited GIT_TRACE sink", async () => {

@@ -20,6 +20,7 @@ import {
   elicitationSupportFromInitialize,
   ElicitationRejected,
   mergeInitializeElicitation,
+  elicitationIdString,
   relayElicitationParams,
   sanitizeElicitationResponse,
 } from "../acp/elicitation.js";
@@ -2090,8 +2091,8 @@ export class SessionManager {
 
   private forwardElicitationComplete(params: unknown): void {
     if (!params || typeof params !== "object") return;
-    const id = (params as { elicitationId?: unknown }).elicitationId;
-    if (typeof id !== "string" || !id || id.length > 200) return;
+    const id = elicitationIdString((params as { elicitationId?: unknown }).elicitationId);
+    if (!id) return;
     this.opts.broadcast?.({
       jsonrpc: "2.0",
       method: "elicitation/complete",

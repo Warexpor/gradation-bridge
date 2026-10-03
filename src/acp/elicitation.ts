@@ -6,6 +6,7 @@
  */
 
 import { isIP } from "node:net";
+import { wireIdString } from "./wire-id.js";
 
 export interface ElicitationSupport {
   form: boolean;
@@ -248,11 +249,20 @@ function assertFieldSchema(value: unknown): void {
   }
 }
 
+/** Canonical digit-string elicitation id. Spaces stay invalid. */
+export function elicitationIdString(value: unknown): string | undefined {
+  const id = wireIdString(value);
+  if (!id || /\s/.test(id)) return undefined;
+  return id;
+}
+
 function assertUrl(raw: Record<string, unknown>): void {
-  const id = raw.elicitationId;
-  if (typeof id !== "string" || !id || id.length > 200 || /[\s\u0000]/.test(id)) {
+  // Digit-string ids arrive as JSON numbers or `"5.0"`, same as methodId.
+  const id = elicitationIdString(raw.elicitationId);
+  if (!id) {
     throw new ElicitationRejected("elicitationId is invalid");
   }
+  raw.elicitationId = id;
   const urlText = raw.url;
   if (typeof urlText !== "string" || urlText.length > 2048) {
     throw new ElicitationRejected("elicitation url is invalid");
