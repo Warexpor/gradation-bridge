@@ -90,6 +90,21 @@ describe("terminal output limit", () => {
     expect(blockedTerminalEnvName("DYLD_VERSIONED_LIBRARY_PATH")).toBe(true);
     expect(blockedTerminalEnvName("DYLD_VERSIONED_FRAMEWORK_PATH")).toBe(true);
     expect(blockedTerminalEnvName("CARGO_TARGET_DIR")).toBe(false);
+    expect(blockedTerminalEnvName("RUSTFLAGS")).toBe(false);
+    expect(blockedTerminalEnvName("RUSTDOCFLAGS")).toBe(false);
+    expect(blockedTerminalEnvName("RUSTDOC")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_BUILD_RUSTDOC")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_BUILD_RUSTDOCFLAGS")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_ENCODED_RUSTDOCFLAGS")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTDOCFLAGS")).toBe(true);
+    expect(blockedTerminalEnvName("CC")).toBe(true);
+    expect(blockedTerminalEnvName("CXX")).toBe(true);
+    expect(blockedTerminalEnvName("HOST_CC")).toBe(true);
+    expect(blockedTerminalEnvName("GIT_TEMPLATE_DIR")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_REGISTRY_CREDENTIAL_PROVIDER")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_REGISTRIES_CRATES_IO_CREDENTIAL_PROVIDER")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_CREDENTIAL_ALIAS_MY_ALIAS")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_REGISTRIES_CRATES_IO_INDEX")).toBe(false);
     expect(blockedTerminalEnvName("PATH")).toBe(false);
     expect(blockedTerminalEnvName("TERM")).toBe(false);
     expect(blockedTerminalEnvName("npm_config")).toBe(false);
@@ -139,6 +154,19 @@ describe("terminal output limit", () => {
       DYLD_VERSIONED_FRAMEWORK_PATH: "/tmp/fw",
       CARGO_TARGET_DIR: "/tmp/target",
       RUSTFLAGS: "-C debuginfo=0",
+      RUSTDOCFLAGS: "--test-builder /tmp/rustdoc",
+      RUSTDOC: "/tmp/rustdoc",
+      CARGO_BUILD_RUSTDOC: "/tmp/rustdoc",
+      CARGO_BUILD_RUSTDOCFLAGS: "--test-builder=/tmp/rustdoc",
+      CARGO_ENCODED_RUSTDOCFLAGS: "--test-builder\u001f/tmp/rustdoc",
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTDOCFLAGS: "--test-builder=/tmp/rustdoc",
+      CC: "/tmp/cc",
+      CXX: "/tmp/c++",
+      AR: "/tmp/ar",
+      HOST_CC: "/tmp/host-cc",
+      GIT_TEMPLATE_DIR: "/tmp/git-template",
+      CARGO_REGISTRY_CREDENTIAL_PROVIDER: "/tmp/cred",
+      CARGO_CREDENTIAL_ALIAS_MY_ALIAS: "/tmp/cred",
       NODE_DEBUG: "http",
     });
     expect(env.PATH).toBe("/usr/bin");
@@ -182,6 +210,19 @@ describe("terminal output limit", () => {
     expect(env.DYLD_VERSIONED_FRAMEWORK_PATH).toBeUndefined();
     expect(env.CARGO_TARGET_DIR).toBe("/tmp/target");
     expect(env.RUSTFLAGS).toBe("-C debuginfo=0");
+    expect(env.RUSTDOCFLAGS).toBe("--test-builder /tmp/rustdoc");
+    expect(env.RUSTDOC).toBeUndefined();
+    expect(env.CARGO_BUILD_RUSTDOC).toBeUndefined();
+    expect(env.CARGO_BUILD_RUSTDOCFLAGS).toBeUndefined();
+    expect(env.CARGO_ENCODED_RUSTDOCFLAGS).toBeUndefined();
+    expect(env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTDOCFLAGS).toBeUndefined();
+    expect(env.CC).toBeUndefined();
+    expect(env.CXX).toBeUndefined();
+    expect(env.AR).toBeUndefined();
+    expect(env.HOST_CC).toBeUndefined();
+    expect(env.GIT_TEMPLATE_DIR).toBeUndefined();
+    expect(env.CARGO_REGISTRY_CREDENTIAL_PROVIDER).toBeUndefined();
+    expect(env.CARGO_CREDENTIAL_ALIAS_MY_ALIAS).toBeUndefined();
     expect(env.NODE_DEBUG).toBe("http");
   });
 
@@ -212,6 +253,12 @@ describe("terminal output limit", () => {
       GOROOT: "/tmp/goroot",
       CARGO_ENCODED_RUSTFLAGS: "-C\u001flinker=/tmp/ld",
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: "/tmp/ld",
+      RUSTDOC: "/tmp/rustdoc",
+      CC: "/tmp/cc",
+      GIT_TEMPLATE_DIR: "/tmp/git-template",
+      CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS: "/tmp/cred",
+      RUSTFLAGS: "-C debuginfo=0",
+      CARGO_TARGET_DIR: "/tmp/target",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.ANTHROPIC_API_KEY).toBe("sk-test");
@@ -238,6 +285,12 @@ describe("terminal output limit", () => {
     expect(env.GOROOT).toBeUndefined();
     expect(env.CARGO_ENCODED_RUSTFLAGS).toBeUndefined();
     expect(env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER).toBeUndefined();
+    expect(env.RUSTDOC).toBeUndefined();
+    expect(env.CC).toBeUndefined();
+    expect(env.GIT_TEMPLATE_DIR).toBeUndefined();
+    expect(env.CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS).toBeUndefined();
+    expect(env.RUSTFLAGS).toBe("-C debuginfo=0");
+    expect(env.CARGO_TARGET_DIR).toBe("/tmp/target");
   });
 
   it("rejects a create that cannot start", () => {

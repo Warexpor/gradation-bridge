@@ -198,6 +198,24 @@ const BLOCKED_TERMINAL_ENV = new Set([
   "CARGO_BUILD_RUSTFLAGS",
   "CARGO_ENCODED_RUSTFLAGS",
   "GOROOT",
+  // rustdoc is a different binary from RUSTC. `cargo test` runs it, and
+  // `--test-builder` in the cargo rustdocflags names another program.
+  // RUSTDOCFLAGS itself stays, the same way RUSTFLAGS stays.
+  "RUSTDOC",
+  "CARGO_BUILD_RUSTDOC",
+  "CARGO_BUILD_RUSTDOCFLAGS",
+  "CARGO_ENCODED_RUSTDOCFLAGS",
+  // cc-rs, cgo, and node-gyp execute these. Flag variables (CFLAGS) stay.
+  "CC",
+  "CXX",
+  "AR",
+  "RANLIB",
+  "HOST_CC",
+  "HOST_CXX",
+  "HOST_AR",
+  "HOST_RANLIB",
+  // git clone/init copies this directory's hooks and runs them.
+  "GIT_TEMPLATE_DIR",
   // Dynamic linker debug writes `<path>.<pid>` when LD_DEBUG is set.
   "LD_DEBUG",
   "LD_DEBUG_OUTPUT",
@@ -213,11 +231,30 @@ const BLOCKED_TERMINAL_ENV = new Set([
 
 /**
  * `CARGO_TARGET_<triple>_LINKER` and `_RUNNER` name a program. `_RUSTFLAGS`
- * can pass `-C linker=`. `CARGO_TARGET_DIR` is not one of these.
+ * can pass `-C linker=`. `_RUSTDOCFLAGS` can pass `--test-builder`.
+ * `CARGO_TARGET_DIR` is not one of these.
  */
 function isCargoTargetHookEnv(name: string): boolean {
   if (!name.startsWith("CARGO_TARGET_")) return false;
-  return name.endsWith("_LINKER") || name.endsWith("_RUNNER") || name.endsWith("_RUSTFLAGS");
+  return (
+    name.endsWith("_LINKER") ||
+    name.endsWith("_RUNNER") ||
+    name.endsWith("_RUSTFLAGS") ||
+    name.endsWith("_RUSTDOCFLAGS")
+  );
+}
+
+/**
+ * Cargo runs a credential provider as a program. The alias and per-registry
+ * names do not share one exact spelling.
+ */
+function isCargoCredentialProviderEnv(name: string): boolean {
+  if (name === "CARGO_REGISTRY_CREDENTIAL_PROVIDER") return true;
+  if (name === "CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS") return true;
+  if (name.startsWith("CARGO_CREDENTIAL_ALIAS_") && name.length > "CARGO_CREDENTIAL_ALIAS_".length) {
+    return true;
+  }
+  return name.startsWith("CARGO_REGISTRIES_") && name.endsWith("_CREDENTIAL_PROVIDER");
 }
 
 export function blockedTerminalEnvName(name: string): boolean {
@@ -226,6 +263,7 @@ export function blockedTerminalEnvName(name: string): boolean {
   if (name.startsWith("GIT_TRACE")) return true;
   if (name.startsWith("BASH_FUNC_")) return true;
   if (isCargoTargetHookEnv(name)) return true;
+  if (isCargoCredentialProviderEnv(name)) return true;
   // Any case: npm folds NPM_CONFIG_* into the same table as npm_config_*.
   if (isNpmConfigEnv(name)) return true;
   return false;

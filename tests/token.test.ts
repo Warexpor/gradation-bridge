@@ -1,9 +1,10 @@
-import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ensurePrimaryToken,
+  listDevices,
   revokeDevice,
   verifyBearerToken,
 } from "../src/auth/token.js";
@@ -47,7 +48,7 @@ describe("bearer tokens", () => {
     const root = withEnv();
     const path = join(root, "config", "gradation-bridge", "devices.json");
     mkdirSync(join(root, "config", "gradation-bridge"), { recursive: true });
-    writeFileSync(path, "{not-json");
+    writeFileSync(path, "{not-json", { mode: 0o600 });
     expect(() => ensurePrimaryToken()).toThrow(/corrupt/);
     expect(readFileSync(path, "utf8")).toBe("{not-json");
     expect(verifyBearerToken("anything")).toBe(false);
@@ -122,5 +123,38 @@ describe("bearer tokens", () => {
     expect(() => ensurePrimaryToken()).toThrow(/symlink/);
     expect(existsSync(join(empty, "devices.json"))).toBe(false);
     expect(verifyBearerToken("ab".repeat(32))).toBe(false);
+  });
+
+  it("fails closed on a device record that is not a pairing token", () => {
+    const root = withEnv();
+    const path = join(root, "config", "gradation-bridge", "devices.json");
+    mkdirSync(join(root, "config", "gradation-bridge"), { recursive: true });
+    const token = "ab".repeat(32);
+    const body = JSON.stringify({
+      devices: [
+        { id: "primary", token, createdAt: "2020-01-01T00:00:00.000Z" },
+        null,
+        { id: "bad", token: 1, createdAt: "2020-01-01T00:00:00.000Z" },
+      ],
+    });
+    writeFileSync(path, body, { mode: 0o600 });
+    expect(verifyBearerToken(token)).toBe(false);
+    expect(verifyBearerToken("1")).toBe(false);
+    expect(() => ensurePrimaryToken()).toThrow(/corrupt/);
+    expect(() => listDevices()).toThrow(/corrupt/);
+    expect(readFileSync(path, "utf8")).toBe(body);
+  });
+
+  it("does not accept a pairing token from a devices file other users can read", () => {
+    withEnv();
+    const { token } = ensurePrimaryToken();
+    const path = join(process.env.XDG_CONFIG_HOME!, "gradation-bridge", "devices.json");
+    const before = readFileSync(path, "utf8");
+    chmodSync(path, 0o644);
+    expect(verifyBearerToken(token)).toBe(false);
+    expect(() => ensurePrimaryToken()).toThrow(/readable by other users/);
+    expect(readFileSync(path, "utf8")).toBe(before);
+    chmodSync(path, 0o600);
+    expect(verifyBearerToken(token)).toBe(true);
   });
 });

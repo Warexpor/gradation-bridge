@@ -287,6 +287,14 @@ describe("getGitStatus / getGitDiff", () => {
       DYLD_VERSIONED_LIBRARY_PATH: "/tmp/dyld",
       CARGO_TARGET_DIR: "/tmp/target",
       RUSTFLAGS: "-C debuginfo=0",
+      RUSTDOCFLAGS: "--test-builder /tmp/rustdoc",
+      RUSTDOC: "/tmp/rustdoc",
+      CARGO_BUILD_RUSTDOCFLAGS: "--test-builder=/tmp/rustdoc",
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTDOCFLAGS: "--test-builder=/tmp/rustdoc",
+      CC: "/tmp/cc",
+      CXX: "/tmp/c++",
+      GIT_TEMPLATE_DIR: "/tmp/git-template",
+      CARGO_REGISTRIES_CRATES_IO_CREDENTIAL_PROVIDER: "/tmp/cred",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.GIT_EXTERNAL_DIFF).toBeUndefined();
@@ -352,6 +360,14 @@ describe("getGitStatus / getGitDiff", () => {
     expect(env.DYLD_VERSIONED_LIBRARY_PATH).toBeUndefined();
     expect(env.CARGO_TARGET_DIR).toBe("/tmp/target");
     expect(env.RUSTFLAGS).toBe("-C debuginfo=0");
+    expect(env.RUSTDOCFLAGS).toBe("--test-builder /tmp/rustdoc");
+    expect(env.RUSTDOC).toBeUndefined();
+    expect(env.CARGO_BUILD_RUSTDOCFLAGS).toBeUndefined();
+    expect(env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTDOCFLAGS).toBeUndefined();
+    expect(env.CC).toBeUndefined();
+    expect(env.CXX).toBeUndefined();
+    expect(env.GIT_TEMPLATE_DIR).toBeUndefined();
+    expect(env.CARGO_REGISTRIES_CRATES_IO_CREDENTIAL_PROVIDER).toBeUndefined();
     expect(env.GIT_CONFIG_COUNT).toBeUndefined();
     expect(env.GIT_CONFIG_KEY_0).toBeUndefined();
     expect(env.GIT_CONFIG_VALUE_0).toBeUndefined();
