@@ -169,6 +169,9 @@ const STRIPPED_GIT_ENV = new Set([
   "DYLD_FRAMEWORK_PATH",
   "DYLD_FALLBACK_LIBRARY_PATH",
   "DYLD_FALLBACK_FRAMEWORK_PATH",
+  // Same loader class as DYLD_LIBRARY_PATH. The versioned paths are separate names.
+  "DYLD_VERSIONED_LIBRARY_PATH",
+  "DYLD_VERSIONED_FRAMEWORK_PATH",
   "JAVA_TOOL_OPTIONS",
   "_JAVA_OPTIONS",
   "JDK_JAVA_OPTIONS",
@@ -214,6 +217,13 @@ const STRIPPED_GIT_ENV = new Set([
   "CARGO_BUILD_RUSTC",
   "CARGO_BUILD_RUSTC_WRAPPER",
   "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+  // CARGO_HOME/config.toml can set rustc-wrapper. The encoded and build
+  // rustflags names are not RUSTFLAGS, and they can pass `-C linker=`.
+  // GOROOT selects the tool binaries `go build` executes.
+  "CARGO_HOME",
+  "CARGO_BUILD_RUSTFLAGS",
+  "CARGO_ENCODED_RUSTFLAGS",
+  "GOROOT",
   // Dynamic linker debug writes `<path>.<pid>` when LD_DEBUG is set.
   "LD_DEBUG",
   "LD_DEBUG_OUTPUT",
@@ -226,6 +236,15 @@ const STRIPPED_GIT_ENV = new Set([
   "OPENSSL_CONF_INCLUDE",
 ]);
 
+/**
+ * `CARGO_TARGET_<triple>_LINKER` and `_RUNNER` name a program. `_RUSTFLAGS`
+ * can pass `-C linker=`. `CARGO_TARGET_DIR` is not one of these.
+ */
+function isCargoTargetHookEnv(name: string): boolean {
+  if (!name.startsWith("CARGO_TARGET_")) return false;
+  return name.endsWith("_LINKER") || name.endsWith("_RUNNER") || name.endsWith("_RUSTFLAGS");
+}
+
 /** Child env for git. Drops variables that can name a program or inject config. */
 export function gitChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
@@ -234,6 +253,7 @@ export function gitChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Proce
     if (STRIPPED_GIT_ENV.has(key)) continue;
     if (key.startsWith("GIT_CONFIG_KEY_") || key.startsWith("GIT_CONFIG_VALUE_")) continue;
     if (key.startsWith("GIT_TRACE")) continue;
+    if (isCargoTargetHookEnv(key)) continue;
     // Exported bash functions (`BASH_FUNC_foo%%`) are imported by any bash
     // git starts. Terminals already drop this prefix; git must too.
     if (key.startsWith("BASH_FUNC_")) continue;

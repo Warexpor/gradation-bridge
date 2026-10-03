@@ -106,6 +106,9 @@ const BLOCKED_TERMINAL_ENV = new Set([
   "DYLD_FRAMEWORK_PATH",
   "DYLD_FALLBACK_LIBRARY_PATH",
   "DYLD_FALLBACK_FRAMEWORK_PATH",
+  // Same loader class as DYLD_LIBRARY_PATH. The versioned paths are separate names.
+  "DYLD_VERSIONED_LIBRARY_PATH",
+  "DYLD_VERSIONED_FRAMEWORK_PATH",
   "GIT_TRACE",
   "GIT_TRACE2",
   "GIT_TRACE2_EVENT",
@@ -188,6 +191,13 @@ const BLOCKED_TERMINAL_ENV = new Set([
   "CARGO_BUILD_RUSTC",
   "CARGO_BUILD_RUSTC_WRAPPER",
   "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+  // CARGO_HOME/config.toml can set rustc-wrapper. The encoded and build
+  // rustflags names are not RUSTFLAGS, and they can pass `-C linker=`.
+  // GOROOT selects the tool binaries `go build` executes.
+  "CARGO_HOME",
+  "CARGO_BUILD_RUSTFLAGS",
+  "CARGO_ENCODED_RUSTFLAGS",
+  "GOROOT",
   // Dynamic linker debug writes `<path>.<pid>` when LD_DEBUG is set.
   "LD_DEBUG",
   "LD_DEBUG_OUTPUT",
@@ -201,11 +211,21 @@ const BLOCKED_TERMINAL_ENV = new Set([
   "OPENSSL_CONF_INCLUDE",
 ]);
 
+/**
+ * `CARGO_TARGET_<triple>_LINKER` and `_RUNNER` name a program. `_RUSTFLAGS`
+ * can pass `-C linker=`. `CARGO_TARGET_DIR` is not one of these.
+ */
+function isCargoTargetHookEnv(name: string): boolean {
+  if (!name.startsWith("CARGO_TARGET_")) return false;
+  return name.endsWith("_LINKER") || name.endsWith("_RUNNER") || name.endsWith("_RUSTFLAGS");
+}
+
 export function blockedTerminalEnvName(name: string): boolean {
   if (BLOCKED_TERMINAL_ENV.has(name)) return true;
   if (name.startsWith("GIT_CONFIG_KEY_") || name.startsWith("GIT_CONFIG_VALUE_")) return true;
   if (name.startsWith("GIT_TRACE")) return true;
   if (name.startsWith("BASH_FUNC_")) return true;
+  if (isCargoTargetHookEnv(name)) return true;
   // Any case: npm folds NPM_CONFIG_* into the same table as npm_config_*.
   if (isNpmConfigEnv(name)) return true;
   return false;

@@ -80,6 +80,16 @@ describe("terminal output limit", () => {
     expect(blockedTerminalEnvName("NODE_V8_COVERAGE")).toBe(true);
     expect(blockedTerminalEnvName("NODE_REDIRECT_WARNINGS")).toBe(true);
     expect(blockedTerminalEnvName("NODE_COMPILE_CACHE")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_HOME")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_BUILD_RUSTFLAGS")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_ENCODED_RUSTFLAGS")).toBe(true);
+    expect(blockedTerminalEnvName("GOROOT")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS")).toBe(true);
+    expect(blockedTerminalEnvName("DYLD_VERSIONED_LIBRARY_PATH")).toBe(true);
+    expect(blockedTerminalEnvName("DYLD_VERSIONED_FRAMEWORK_PATH")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_TARGET_DIR")).toBe(false);
     expect(blockedTerminalEnvName("PATH")).toBe(false);
     expect(blockedTerminalEnvName("TERM")).toBe(false);
     expect(blockedTerminalEnvName("npm_config")).toBe(false);
@@ -119,6 +129,15 @@ describe("terminal output limit", () => {
       NODE_V8_COVERAGE: "/tmp/cov",
       NODE_REDIRECT_WARNINGS: "/tmp/warnings",
       NODE_COMPILE_CACHE: "/tmp/cache",
+      CARGO_HOME: "/tmp/cargo-home",
+      CARGO_BUILD_RUSTFLAGS: "-C linker=/tmp/ld",
+      CARGO_ENCODED_RUSTFLAGS: "-C\u001flinker=/tmp/ld",
+      GOROOT: "/tmp/goroot",
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: "/tmp/ld",
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "/tmp/run",
+      DYLD_VERSIONED_LIBRARY_PATH: "/tmp/dyld",
+      DYLD_VERSIONED_FRAMEWORK_PATH: "/tmp/fw",
+      CARGO_TARGET_DIR: "/tmp/target",
       RUSTFLAGS: "-C debuginfo=0",
       NODE_DEBUG: "http",
     });
@@ -153,6 +172,15 @@ describe("terminal output limit", () => {
     expect(env.NODE_V8_COVERAGE).toBeUndefined();
     expect(env.NODE_REDIRECT_WARNINGS).toBeUndefined();
     expect(env.NODE_COMPILE_CACHE).toBeUndefined();
+    expect(env.CARGO_HOME).toBeUndefined();
+    expect(env.CARGO_BUILD_RUSTFLAGS).toBeUndefined();
+    expect(env.CARGO_ENCODED_RUSTFLAGS).toBeUndefined();
+    expect(env.GOROOT).toBeUndefined();
+    expect(env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER).toBeUndefined();
+    expect(env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER).toBeUndefined();
+    expect(env.DYLD_VERSIONED_LIBRARY_PATH).toBeUndefined();
+    expect(env.DYLD_VERSIONED_FRAMEWORK_PATH).toBeUndefined();
+    expect(env.CARGO_TARGET_DIR).toBe("/tmp/target");
     expect(env.RUSTFLAGS).toBe("-C debuginfo=0");
     expect(env.NODE_DEBUG).toBe("http");
   });
@@ -180,6 +208,10 @@ describe("terminal output limit", () => {
       NODE_V8_COVERAGE: "/tmp/cov",
       NODE_REDIRECT_WARNINGS: "/tmp/warnings",
       NODE_COMPILE_CACHE: "/tmp/cache",
+      CARGO_HOME: "/tmp/cargo-home",
+      GOROOT: "/tmp/goroot",
+      CARGO_ENCODED_RUSTFLAGS: "-C\u001flinker=/tmp/ld",
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: "/tmp/ld",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.ANTHROPIC_API_KEY).toBe("sk-test");
@@ -202,6 +234,10 @@ describe("terminal output limit", () => {
     expect(env.NODE_V8_COVERAGE).toBeUndefined();
     expect(env.NODE_REDIRECT_WARNINGS).toBeUndefined();
     expect(env.NODE_COMPILE_CACHE).toBeUndefined();
+    expect(env.CARGO_HOME).toBeUndefined();
+    expect(env.GOROOT).toBeUndefined();
+    expect(env.CARGO_ENCODED_RUSTFLAGS).toBeUndefined();
+    expect(env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER).toBeUndefined();
   });
 
   it("rejects a create that cannot start", () => {

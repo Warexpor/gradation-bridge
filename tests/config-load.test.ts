@@ -1,6 +1,6 @@
-import { lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadConfig, saveConfig } from "../src/config/load.js";
 import { defaultConfig } from "../src/config/types.js";
@@ -89,5 +89,24 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow(/symlink/);
     expect(lstatSync(tempLink).isSymbolicLink()).toBe(true);
     expect(readFileSync(leaked, "utf8")).toBe("KEEP\n");
+  });
+
+  it("refuses a symlinked config directory and does not write through it", () => {
+    const path = useEnv();
+    const outside = join(path, "..", "..", "outside-bridge-config");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "config.json"), JSON.stringify({ port: 9, allowedRoots: ["/"] }));
+    symlinkSync(outside, dirname(path));
+    expect(() => loadConfig()).toThrow(/symlink/);
+    expect(() => saveConfig(defaultConfig())).toThrow(/symlink/);
+    expect(JSON.parse(readFileSync(join(outside, "config.json"), "utf8")).port).toBe(9);
+    expect(lstatSync(dirname(path)).isSymbolicLink()).toBe(true);
+
+    const fresh = useEnv();
+    const empty = join(fresh, "..", "..", "empty-bridge-config");
+    mkdirSync(empty);
+    symlinkSync(empty, dirname(fresh));
+    expect(() => loadConfig()).toThrow(/symlink/);
+    expect(existsSync(join(empty, "config.json"))).toBe(false);
   });
 });

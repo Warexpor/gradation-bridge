@@ -26,8 +26,16 @@ type DevicesRead =
   | { ok: false; path: string; symlink: boolean };
 
 function readDevices(): DevicesRead {
-  ensureDirs();
   const path = devicesPath();
+  try {
+    ensureDirs();
+  } catch (e) {
+    // Fail closed on the upgrade path. A symlinked config directory must not throw.
+    if (e instanceof Error && /symlink/i.test(e.message)) {
+      return { ok: false, path, symlink: true };
+    }
+    throw e;
+  }
   let text: string;
   try {
     text = readPrivateNoFollow(path);

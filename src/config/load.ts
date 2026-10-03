@@ -1,6 +1,6 @@
-import { mkdirSync } from "node:fs";
+import { lstatSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 import { readPrivateNoFollow, writePrivateNoFollow } from "../fs/atomic-write.js";
 import { type BridgeConfig, defaultConfig } from "./types.js";
@@ -45,11 +45,41 @@ export function dataDir(): string {
   return join(homedir(), ".local", "share", "gradation-bridge");
 }
 
+/**
+ * Missing is fine. A symlink is refused so `mkdir` and later file IO do not
+ * follow a planted config, data, certs, or sessions directory.
+ */
+export function refuseSymlinkedDir(path: string, label: string): void {
+  let info: ReturnType<typeof lstatSync>;
+  try {
+    info = lstatSync(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw e;
+  }
+  if (info.isSymbolicLink()) {
+    throw new Error(`refusing to use a symlinked ${label}`);
+  }
+}
+
+function mkdirRealDir(path: string, label: string): void {
+  const parent = dirname(path);
+  if (parent !== path) mkdirSync(parent, { recursive: true, mode: 0o700 });
+  refuseSymlinkedDir(path, label);
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+}
+
 export function ensureDirs(): void {
-  mkdirSync(configDir(), { recursive: true, mode: 0o700 });
-  mkdirSync(dataDir(), { recursive: true, mode: 0o700 });
-  mkdirSync(join(dataDir(), "certs"), { recursive: true, mode: 0o700 });
-  mkdirSync(join(dataDir(), "sessions"), { recursive: true, mode: 0o700 });
+  const config = configDir();
+  const data = dataDir();
+  mkdirRealDir(config, "config directory");
+  mkdirRealDir(data, "data directory");
+  const certs = join(data, "certs");
+  const sessions = join(data, "sessions");
+  refuseSymlinkedDir(certs, "certs directory");
+  mkdirSync(certs, { recursive: true, mode: 0o700 });
+  refuseSymlinkedDir(sessions, "sessions directory");
+  mkdirSync(sessions, { recursive: true, mode: 0o700 });
 }
 
 export function loadConfig(): BridgeConfig {

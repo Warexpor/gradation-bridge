@@ -1,11 +1,13 @@
 /**
  * Replace a private catalog file without following a symlink.
  *
- * `writeFileSync(path)` follows a symlink planted on the temp file or the
- * destination, so the bytes can land outside the directory that owns the
- * catalog. The temp file is created with `O_EXCL|O_NOFOLLOW`. An existing
- * destination is opened with `O_NOFOLLOW` and a symlink is refused instead
- * of being replaced or followed.
+ * `writeFileSync(path)` follows a symlink planted on the temp file, the
+ * destination, or the directory that contains them, so the bytes can land
+ * outside the directory that owns the catalog. `O_NOFOLLOW` covers only the
+ * final component. The parent directory is refused when it is a symlink.
+ * The temp file is created with `O_EXCL|O_NOFOLLOW`. An existing destination
+ * is opened with `O_NOFOLLOW` and a symlink is refused instead of being
+ * replaced or followed.
  */
 
 import {
@@ -46,6 +48,18 @@ function assertNotSymlink(path: string): void {
 }
 
 /**
+ * `O_NOFOLLOW` does not apply to a symlink on the parent. A symlinked
+ * config or certs directory would otherwise be followed for the file inside it.
+ */
+function assertParentNotSymlink(path: string, reading: boolean): void {
+  const info = lstatOrMissing(dirname(path));
+  if (!info?.isSymbolicLink()) return;
+  throw new Error(
+    reading ? "refusing to read through a symlink" : "refusing to write through a symlink",
+  );
+}
+
+/**
  * A destination we may replace: absent, or a regular file we can open
  * without following a final-component symlink.
  */
@@ -81,6 +95,7 @@ function openTempNoFollow(tmp: string): number {
  * Missing paths throw `ENOENT`.
  */
 export function readPrivateNoFollow(path: string): string {
+  assertParentNotSymlink(path, true);
   const info = lstatOrMissing(path);
   if (!info) {
     const err = new Error(`ENOENT: no such file, open '${path}'`) as NodeJS.ErrnoException;
@@ -107,6 +122,7 @@ export function readPrivateNoFollow(path: string): string {
 
 /** Write `content` to `dest` (mode 0o600). Refuses a symlink at `dest` or the temp path. */
 export function writePrivateNoFollow(dest: string, content: string): void {
+  assertParentNotSymlink(dest, false);
   assertReplaceableDest(dest);
   const tmp = privateWriteTempPath(dest);
   assertNotSymlink(tmp);

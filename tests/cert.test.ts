@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -195,5 +195,66 @@ describe("tls subject alt names", () => {
     expect(() => inspectTlsFiles()).toThrow(/symlink/);
     expect(readFileSync(swappedCert, "utf8")).toBe("SWAPPED-CERT\n");
     expect(readFileSync(tls.keyPath, "utf8")).toBe(tls.keyPem);
+  });
+
+  it("refuses a symlinked certs or data directory and does not write the key there", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-cert-dirlink-"));
+    const prevConfig = process.env.XDG_CONFIG_HOME;
+    const prevData = process.env.XDG_DATA_HOME;
+    process.env.XDG_CONFIG_HOME = join(root, "config");
+    process.env.XDG_DATA_HOME = join(root, "data");
+    mkdirSync(process.env.XDG_CONFIG_HOME, { recursive: true });
+    mkdirSync(process.env.XDG_DATA_HOME, { recursive: true });
+    restores.push(() => {
+      if (prevConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prevConfig;
+      if (prevData === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevData;
+    });
+
+    const outsideCerts = join(root, "outside-certs");
+    mkdirSync(outsideCerts);
+    writeFileSync(join(outsideCerts, "server.key"), "SENTINEL-KEY\n");
+    writeFileSync(join(outsideCerts, "server.crt"), "SENTINEL-CERT\n");
+    const dataRoot = join(process.env.XDG_DATA_HOME, "gradation-bridge");
+    mkdirSync(dataRoot, { recursive: true });
+    symlinkSync(outsideCerts, join(dataRoot, "certs"));
+    expect(() => ensureTlsMaterial()).toThrow(/symlink/);
+    expect(() => inspectTlsFiles()).toThrow(/symlink/);
+    expect(readFileSync(join(outsideCerts, "server.key"), "utf8")).toBe("SENTINEL-KEY\n");
+    expect(readFileSync(join(outsideCerts, "server.crt"), "utf8")).toBe("SENTINEL-CERT\n");
+    expect(readdirSync(outsideCerts).sort()).toEqual(["server.crt", "server.key"]);
+
+    unlinkSync(join(dataRoot, "certs"));
+    rmSync(dataRoot, { recursive: true, force: true });
+    const outsideData = join(root, "outside-data");
+    mkdirSync(join(outsideData, "certs"), { recursive: true });
+    writeFileSync(join(outsideData, "certs", "server.key"), "DATA-KEY\n");
+    symlinkSync(outsideData, dataRoot);
+    expect(() => ensureTlsMaterial()).toThrow(/symlink/);
+    expect(() => inspectTlsFiles()).toThrow(/symlink/);
+    expect(readFileSync(join(outsideData, "certs", "server.key"), "utf8")).toBe("DATA-KEY\n");
+    expect(readdirSync(join(outsideData, "certs"))).toEqual(["server.key"]);
+  });
+
+  it("refuses a FIFO TLS file instead of blocking on the read", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-cert-fifo-"));
+    const prevConfig = process.env.XDG_CONFIG_HOME;
+    const prevData = process.env.XDG_DATA_HOME;
+    process.env.XDG_CONFIG_HOME = join(root, "config");
+    process.env.XDG_DATA_HOME = join(root, "data");
+    mkdirSync(process.env.XDG_CONFIG_HOME, { recursive: true });
+    mkdirSync(process.env.XDG_DATA_HOME, { recursive: true });
+    restores.push(() => {
+      if (prevConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prevConfig;
+      if (prevData === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevData;
+    });
+    const certDir = join(process.env.XDG_DATA_HOME, "gradation-bridge", "certs");
+    mkdirSync(certDir, { recursive: true });
+    execFileSync("mkfifo", [join(certDir, "server.crt")]);
+    expect(() => inspectTlsFiles()).toThrow(/non-regular/);
+    expect(() => ensureTlsMaterial()).toThrow(/non-regular/);
   });
 });
