@@ -152,6 +152,10 @@ const BLOCKED_TERMINAL_ENV = new Set([
   "NODE_OPTIONS",
   "NODE_PATH",
   "NODE_REPL_EXTERNAL_MODULE",
+  // Node writes coverage JSON, warning logs, and a compile cache to these paths.
+  "NODE_V8_COVERAGE",
+  "NODE_REDIRECT_WARNINGS",
+  "NODE_COMPILE_CACHE",
   "JAVA_TOOL_OPTIONS",
   "_JAVA_OPTIONS",
   "JDK_JAVA_OPTIONS",
@@ -173,6 +177,13 @@ const BLOCKED_TERMINAL_ENV = new Set([
   // zsh reads startup files from here instead of $HOME.
   "ZDOTDIR",
   "GCONV_PATH",
+  // Go and Cargo startup hooks. GOFLAGS=-toolexec=… runs during go build.
+  // RUSTC replaces the compiler. RUSTC_WRAPPER and CARGO_BUILD_RUSTC run
+  // during cargo build.
+  "GOFLAGS",
+  "RUSTC",
+  "RUSTC_WRAPPER",
+  "CARGO_BUILD_RUSTC",
 ]);
 
 export function blockedTerminalEnvName(name: string): boolean {

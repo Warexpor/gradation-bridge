@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { bindHostCoveredByCert, ensureTlsMaterial, tlsSubjectAltNames } from "../src/auth/cert.js";
+import { bindHostCoveredByCert, ensureTlsMaterial, inspectTlsFiles, tlsSubjectAltNames } from "../src/auth/cert.js";
 
 const restores: Array<() => void> = [];
 
@@ -54,6 +54,10 @@ describe("tls subject alt names", () => {
     expect(again.fingerprintSha256).toBe(tls.fingerprintSha256);
     expect(again.sanWarning).toMatch(/10\.9\.8\.8/);
     expect(readFileSync(tls.certPath, "utf8")).toBe(tls.certPem);
+    expect(lstatSync(tls.keyPath).isFile()).toBe(true);
+    expect(lstatSync(tls.certPath).isFile()).toBe(true);
+    expect(lstatSync(tls.keyPath).isSymbolicLink()).toBe(false);
+    expect(lstatSync(tls.certPath).isSymbolicLink()).toBe(false);
     const text = execFileSync(
       "openssl",
       ["x509", "-in", tls.certPath, "-noout", "-ext", "subjectAltName"],
@@ -87,5 +91,76 @@ describe("tls subject alt names", () => {
     writeFileSync(tls.keyPath, privateKey);
     expect(() => ensureTlsMaterial()).toThrow(/does not match/);
     expect(readFileSync(tls.certPath, "utf8")).toBe(tls.certPem);
+  });
+
+  it("refuses a symlink on server.key or server.crt and does not write through it", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-cert-link-"));
+    const prevConfig = process.env.XDG_CONFIG_HOME;
+    const prevData = process.env.XDG_DATA_HOME;
+    process.env.XDG_CONFIG_HOME = join(root, "config");
+    process.env.XDG_DATA_HOME = join(root, "data");
+    mkdirSync(process.env.XDG_CONFIG_HOME, { recursive: true });
+    mkdirSync(process.env.XDG_DATA_HOME, { recursive: true });
+    restores.push(() => {
+      if (prevConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prevConfig;
+      if (prevData === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevData;
+    });
+
+    const certDir = join(process.env.XDG_DATA_HOME, "gradation-bridge", "certs");
+    mkdirSync(certDir, { recursive: true });
+    const keyLeak = join(root, "key-leak.pem");
+    const certLeak = join(root, "cert-leak.pem");
+    writeFileSync(keyLeak, "SENTINEL-KEY\n");
+    writeFileSync(certLeak, "SENTINEL-CERT\n");
+    symlinkSync(keyLeak, join(certDir, "server.key"));
+    expect(() => ensureTlsMaterial()).toThrow(/symlink/);
+    expect(() => inspectTlsFiles()).toThrow(/symlink/);
+    expect(readFileSync(keyLeak, "utf8")).toBe("SENTINEL-KEY\n");
+
+    unlinkSync(join(certDir, "server.key"));
+    symlinkSync(certLeak, join(certDir, "server.crt"));
+    expect(() => ensureTlsMaterial()).toThrow(/symlink/);
+    expect(() => inspectTlsFiles()).toThrow(/symlink/);
+    expect(readFileSync(certLeak, "utf8")).toBe("SENTINEL-CERT\n");
+    expect(readFileSync(keyLeak, "utf8")).toBe("SENTINEL-KEY\n");
+  });
+
+  it("refuses a symlink when re-reading an existing key or cert", () => {
+    const root = mkdtempSync(join(tmpdir(), "gb-cert-reread-"));
+    const prevConfig = process.env.XDG_CONFIG_HOME;
+    const prevData = process.env.XDG_DATA_HOME;
+    process.env.XDG_CONFIG_HOME = join(root, "config");
+    process.env.XDG_DATA_HOME = join(root, "data");
+    mkdirSync(process.env.XDG_CONFIG_HOME, { recursive: true });
+    mkdirSync(process.env.XDG_DATA_HOME, { recursive: true });
+    restores.push(() => {
+      if (prevConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prevConfig;
+      if (prevData === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevData;
+    });
+
+    const tls = ensureTlsMaterial({ bindHost: "127.0.0.1" });
+    const swappedKey = join(root, "swapped.key");
+    writeFileSync(swappedKey, "SWAPPED-KEY\n");
+    unlinkSync(tls.keyPath);
+    symlinkSync(swappedKey, tls.keyPath);
+    expect(() => ensureTlsMaterial()).toThrow(/symlink/);
+    expect(() => inspectTlsFiles()).toThrow(/symlink/);
+    expect(readFileSync(swappedKey, "utf8")).toBe("SWAPPED-KEY\n");
+    expect(readFileSync(tls.certPath, "utf8")).toBe(tls.certPem);
+
+    unlinkSync(tls.keyPath);
+    writeFileSync(tls.keyPath, tls.keyPem, { mode: 0o600 });
+    const swappedCert = join(root, "swapped.crt");
+    writeFileSync(swappedCert, "SWAPPED-CERT\n");
+    unlinkSync(tls.certPath);
+    symlinkSync(swappedCert, tls.certPath);
+    expect(() => ensureTlsMaterial()).toThrow(/symlink/);
+    expect(() => inspectTlsFiles()).toThrow(/symlink/);
+    expect(readFileSync(swappedCert, "utf8")).toBe("SWAPPED-CERT\n");
+    expect(readFileSync(tls.keyPath, "utf8")).toBe(tls.keyPem);
   });
 });

@@ -263,6 +263,14 @@ describe("getGitStatus / getGitDiff", () => {
       npm_config_script_shell: "/tmp/evil-sh",
       NPM_CONFIG_SCRIPT_SHELL: "/tmp/evil-sh",
       npm_lifecycle_event: "test",
+      GOFLAGS: "-toolexec=/tmp/evil",
+      RUSTC: "/tmp/rustc",
+      RUSTC_WRAPPER: "/tmp/wrap",
+      CARGO_BUILD_RUSTC: "/tmp/rustc",
+      NODE_V8_COVERAGE: "/tmp/cov",
+      NODE_REDIRECT_WARNINGS: "/tmp/warnings",
+      NODE_COMPILE_CACHE: "/tmp/cache",
+      RUSTFLAGS: "-C debuginfo=0",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.GIT_EXTERNAL_DIFF).toBeUndefined();
@@ -304,6 +312,14 @@ describe("getGitStatus / getGitDiff", () => {
     expect(env.npm_config_script_shell).toBeUndefined();
     expect(env.NPM_CONFIG_SCRIPT_SHELL).toBeUndefined();
     expect(env.npm_lifecycle_event).toBe("test");
+    expect(env.GOFLAGS).toBeUndefined();
+    expect(env.RUSTC).toBeUndefined();
+    expect(env.RUSTC_WRAPPER).toBeUndefined();
+    expect(env.CARGO_BUILD_RUSTC).toBeUndefined();
+    expect(env.NODE_V8_COVERAGE).toBeUndefined();
+    expect(env.NODE_REDIRECT_WARNINGS).toBeUndefined();
+    expect(env.NODE_COMPILE_CACHE).toBeUndefined();
+    expect(env.RUSTFLAGS).toBe("-C debuginfo=0");
     expect(env.GIT_CONFIG_COUNT).toBeUndefined();
     expect(env.GIT_CONFIG_KEY_0).toBeUndefined();
     expect(env.GIT_CONFIG_VALUE_0).toBeUndefined();
