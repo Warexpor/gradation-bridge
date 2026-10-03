@@ -1,4 +1,4 @@
-import { lstatSync, mkdtempSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -95,5 +95,32 @@ describe("bearer tokens", () => {
     expect(() => ensurePrimaryToken()).toThrow(/symlink/);
     expect(lstatSync(tempLink).isSymbolicLink()).toBe(true);
     expect(readFileSync(leaked, "utf8")).toBe("KEEP\n");
+  });
+
+  it("does not trust or mint a token through a symlinked config directory", () => {
+    const root = withEnv();
+    const outside = join(root, "outside-config");
+    mkdirSync(outside);
+    const token = "cd".repeat(32);
+    writeFileSync(
+      join(outside, "devices.json"),
+      JSON.stringify({
+        devices: [{ id: "attacker", token, createdAt: "2020-01-01T00:00:00.000Z" }],
+      }),
+    );
+    const link = join(root, "config", "gradation-bridge");
+    symlinkSync(outside, link);
+    expect(() => ensurePrimaryToken()).toThrow(/symlink/);
+    expect(verifyBearerToken(token)).toBe(false);
+    expect(readFileSync(join(outside, "devices.json"), "utf8")).toContain(token);
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+
+    unlinkSync(link);
+    const empty = join(root, "empty-config");
+    mkdirSync(empty);
+    symlinkSync(empty, link);
+    expect(() => ensurePrimaryToken()).toThrow(/symlink/);
+    expect(existsSync(join(empty, "devices.json"))).toBe(false);
+    expect(verifyBearerToken("ab".repeat(32))).toBe(false);
   });
 });

@@ -278,6 +278,14 @@ describe("getGitStatus / getGitDiff", () => {
       NODE_V8_COVERAGE: "/tmp/cov",
       NODE_REDIRECT_WARNINGS: "/tmp/warnings",
       NODE_COMPILE_CACHE: "/tmp/cache",
+      CARGO_HOME: "/tmp/cargo-home",
+      CARGO_BUILD_RUSTFLAGS: "-C linker=/tmp/ld",
+      CARGO_ENCODED_RUSTFLAGS: "-C\u001flinker=/tmp/ld",
+      GOROOT: "/tmp/goroot",
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: "/tmp/ld",
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "/tmp/run",
+      DYLD_VERSIONED_LIBRARY_PATH: "/tmp/dyld",
+      CARGO_TARGET_DIR: "/tmp/target",
       RUSTFLAGS: "-C debuginfo=0",
     });
     expect(env.PATH).toBe("/usr/bin");
@@ -335,6 +343,14 @@ describe("getGitStatus / getGitDiff", () => {
     expect(env.NODE_V8_COVERAGE).toBeUndefined();
     expect(env.NODE_REDIRECT_WARNINGS).toBeUndefined();
     expect(env.NODE_COMPILE_CACHE).toBeUndefined();
+    expect(env.CARGO_HOME).toBeUndefined();
+    expect(env.CARGO_BUILD_RUSTFLAGS).toBeUndefined();
+    expect(env.CARGO_ENCODED_RUSTFLAGS).toBeUndefined();
+    expect(env.GOROOT).toBeUndefined();
+    expect(env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER).toBeUndefined();
+    expect(env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER).toBeUndefined();
+    expect(env.DYLD_VERSIONED_LIBRARY_PATH).toBeUndefined();
+    expect(env.CARGO_TARGET_DIR).toBe("/tmp/target");
     expect(env.RUSTFLAGS).toBe("-C debuginfo=0");
     expect(env.GIT_CONFIG_COUNT).toBeUndefined();
     expect(env.GIT_CONFIG_KEY_0).toBeUndefined();

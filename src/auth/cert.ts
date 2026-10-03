@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { createHash, createPrivateKey, generateKeyPairSync, X509Certificate } from "node:crypto";
 import {
-  chmodSync,
   closeSync,
   constants,
+  fchmodSync,
   lstatSync,
   mkdtempSync,
   openSync,
@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { isIP } from "node:net";
 import { join } from "node:path";
-import { dataDir, ensureDirs } from "../config/load.js";
+import { dataDir, ensureDirs, refuseSymlinkedDir } from "../config/load.js";
 import { writePrivateNoFollow } from "../fs/atomic-write.js";
 import { harnessChildEnv } from "../session/terminals.js";
 
@@ -77,13 +77,29 @@ function lstatOrMissing(path: string): ReturnType<typeof lstatSync> | undefined 
   }
 }
 
-/** Missing is fine. A symlink on `server.key` or `server.crt` is refused. */
-function assertNotTlsSymlink(path: string): void {
-  if (lstatOrMissing(path)?.isSymbolicLink()) throw tlsSymlinkError();
+/** Data and certs directories are not followed. Missing paths are fine. */
+function assertTlsStorage(): void {
+  const data = dataDir();
+  refuseSymlinkedDir(data, "data directory");
+  refuseSymlinkedDir(join(data, "certs"), "certs directory");
 }
 
-/** Read a freshly minted key or cert. A symlink is treated as a failed mint. */
+/**
+ * Missing is fine. A symlink or any non-regular file (a FIFO would block
+ * the read) on `server.key` or `server.crt` is refused.
+ */
+function assertTlsPath(path: string): ReturnType<typeof lstatSync> | undefined {
+  const info = lstatOrMissing(path);
+  if (!info) return undefined;
+  if (info.isSymbolicLink()) throw tlsSymlinkError();
+  if (!info.isFile()) throw new Error("refusing to use a non-regular TLS file");
+  return info;
+}
+
+/** Read a freshly minted key or cert. A symlink or non-file is a failed mint. */
 function readMintedNoFollow(path: string): string | undefined {
+  const info = lstatOrMissing(path);
+  if (!info || info.isSymbolicLink() || !info.isFile()) return undefined;
   let fd: number;
   try {
     fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -101,7 +117,11 @@ function readMintedNoFollow(path: string): string | undefined {
 
 /** Read a TLS file without following a final-component symlink. */
 function readTlsFile(path: string): string {
-  assertNotTlsSymlink(path);
+  if (!assertTlsPath(path)) {
+    const err = new Error(`ENOENT: no such file, open '${path}'`) as NodeJS.ErrnoException;
+    err.code = "ENOENT";
+    throw err;
+  }
   let fd: number;
   try {
     fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -129,14 +149,16 @@ export function inspectTlsFiles(): {
   subjectAltName?: string;
   detail?: string;
 } {
+  assertTlsStorage();
   const { keyPath, certPath } = certPaths();
-  assertNotTlsSymlink(keyPath);
-  assertNotTlsSymlink(certPath);
-  if (!lstatOrMissing(certPath)) return { certPath, state: "missing" };
+  // Check both paths first. A symlinked key must not be ignored just because
+  // the certificate file is missing or still the openssl stub.
+  assertTlsPath(keyPath);
+  if (!assertTlsPath(certPath)) return { certPath, state: "missing" };
   const certPem = readTlsFile(certPath);
   const diag = tlsDiagnostics(certPem);
   if (!diag.tls || !diag.certFingerprint) return { certPath, state: "stub" };
-  if (!lstatOrMissing(keyPath)) {
+  if (!assertTlsPath(keyPath)) {
     return { certPath, state: "incomplete", detail: "certificate without a private key" };
   }
   const problem = tlsPairProblem(readTlsFile(keyPath), certPem);
@@ -225,19 +247,38 @@ function opensslArgs(keyPath: string, certPath: string, sans?: string[]): string
   return args;
 }
 
+/** `chmod` follows a symlink. Only a regular file opened with `O_NOFOLLOW` is changed. */
+function chmodRegularNoFollow(path: string): void {
+  const info = lstatOrMissing(path);
+  if (!info || info.isSymbolicLink() || !info.isFile()) return;
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  } catch {
+    return;
+  }
+  try {
+    fchmodSync(fd, 0o600);
+  } catch {
+    // best effort
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function tryOpensslSelfSigned(keyPath: string, certPath: string, sans: string[]): boolean {
+  // `openssl -keyout` follows a symlink. Do not start it when one is already there.
+  if (lstatOrMissing(keyPath)?.isSymbolicLink() || lstatOrMissing(certPath)?.isSymbolicLink()) {
+    return false;
+  }
   const attempts = [opensslArgs(keyPath, certPath, sans), opensslArgs(keyPath, certPath)];
   for (const args of attempts) {
     try {
       // Same scrub as harness children. OPENSSL_CONF can load a provider .so
       // during `openssl req`, and LD_PRELOAD would see the new private key.
       execFileSync("openssl", args, { stdio: "pipe", env: harnessChildEnv() });
-      try {
-        chmodSync(keyPath, 0o600);
-        chmodSync(certPath, 0o600);
-      } catch {
-        // best effort
-      }
+      chmodRegularNoFollow(keyPath);
+      chmodRegularNoFollow(certPath);
       return true;
     } catch {
       // retry without SAN; some openssl builds reject -addext
@@ -251,9 +292,17 @@ function tryOpensslSelfSigned(keyPath: string, certPath: string, sans: string[])
  * so those flags never receive `server.key` or `server.crt`.
  */
 function mintOpensslMaterial(sans: string[]): { keyPem: string; certPem: string } | undefined {
+  assertTlsStorage();
   const scratch = mkdtempSync(join(dataDir(), "certs", ".mint-"));
   try {
-    chmodSync(scratch, 0o700);
+    const scratchInfo = lstatSync(scratch);
+    if (scratchInfo.isSymbolicLink() || !scratchInfo.isDirectory()) throw tlsSymlinkError();
+    const dirFd = openSync(scratch, constants.O_RDONLY | constants.O_DIRECTORY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      fchmodSync(dirFd, 0o700);
+    } finally {
+      closeSync(dirFd);
+    }
     const keyOut = join(scratch, "server.key");
     const certOut = join(scratch, "server.crt");
     if (!tryOpensslSelfSigned(keyOut, certOut, sans)) return undefined;
@@ -268,8 +317,9 @@ function mintOpensslMaterial(sans: string[]): { keyPem: string; certPem: string 
 
 /** Install key and cert. `O_NOFOLLOW` refuses a symlink on either path. */
 function installTlsMaterial(keyPath: string, certPath: string, keyPem: string, certPem: string): void {
-  assertNotTlsSymlink(keyPath);
-  assertNotTlsSymlink(certPath);
+  assertTlsStorage();
+  assertTlsPath(keyPath);
+  assertTlsPath(certPath);
   writePrivateNoFollow(keyPath, keyPem);
   writePrivateNoFollow(certPath, certPem);
 }
@@ -281,15 +331,16 @@ function installTlsMaterial(keyPath: string, certPath: string, keyPem: string, c
  */
 export function ensureTlsMaterial(opts?: { bindHost?: string }): TlsMaterial {
   ensureDirs();
+  assertTlsStorage();
   const { keyPath, certPath } = certPaths();
   const sans = tlsSubjectAltNames(opts?.bindHost);
-  assertNotTlsSymlink(keyPath);
-  assertNotTlsSymlink(certPath);
+  const existingCert = assertTlsPath(certPath);
+  assertTlsPath(keyPath);
 
-  if (lstatOrMissing(certPath)) {
+  if (existingCert) {
     const certPem = readTlsFile(certPath);
     if (certPem.includes("BEGIN CERTIFICATE")) {
-      if (!lstatOrMissing(keyPath)) {
+      if (!assertTlsPath(keyPath)) {
         throw new Error(
           `TLS certificate has no private key (${certPath}). Delete server.crt to mint a new pair. Refusing to replace a cert a phone may already have pinned.`,
         );
