@@ -202,6 +202,9 @@ export function gitChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Proce
     if (STRIPPED_GIT_ENV.has(key)) continue;
     if (key.startsWith("GIT_CONFIG_KEY_") || key.startsWith("GIT_CONFIG_VALUE_")) continue;
     if (key.startsWith("GIT_TRACE")) continue;
+    // Exported bash functions (`BASH_FUNC_foo%%`) are imported by any bash
+    // git starts. Terminals already drop this prefix; git must too.
+    if (key.startsWith("BASH_FUNC_")) continue;
     env[key] = value;
   }
   env.GIT_TERMINAL_PROMPT = "0";
@@ -337,6 +340,82 @@ async function git(
   }
 }
 
+
+const C_QUOTE_SIMPLE: Record<string, number> = {
+  a: 0x07,
+  b: 0x08,
+  f: 0x0c,
+  n: 0x0a,
+  r: 0x0d,
+  t: 0x09,
+  v: 0x0b,
+  "\\": 0x5c,
+  '"': 0x22,
+};
+
+/**
+ * One porcelain path field. Quoted fields follow git's C quoting (octal
+ * bytes and simple escapes). The rename separator ` -> ` is only recognized
+ * outside quotes, so a name like `foo -> bar.txt` stays intact.
+ */
+function readPorcelainPath(field: string): { path: string; rest: string } {
+  if (field.startsWith('"')) {
+    const quoted = readQuotedGitPath(field);
+    if (quoted) return quoted;
+  }
+  const sep = field.indexOf(" -> ");
+  if (sep >= 0) return { path: field.slice(0, sep), rest: field.slice(sep) };
+  return { path: field, rest: "" };
+}
+
+function readQuotedGitPath(field: string): { path: string; rest: string } | undefined {
+  const bytes: number[] = [];
+  let i = 1;
+  while (i < field.length) {
+    const ch = field[i]!;
+    if (ch === '"') {
+      return { path: Buffer.from(bytes).toString("utf8"), rest: field.slice(i + 1) };
+    }
+    if (ch === "\\" && i + 1 < field.length) {
+      const esc = field[i + 1]!;
+      const simple = C_QUOTE_SIMPLE[esc];
+      if (simple !== undefined) {
+        bytes.push(simple);
+        i += 2;
+        continue;
+      }
+      if (esc >= "0" && esc <= "7") {
+        let val = esc.charCodeAt(0) - 48;
+        let consumed = 1;
+        while (consumed < 3 && i + 1 + consumed < field.length) {
+          const digit = field[i + 1 + consumed]!;
+          if (digit < "0" || digit > "7") break;
+          val = (val << 3) + (digit.charCodeAt(0) - 48);
+          consumed += 1;
+        }
+        bytes.push(val & 0xff);
+        i += 1 + consumed;
+        continue;
+      }
+      bytes.push(esc.charCodeAt(0) & 0xff);
+      i += 2;
+      continue;
+    }
+    const code = ch.charCodeAt(0);
+    if (code <= 0xff) bytes.push(code);
+    else for (const b of Buffer.from(ch, "utf8")) bytes.push(b);
+    i += 1;
+  }
+  return undefined;
+}
+
+/** Destination path of a rename/copy, or the only path on any other row. */
+function porcelainFilePath(field: string): string {
+  const first = readPorcelainPath(field);
+  if (!first.rest.startsWith(" -> ")) return first.path;
+  return readPorcelainPath(first.rest.slice(4)).path;
+}
+
 /**
  * Parse `git status --porcelain=v1 -b` output.
  */
@@ -380,17 +459,14 @@ export function parsePorcelainStatus(text: string): GitStatusResult {
       if (behindM) behind = Number(behindM[1]);
       continue;
     }
-    // XY PATH or XY ORIG -> PATH
+    // XY PATH or XY ORIG -> PATH. Paths with spaces, quotes, non-ASCII, or
+    // the rename separator are C-quoted (`"foo -> bar.txt"`, `\303\251`).
+    // Splitting on ` -> ` before unquoting turns the destination into a
+    // fragment such as `bar.txt"`.
     if (line.length < 3) continue;
     const status = line.slice(0, 2);
-    let pathPart = line.slice(3);
-    if (pathPart.includes(" -> ")) {
-      pathPart = pathPart.split(" -> ").pop() ?? pathPart;
-    }
-    // Unquoted paths; strip surrounding quotes if present
-    if (pathPart.startsWith('"') && pathPart.endsWith('"')) {
-      pathPart = pathPart.slice(1, -1);
-    }
+    const pathPart = porcelainFilePath(line.slice(3));
+    if (!pathPart) continue;
     files.push({ path: pathPart, status });
   }
 
@@ -398,7 +474,13 @@ export function parsePorcelainStatus(text: string): GitStatusResult {
 }
 
 export async function getGitStatus(cwd: string, opts?: GitHelperOptions): Promise<GitStatusResult> {
-  const { stdout, code } = await git(cwd, ["status", "--porcelain=v1", "-b", "--ignore-submodules=all"], opts);
+  // Force quoting so a repo `core.quotePath=false` cannot put a raw newline
+  // (or an unquoted ` -> `) into the porcelain stream we parse below.
+  const { stdout, code } = await git(
+    cwd,
+    ["-c", "core.quotePath=true", "status", "--porcelain=v1", "-b", "--ignore-submodules=all"],
+    opts,
+  );
   if (code !== 0 && !stdout) {
     return { branch: "", ahead: 0, behind: 0, files: [] };
   }

@@ -70,6 +70,28 @@ describe("parsePorcelainStatus", () => {
     expect(both.ahead).toBe(2);
     expect(both.behind).toBe(3);
   });
+
+  it("unquotes porcelain paths and keeps rename separators inside names", () => {
+    const text = [
+      "## main",
+      ' M "foo -> bar.txt"',
+      ' M "quote\\"name.txt"',
+      'RM "caf\\303\\251.txt" -> "renamed -> caf\\303\\251.txt"',
+      '?? "new -> file.txt"',
+      "R  old.ts -> renamed.ts",
+      "?? plain.txt",
+    ].join("\n");
+    const r = parsePorcelainStatus(text);
+    expect(r.branch).toBe("main");
+    expect(r.files).toEqual([
+      { path: "foo -> bar.txt", status: " M" },
+      { path: 'quote"name.txt', status: " M" },
+      { path: "renamed -> café.txt", status: "RM" },
+      { path: "new -> file.txt", status: "??" },
+      { path: "renamed.ts", status: "R " },
+      { path: "plain.txt", status: "??" },
+    ]);
+  });
 });
 
 describe("getGitStatus / getGitDiff", () => {
@@ -98,6 +120,27 @@ describe("getGitStatus / getGitDiff", () => {
       expect(st.files.some((f) => f.path === "tracked.txt")).toBe(true);
       expect(st.files.some((f) => f.path === "untracked.txt" && f.status === "??")).toBe(true);
     });
+  });
+
+  it("reports quoted names that contain the rename separator", async () => {
+    tmp = mkdtempSync(join(tmpdir(), "gb-git-quote-"));
+    git(tmp, ["init"]);
+    git(tmp, ["config", "user.email", "test@example.com"]);
+    git(tmp, ["config", "user.name", "Test"]);
+    git(tmp, ["config", "core.quotePath", "false"]);
+    const arrow = "foo -> bar.txt";
+    const cafe = "café.txt";
+    writeFileSync(join(tmp, arrow), "v1\n");
+    writeFileSync(join(tmp, cafe), "v1\n");
+    git(tmp, ["add", "--", arrow, cafe]);
+    git(tmp, ["commit", "-m", "init"]);
+    writeFileSync(join(tmp, arrow), "v2\n");
+    writeFileSync(join(tmp, cafe), "v2\n");
+
+    const st = await getGitStatus(tmp);
+    expect(st.files.map((f) => f.path).sort()).toEqual([arrow, cafe].sort());
+    const diff = await getGitDiff(tmp, arrow);
+    expect(diff.unified).toContain("+v2");
   });
 
   it("returns unified diff for a changed file", async () => {
@@ -212,6 +255,7 @@ describe("getGitStatus / getGitDiff", () => {
       SHELLOPTS: "xtrace",
       BASHOPTS: "extdebug",
       GCONV_PATH: "/tmp/gconv",
+      "BASH_FUNC_echo%%": "() {  echo pwned; }",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.GIT_EXTERNAL_DIFF).toBeUndefined();
@@ -246,6 +290,7 @@ describe("getGitStatus / getGitDiff", () => {
     expect(env.SHELLOPTS).toBeUndefined();
     expect(env.BASHOPTS).toBeUndefined();
     expect(env.GCONV_PATH).toBeUndefined();
+    expect(env["BASH_FUNC_echo%%"]).toBeUndefined();
     expect(env.GIT_CONFIG_COUNT).toBeUndefined();
     expect(env.GIT_CONFIG_KEY_0).toBeUndefined();
     expect(env.GIT_CONFIG_VALUE_0).toBeUndefined();
