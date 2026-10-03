@@ -69,6 +69,14 @@ describe("terminal output limit", () => {
     expect(blockedTerminalEnvName("RUSTC")).toBe(true);
     expect(blockedTerminalEnvName("RUSTC_WRAPPER")).toBe(true);
     expect(blockedTerminalEnvName("CARGO_BUILD_RUSTC")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_BUILD_RUSTC_WRAPPER")).toBe(true);
+    expect(blockedTerminalEnvName("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")).toBe(true);
+    expect(blockedTerminalEnvName("RUSTC_WORKSPACE_WRAPPER")).toBe(true);
+    expect(blockedTerminalEnvName("LD_DEBUG")).toBe(true);
+    expect(blockedTerminalEnvName("LD_DEBUG_OUTPUT")).toBe(true);
+    expect(blockedTerminalEnvName("PYTHONPYCACHEPREFIX")).toBe(true);
+    expect(blockedTerminalEnvName("OPENSSL_MODULES")).toBe(true);
+    expect(blockedTerminalEnvName("OPENSSL_ENGINES")).toBe(true);
     expect(blockedTerminalEnvName("NODE_V8_COVERAGE")).toBe(true);
     expect(blockedTerminalEnvName("NODE_REDIRECT_WARNINGS")).toBe(true);
     expect(blockedTerminalEnvName("NODE_COMPILE_CACHE")).toBe(true);
@@ -100,6 +108,14 @@ describe("terminal output limit", () => {
       RUSTC: "/tmp/rustc",
       RUSTC_WRAPPER: "/tmp/wrap",
       CARGO_BUILD_RUSTC: "/tmp/rustc",
+      CARGO_BUILD_RUSTC_WRAPPER: "/tmp/wrap",
+      CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER: "/tmp/wrap-ws",
+      RUSTC_WORKSPACE_WRAPPER: "/tmp/wrap-ws",
+      LD_DEBUG: "libs",
+      LD_DEBUG_OUTPUT: "/tmp/ld",
+      PYTHONPYCACHEPREFIX: "/tmp/pyc",
+      OPENSSL_MODULES: "/tmp/modules",
+      OPENSSL_ENGINES: "/tmp/engines",
       NODE_V8_COVERAGE: "/tmp/cov",
       NODE_REDIRECT_WARNINGS: "/tmp/warnings",
       NODE_COMPILE_CACHE: "/tmp/cache",
@@ -126,6 +142,14 @@ describe("terminal output limit", () => {
     expect(env.RUSTC).toBeUndefined();
     expect(env.RUSTC_WRAPPER).toBeUndefined();
     expect(env.CARGO_BUILD_RUSTC).toBeUndefined();
+    expect(env.CARGO_BUILD_RUSTC_WRAPPER).toBeUndefined();
+    expect(env.CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER).toBeUndefined();
+    expect(env.RUSTC_WORKSPACE_WRAPPER).toBeUndefined();
+    expect(env.LD_DEBUG).toBeUndefined();
+    expect(env.LD_DEBUG_OUTPUT).toBeUndefined();
+    expect(env.PYTHONPYCACHEPREFIX).toBeUndefined();
+    expect(env.OPENSSL_MODULES).toBeUndefined();
+    expect(env.OPENSSL_ENGINES).toBeUndefined();
     expect(env.NODE_V8_COVERAGE).toBeUndefined();
     expect(env.NODE_REDIRECT_WARNINGS).toBeUndefined();
     expect(env.NODE_COMPILE_CACHE).toBeUndefined();
@@ -149,6 +173,10 @@ describe("terminal output limit", () => {
       GOFLAGS: "-toolexec=/tmp/evil",
       RUSTC_WRAPPER: "/tmp/wrap",
       CARGO_BUILD_RUSTC: "/tmp/rustc",
+      CARGO_BUILD_RUSTC_WRAPPER: "/tmp/wrap",
+      LD_DEBUG_OUTPUT: "/tmp/ld",
+      PYTHONPYCACHEPREFIX: "/tmp/pyc",
+      OPENSSL_MODULES: "/tmp/modules",
       NODE_V8_COVERAGE: "/tmp/cov",
       NODE_REDIRECT_WARNINGS: "/tmp/warnings",
       NODE_COMPILE_CACHE: "/tmp/cache",
@@ -167,6 +195,10 @@ describe("terminal output limit", () => {
     expect(env.GOFLAGS).toBeUndefined();
     expect(env.RUSTC_WRAPPER).toBeUndefined();
     expect(env.CARGO_BUILD_RUSTC).toBeUndefined();
+    expect(env.CARGO_BUILD_RUSTC_WRAPPER).toBeUndefined();
+    expect(env.LD_DEBUG_OUTPUT).toBeUndefined();
+    expect(env.PYTHONPYCACHEPREFIX).toBeUndefined();
+    expect(env.OPENSSL_MODULES).toBeUndefined();
     expect(env.NODE_V8_COVERAGE).toBeUndefined();
     expect(env.NODE_REDIRECT_WARNINGS).toBeUndefined();
     expect(env.NODE_COMPILE_CACHE).toBeUndefined();

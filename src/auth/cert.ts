@@ -14,6 +14,7 @@ import { isIP } from "node:net";
 import { join } from "node:path";
 import { dataDir, ensureDirs } from "../config/load.js";
 import { writePrivateNoFollow } from "../fs/atomic-write.js";
+import { harnessChildEnv } from "../session/terminals.js";
 
 export interface TlsMaterial {
   keyPath: string;
@@ -79,6 +80,23 @@ function lstatOrMissing(path: string): ReturnType<typeof lstatSync> | undefined 
 /** Missing is fine. A symlink on `server.key` or `server.crt` is refused. */
 function assertNotTlsSymlink(path: string): void {
   if (lstatOrMissing(path)?.isSymbolicLink()) throw tlsSymlinkError();
+}
+
+/** Read a freshly minted key or cert. A symlink is treated as a failed mint. */
+function readMintedNoFollow(path: string): string | undefined {
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  } catch {
+    return undefined;
+  }
+  try {
+    return readFileSync(fd, "utf8");
+  } catch {
+    return undefined;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** Read a TLS file without following a final-component symlink. */
@@ -211,7 +229,9 @@ function tryOpensslSelfSigned(keyPath: string, certPath: string, sans: string[])
   const attempts = [opensslArgs(keyPath, certPath, sans), opensslArgs(keyPath, certPath)];
   for (const args of attempts) {
     try {
-      execFileSync("openssl", args, { stdio: "pipe" });
+      // Same scrub as harness children. OPENSSL_CONF can load a provider .so
+      // during `openssl req`, and LD_PRELOAD would see the new private key.
+      execFileSync("openssl", args, { stdio: "pipe", env: harnessChildEnv() });
       try {
         chmodSync(keyPath, 0o600);
         chmodSync(certPath, 0o600);
@@ -237,10 +257,10 @@ function mintOpensslMaterial(sans: string[]): { keyPem: string; certPem: string 
     const keyOut = join(scratch, "server.key");
     const certOut = join(scratch, "server.crt");
     if (!tryOpensslSelfSigned(keyOut, certOut, sans)) return undefined;
-    return {
-      keyPem: readFileSync(keyOut, "utf8"),
-      certPem: readFileSync(certOut, "utf8"),
-    };
+    const keyPem = readMintedNoFollow(keyOut);
+    const certPem = readMintedNoFollow(certOut);
+    if (!keyPem || !certPem) return undefined;
+    return { keyPem, certPem };
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }

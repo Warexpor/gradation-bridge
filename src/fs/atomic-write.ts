@@ -13,6 +13,7 @@ import {
   constants,
   lstatSync,
   openSync,
+  readFileSync,
   renameSync,
   unlinkSync,
   writeFileSync,
@@ -72,6 +73,35 @@ function openTempNoFollow(tmp: string): number {
     if (code === "ELOOP") throw symlinkError();
     if (code === "EEXIST" && lstatOrMissing(tmp)?.isSymbolicLink()) throw symlinkError();
     throw e;
+  }
+}
+
+/**
+ * Read a regular file. A symlink at `path` is refused instead of followed.
+ * Missing paths throw `ENOENT`.
+ */
+export function readPrivateNoFollow(path: string): string {
+  const info = lstatOrMissing(path);
+  if (!info) {
+    const err = new Error(`ENOENT: no such file, open '${path}'`) as NodeJS.ErrnoException;
+    err.code = "ENOENT";
+    throw err;
+  }
+  if (info.isSymbolicLink()) throw new Error("refusing to read through a symlink");
+  if (!info.isFile()) throw new Error("refusing to read a non-regular file");
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | NOFOLLOW);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new Error("refusing to read through a symlink");
+    }
+    throw e;
+  }
+  try {
+    return readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
   }
 }
 

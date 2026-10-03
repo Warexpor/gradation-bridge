@@ -205,11 +205,25 @@ const STRIPPED_GIT_ENV = new Set([
   "GCONV_PATH",
   // Go and Cargo startup hooks. GOFLAGS=-toolexec=… runs during go build.
   // RUSTC replaces the compiler. RUSTC_WRAPPER and CARGO_BUILD_RUSTC run
-  // during cargo build.
+  // during cargo build. Cargo also reads the wrapper from these config env
+  // names, which do not match the short RUSTC_WRAPPER / CARGO_BUILD_RUSTC keys.
   "GOFLAGS",
   "RUSTC",
   "RUSTC_WRAPPER",
+  "RUSTC_WORKSPACE_WRAPPER",
   "CARGO_BUILD_RUSTC",
+  "CARGO_BUILD_RUSTC_WRAPPER",
+  "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+  // Dynamic linker debug writes `<path>.<pid>` when LD_DEBUG is set.
+  "LD_DEBUG",
+  "LD_DEBUG_OUTPUT",
+  "LD_PROFILE_OUTPUT",
+  // Python writes .pyc files under this directory.
+  "PYTHONPYCACHEPREFIX",
+  // OpenSSL loads provider/engine modules from these directories.
+  "OPENSSL_MODULES",
+  "OPENSSL_ENGINES",
+  "OPENSSL_CONF_INCLUDE",
 ]);
 
 /** Child env for git. Drops variables that can name a program or inject config. */

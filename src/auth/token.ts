@@ -1,8 +1,8 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { configDir, ensureDirs } from "../config/load.js";
-import { writePrivateNoFollow } from "../fs/atomic-write.js";
+import { readPrivateNoFollow, writePrivateNoFollow } from "../fs/atomic-write.js";
 
 export interface DeviceRecord {
   id: string;
@@ -23,19 +23,31 @@ function devicesPath(): string {
 
 type DevicesRead =
   | { ok: true; file: DevicesFile }
-  | { ok: false; path: string };
+  | { ok: false; path: string; symlink: boolean };
 
 function readDevices(): DevicesRead {
   ensureDirs();
   const path = devicesPath();
-  if (!existsSync(path)) return { ok: true, file: { devices: [] } };
+  let text: string;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as DevicesFile;
-    if (!parsed || !Array.isArray(parsed.devices)) return { ok: false, path };
+    text = readPrivateNoFollow(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, file: { devices: [] } };
+    const symlink = e instanceof Error && /symlink/i.test(e.message);
+    return { ok: false, path, symlink };
+  }
+  try {
+    const parsed = JSON.parse(text) as DevicesFile;
+    if (!parsed || !Array.isArray(parsed.devices)) return { ok: false, path, symlink: false };
     return { ok: true, file: parsed };
   } catch {
-    return { ok: false, path };
+    return { ok: false, path, symlink: false };
   }
+}
+
+function refuseDevices(read: { path: string; symlink: boolean }, fallback: string): never {
+  if (read.symlink) throw new Error(`refusing to use a symlinked devices file (${read.path})`);
+  throw new Error(`devices.json is corrupt (${read.path}); ${fallback}`);
 }
 
 /** SHA-256 then constant-time compare so token length is not a timing oracle. */
@@ -62,11 +74,7 @@ export function generateToken(): string {
  */
 export function ensurePrimaryToken(): { token: string; deviceId: string; created: boolean } {
   const read = readDevices();
-  if (!read.ok) {
-    throw new Error(
-      `devices.json is corrupt (${read.path}); refusing to mint a replacement token`,
-    );
-  }
+  if (!read.ok) refuseDevices(read, "refusing to mint a replacement token");
   const file = read.file;
   const active = file.devices.find((d) => !d.revokedAt);
   if (active) {
@@ -86,17 +94,13 @@ export function ensurePrimaryToken(): { token: string; deviceId: string; created
 
 export function listDevices(): DeviceRecord[] {
   const read = readDevices();
-  if (!read.ok) {
-    throw new Error(`devices.json is corrupt (${read.path}); refusing to continue`);
-  }
+  if (!read.ok) refuseDevices(read, "refusing to continue");
   return read.file.devices;
 }
 
 export function revokeDevice(id: string): boolean {
   const read = readDevices();
-  if (!read.ok) {
-    throw new Error(`devices.json is corrupt (${read.path}); refusing to continue`);
-  }
+  if (!read.ok) refuseDevices(read, "refusing to continue");
   const file = read.file;
   const d = file.devices.find((x) => x.id === id);
   if (!d || d.revokedAt) return false;
