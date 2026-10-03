@@ -50,6 +50,10 @@ export interface GitDiffResult {
  * reads that other file, hiding the repo filters that status and diff still run.
  * `GIT_TRACE*` is removed so a phone-triggered status or diff cannot write
  * (or, on some builds, pipe) through an inherited trace sink.
+ * `GIT_NO_LAZY_FETCH` is forced on. A partial clone whose promisor remote is
+ * `ext::` (or another helper) and whose repo config sets `protocol.ext.allow`
+ * otherwise runs that helper while status or diff reads a missing object.
+ * `protocol.allow=never` does not override a more specific `protocol.ext.allow`.
  */
 const GIT_GUARD = [
   "-c",
@@ -204,6 +208,8 @@ export function gitChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Proce
   env.GIT_CONFIG_NOSYSTEM = "1";
   env.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
   env.GIT_PAGER = "";
+  // Overrides a host value of 0. Status and diff must not contact a promisor.
+  env.GIT_NO_LAZY_FETCH = "1";
   return env;
 }
 
@@ -345,23 +351,33 @@ export function parsePorcelainStatus(text: string): GitStatusResult {
     if (line.startsWith("## ")) {
       const rest = line.slice(3);
       // ## HEAD (no branch)
-      if (rest.startsWith("HEAD ")) {
+      if (rest === "HEAD" || rest.startsWith("HEAD ")) {
         branch = "HEAD";
-      } else {
-        const tracking = rest.match(
-          /^([^\s.]+)(?:\.\.\.(\S+))?(?:\s+\[([^\]]+)\])?/,
-        );
-        if (tracking) {
-          branch = tracking[1] ?? "";
-          const bracket = tracking[3] ?? "";
-          const aheadM = bracket.match(/ahead\s+(\d+)/);
-          const behindM = bracket.match(/behind\s+(\d+)/);
-          if (aheadM) ahead = Number(aheadM[1]);
-          if (behindM) behind = Number(behindM[1]);
-        } else {
-          branch = rest.split(/\s/)[0] ?? "";
-        }
+        continue;
       }
+      // Unborn HEAD. The branch name may contain dots (`release/1.2`).
+      const unborn = /^(?:No commits yet on|Initial commit on)\s+(\S+)$/.exec(rest);
+      if (unborn) {
+        branch = unborn[1] ?? "";
+        continue;
+      }
+      // `branch`, `branch...upstream`, optionally ` [ahead N, behind M]`.
+      // Branch names cannot contain `..` or spaces, but they can contain `.`
+      // (`feature.2`, `release/1.2.3`). A character class that stops at `.`
+      // truncates those and drops the ahead/behind counts.
+      let head = rest;
+      let bracket = "";
+      const bracketAt = rest.lastIndexOf(" [");
+      if (bracketAt >= 0 && rest.endsWith("]")) {
+        head = rest.slice(0, bracketAt);
+        bracket = rest.slice(bracketAt + 2, -1);
+      }
+      const dots = head.indexOf("...");
+      branch = (dots >= 0 ? head.slice(0, dots) : head).trim();
+      const aheadM = bracket.match(/ahead\s+(\d+)/);
+      const behindM = bracket.match(/behind\s+(\d+)/);
+      if (aheadM) ahead = Number(aheadM[1]);
+      if (behindM) behind = Number(behindM[1]);
       continue;
     }
     // XY PATH or XY ORIG -> PATH

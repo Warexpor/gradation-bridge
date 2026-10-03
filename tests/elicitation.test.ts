@@ -75,6 +75,29 @@ describe("elicitation relay checks", () => {
       both,
     );
     expect(forwarded.url).toBe("https://example.com/connect?elicitationId=e1");
+
+    expect(
+      relayElicitationParams(
+        {
+          sessionId: "s",
+          mode: "url",
+          elicitationId: 5,
+          url: "https://example.com/connect",
+        },
+        both,
+      ).elicitationId,
+    ).toBe("5");
+    expect(
+      relayElicitationParams(
+        {
+          sessionId: "s",
+          mode: "url",
+          elicitationId: "5.0",
+          url: "https://example.com/connect",
+        },
+        both,
+      ).elicitationId,
+    ).toBe("5");
   });
 
   it("refuses a mode the phone did not advertise", () => {
